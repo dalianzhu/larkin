@@ -12,6 +12,23 @@ export interface AgentUpsertRequest { operationId: string; agentId: string; auth
 export type AgentUpsertOperation = Pick<AgentUpsertRequest, "operationId" | "agentId">;
 export interface AgentUpsertResponse { ok: boolean; operationId: string; agentId: string; code?: string; error?: string; readiness?: RuntimeReadiness }
 export interface DashboardRecoveryResponse { ok: boolean; operationId: string; state?: string; error?: string }
+export interface AgentEnqueueInput {
+  agentId: string;
+  idempotencyKey: string;
+  chatId: string;
+  replyTo?: string;
+  senderName?: string;
+  content: string;
+}
+export interface AgentEnqueueResponse {
+  ok: boolean;
+  agentId: string;
+  messageId?: string;
+  status: "accepted" | "duplicate" | "deferred" | "error";
+  deliveryId?: string;
+  code?: string;
+  error?: string;
+}
 export interface SessionResetResponse {
   ok: boolean; agentId: string; code?: string; error?: string;
   resetCommitted: boolean; generationChanged: boolean; sessionChanged: boolean; turns: number;
@@ -19,8 +36,11 @@ export interface SessionResetResponse {
   readyForFreshScenario: boolean; inboundObserved: false; readiness?: RuntimeReadiness;
 }
 interface SessionResetControlRequest { operation: "session-reset"; agentId: string; authorization: string; waitReadyMs?: number }
-type AgentControlRequest = AgentUpsertRequest | SessionResetControlRequest;
-type AgentControlPayload = Omit<AgentUpsertRequest, "authorization"> | Omit<SessionResetControlRequest, "authorization">;
+interface AgentEnqueueControlRequest extends AgentEnqueueInput { operation: "agent-enqueue"; authorization: string }
+type AgentControlRequest = AgentUpsertRequest | SessionResetControlRequest | AgentEnqueueControlRequest;
+type AgentControlPayload = Omit<AgentUpsertRequest, "authorization">
+  | Omit<SessionResetControlRequest, "authorization">
+  | Omit<AgentEnqueueControlRequest, "authorization">;
 
 interface ProcessBinding { pid: number; processStartToken: string }
 interface SocketBinding { device: string; inode: string; owner: string; changeTimeNs: string }
@@ -39,6 +59,11 @@ interface ControlAuthority {
 const AGENT_ID = /^cli_[A-Za-z0-9]+$/;
 const OPERATION_ID = /^[A-Za-z0-9_-]{8,128}$/;
 const AUTHORIZATION = /^[A-Za-z0-9_-]{43,128}$/;
+const IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
+const CHAT_ID = /^oc_[A-Za-z0-9_-]+$/;
+const MESSAGE_ID = /^om_[A-Za-z0-9_-]+$/;
+const MAX_CONTROL_REQUEST_BYTES = 65_536;
+const MAX_EXTERNAL_CONTENT_BYTES = 32_768;
 const UNIX_SOCKET_PATH_MAX_BYTES = process.platform === "darwin" ? 103 : 107;
 
 function socketPathsFit(root: string): boolean {
@@ -106,18 +131,37 @@ function removeLegacyResetLedger(larkinHome: string): void {
 }
 
 function parseRequest(line: string): AgentControlRequest {
-  const value = JSON.parse(line) as Partial<AgentUpsertRequest & SessionResetControlRequest>;
+  const value = JSON.parse(line) as Record<string, unknown>;
   if (!AGENT_ID.test(String(value.agentId || "")) || !AUTHORIZATION.test(String(value.authorization || ""))) {
     throw new Error("invalid agent control request");
   }
   if (value.operation === "session-reset") {
-    if (value.waitReadyMs !== undefined && (!Number.isSafeInteger(value.waitReadyMs) || value.waitReadyMs < 0 || value.waitReadyMs > 300_000)) {
+    const waitReadyMs = value.waitReadyMs;
+    if (waitReadyMs !== undefined && (typeof waitReadyMs !== "number" || !Number.isSafeInteger(waitReadyMs)
+        || waitReadyMs < 0 || waitReadyMs > 300_000)) {
       throw new Error("invalid session reset waitReadyMs");
     }
     if (Object.keys(value).some((key) => !["agentId", "authorization", "operation", "waitReadyMs"].includes(key))) {
       throw new Error("session reset control request 包含未知字段");
     }
-    return value as SessionResetControlRequest;
+    return value as unknown as SessionResetControlRequest;
+  }
+  if (value.operation === "agent-enqueue") {
+    if (Object.keys(value).some((key) => ![
+      "agentId", "authorization", "operation", "idempotencyKey", "chatId", "replyTo", "senderName", "content",
+    ].includes(key))) throw new Error("agent enqueue control request 包含未知字段");
+    if (!IDEMPOTENCY_KEY.test(String(value.idempotencyKey || ""))) throw new Error("invalid enqueue idempotency key");
+    if (!CHAT_ID.test(String(value.chatId || ""))) throw new Error("invalid enqueue chat id");
+    if (value.replyTo !== undefined && !MESSAGE_ID.test(String(value.replyTo))) throw new Error("invalid enqueue reply message id");
+    if (value.senderName !== undefined && (typeof value.senderName !== "string" || !value.senderName.trim()
+        || value.senderName.length > 80 || /[\u0000-\u001f\u007f]/.test(value.senderName))) {
+      throw new Error("invalid enqueue sender name");
+    }
+    if (typeof value.content !== "string" || !value.content.trim() || value.content.includes("\u0000")
+        || Buffer.byteLength(value.content) > MAX_EXTERNAL_CONTENT_BYTES) {
+      throw new Error("invalid enqueue content");
+    }
+    return value as unknown as AgentEnqueueControlRequest;
   }
   if (value.operation !== undefined || !OPERATION_ID.test(String(value.operationId || ""))) {
     throw new Error("invalid agent upsert request");
@@ -128,7 +172,7 @@ function parseRequest(line: string): AgentControlRequest {
   if (Object.keys(value).some((key) => !["operationId", "agentId", "authorization"].includes(key))) {
     throw new Error("agent control request 包含未知字段");
   }
-  return value as AgentUpsertRequest;
+  return value as unknown as AgentUpsertRequest;
 }
 
 function atomicWritePrivateJson(file: string, value: unknown): void {
@@ -438,12 +482,14 @@ export function createAgentControlServer({
   authorityToken,
   upsert,
   resetSession,
+  enqueue,
   maxRememberedOperations = 256,
 }: {
   larkinHome: string;
   authorityToken: string;
   upsert(request: AgentUpsertOperation): Promise<void>;
   resetSession?(request: { agentId: string; waitReadyMs: number }): Promise<SessionResetResponse>;
+  enqueue?(request: AgentEnqueueInput): Promise<AgentEnqueueResponse>;
   maxRememberedOperations?: number;
 }): { start(): Promise<void>; close(): Promise<void> } {
   let socket = "";
@@ -482,7 +528,7 @@ export function createAgentControlServer({
         let input = "";
         connection.on("data", (chunk) => {
           input += chunk;
-          if (input.length > 4096) connection.destroy(new Error("control request too large"));
+          if (Buffer.byteLength(input) > MAX_CONTROL_REQUEST_BYTES) connection.destroy(new Error("control request too large"));
           const newline = input.indexOf("\n");
           if (newline < 0) return;
           const line = input.slice(0, newline);
@@ -502,7 +548,7 @@ export function createAgentControlServer({
                 agentId: request.agentId, error: "unauthorized control request" })}\n`);
               return;
             }
-            if ("operation" in request) {
+            if ("operation" in request && request.operation === "session-reset") {
               const resetRequest = request;
               let operation = resetInFlight.get(resetRequest.agentId);
               if (!operation) {
@@ -540,6 +586,35 @@ export function createAgentControlServer({
               }
               const response = await operation;
               connection.end(`${JSON.stringify(response)}\n`);
+              return;
+            }
+            if ("operation" in request && request.operation === "agent-enqueue") {
+              const enqueueRequest = request;
+              const executeEnqueue = async (): Promise<AgentEnqueueResponse> => {
+                try {
+                  if (!enqueue) throw new Error("agent enqueue control unavailable");
+                  return await enqueue({
+                    agentId: enqueueRequest.agentId,
+                    idempotencyKey: enqueueRequest.idempotencyKey,
+                    chatId: enqueueRequest.chatId,
+                    ...(enqueueRequest.replyTo ? { replyTo: enqueueRequest.replyTo } : {}),
+                    ...(enqueueRequest.senderName ? { senderName: enqueueRequest.senderName } : {}),
+                    content: enqueueRequest.content,
+                  });
+                } catch (error) {
+                  return { ok: false, agentId: enqueueRequest.agentId, status: "error",
+                    code: typeof (error as { code?: unknown }).code === "string" ? String((error as { code: string }).code) : "enqueue_failed",
+                    error: error instanceof Error ? error.message : String(error) };
+                }
+              };
+              const prior = agentQueues.get(enqueueRequest.agentId) ?? Promise.resolve();
+              const executing = prior.catch(() => {}).then(executeEnqueue);
+              let queued: Promise<AgentEnqueueResponse>;
+              queued = executing.finally(() => {
+                if (agentQueues.get(enqueueRequest.agentId) === queued) agentQueues.delete(enqueueRequest.agentId);
+              });
+              agentQueues.set(enqueueRequest.agentId, queued);
+              connection.end(`${JSON.stringify(await queued)}\n`);
               return;
             }
             const upsertRequest = request;
@@ -719,6 +794,20 @@ export async function requestSessionReset({
   return requestAgentControl<SessionResetResponse>({
     larkinHome, timeoutMs: Math.max(1_000, waitReadyMs + 1_000),
     request: { operation: "session-reset", agentId, waitReadyMs },
+  });
+}
+
+export async function requestAgentEnqueue(input: AgentEnqueueInput & {
+  larkinHome: string;
+  timeoutMs?: number;
+}): Promise<AgentEnqueueResponse> {
+  return requestAgentControl<AgentEnqueueResponse>({
+    larkinHome: input.larkinHome, timeoutMs: input.timeoutMs,
+    request: {
+      operation: "agent-enqueue", agentId: input.agentId, idempotencyKey: input.idempotencyKey,
+      chatId: input.chatId, ...(input.replyTo ? { replyTo: input.replyTo } : {}),
+      ...(input.senderName ? { senderName: input.senderName } : {}), content: input.content,
+    },
   });
 }
 

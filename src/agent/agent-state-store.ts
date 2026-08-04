@@ -6,11 +6,11 @@ import { acquireProcessLock, inspectProcess } from "../platform/process-state.js
 import { targetKeyOfInboxEnvelope, type InboxEnvelope } from "./inbox-projection.js";
 
 export type JsonStateKey = "agentState" | "status" | "map" | "replyctx" | "botIdentity" |
-  "senderProfiles" | "readReceipts" | "pendingReact" | "runtimeDeliveries" | "inboxState" | "freshnessState" | "reminders" | "interactions";
+  "senderProfiles" | "readReceipts" | "pendingReact" | "runtimeDeliveries" | "inboxState" | "freshnessState" | "reminders" | "interactions" | "externalEnqueue";
 export type NdjsonStateKey = "conversation" | "inbox";
 
 const JSON_KEYS: ReadonlySet<string> = new Set([
-  "agentState", "status", "map", "replyctx", "botIdentity", "senderProfiles", "readReceipts", "pendingReact", "runtimeDeliveries", "inboxState", "freshnessState", "reminders", "interactions",
+  "agentState", "status", "map", "replyctx", "botIdentity", "senderProfiles", "readReceipts", "pendingReact", "runtimeDeliveries", "inboxState", "freshnessState", "reminders", "interactions", "externalEnqueue",
 ]);
 const NDJSON_KEYS: ReadonlySet<string> = new Set(["conversation", "inbox"]);
 const INBOX_LOCK_TIMEOUT_MS = 2_000;

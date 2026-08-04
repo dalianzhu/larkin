@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
@@ -20,7 +21,7 @@ import { projectInboxEnvelope, targetKeyOfInboxEnvelope } from "../agent/inbox-p
 import { HostReminderOrchestrator } from "../agent/host-reminder-orchestrator.js";
 import { HostChannelBusiness } from "./host-channel-business.js";
 import { HostInteractionOrchestrator } from "./interaction-orchestrator.js";
-import { targetFor, type FeishuInboundEvent } from "./message-policy.js";
+import { slug10, targetFor, type FeishuInboundEvent } from "./message-policy.js";
 import type { RuntimeHost, RuntimeHostEvent } from "../runtime/runtime-host.js";
 import { providerAuthenticationFailureReadiness, RuntimePrerequisiteError } from "../runtime/runtime-readiness.js";
 import { verifyCallbackProbe } from "../platform/callback-capability.js";
@@ -77,6 +78,12 @@ export interface HostShell {
   readonly log: (...parts: unknown[]) => void;
   resumeSession(agent: ConfiguredAgent, runtime: string): string | null;
   ingest(agentId: string, event: FeishuInboundEvent, options?: { wake?: boolean }): Promise<void>;
+  enqueueExternal(request: {
+    agentId: string; idempotencyKey: string; chatId: string; replyTo?: string; senderName?: string; content: string;
+  }): Promise<{
+    ok: boolean; agentId: string; messageId: string; status: "accepted" | "duplicate" | "deferred" | "error";
+    deliveryId: string; error?: string;
+  }>;
   upsertAgent(agent: ConfiguredAgent): Promise<"added" | "updated" | "unchanged">;
   resetSession(agentId: string, waitReadyMs?: number): Promise<{
     resetCommitted: boolean; generationChanged: boolean; sessionChanged: boolean; turns: number;
@@ -951,6 +958,86 @@ export function createHostShell({
       const agent = agents.find((candidate) => candidate.agentId === agentId);
       if (!agent) throw Object.assign(new Error(`未知 Agent: ${agentId}`), { code: "unknown_agent" });
       await onFeishuMessage(agent, event, options);
+    },
+    async enqueueExternal(request): Promise<{
+      ok: boolean; agentId: string; messageId: string; status: "accepted" | "duplicate" | "deferred" | "error";
+      deliveryId: string; error?: string;
+    }> {
+      const agent = agents.find((candidate) => candidate.agentId === request.agentId);
+      if (!agent) throw Object.assign(new Error(`未知 Agent: ${request.agentId}`), { code: "unknown_agent" });
+      const store = stateStore(agent);
+      const messageId = `external_${crypto.createHash("sha256")
+        .update(`${request.agentId}\0${request.idempotencyKey}`).digest("hex").slice(0, 32)}`;
+      const fingerprint = crypto.createHash("sha256").update(JSON.stringify({
+        chatId: request.chatId, replyTo: request.replyTo || null,
+        senderName: request.senderName || "External automation", content: request.content,
+      })).digest("hex");
+      type ExternalEnqueueRecord = {
+        messageId: string; fingerprint: string; createdAt: string; updatedAt: string;
+        status?: string; deliveryId?: string;
+      };
+      type ExternalEnqueueStore = { version: 1; records: ExternalEnqueueRecord[] };
+      const now = new Date().toISOString();
+      const external = store.readJson<ExternalEnqueueStore>("externalEnqueue", { version: 1, records: [] });
+      if (!Array.isArray(external.records)) throw new Error("external-enqueue.json records 必须是数组");
+      const existing = external.records.find((record) => record?.messageId === messageId);
+      if (existing && existing.fingerprint !== fingerprint) {
+        throw Object.assign(new Error("idempotency key 已绑定不同的 enqueue payload"), { code: "idempotency_conflict" });
+      }
+      if (existing?.deliveryId && ["accepted", "duplicate", "deferred"].includes(existing.status || "")) {
+        return {
+          ok: true, agentId: request.agentId, messageId, status: "duplicate", deliveryId: existing.deliveryId,
+        };
+      }
+      if (!existing) {
+        external.records.push({ messageId, fingerprint, createdAt: now, updatedAt: now });
+        external.records = external.records.slice(-4_096);
+        store.writeJson("externalEnqueue", external);
+      }
+
+      const chatSlug = `c${slug10(request.chatId)}`;
+      const topicSlug = request.replyTo
+        ? crypto.createHash("sha256").update(request.replyTo).digest("hex").slice(0, 10)
+        : null;
+      const target = topicSlug ? `#${chatSlug}:${topicSlug.slice(0, 8)}` : `#${chatSlug}`;
+      const aliases = topicSlug ? [target, `#${chatSlug}:${topicSlug}`] : [target];
+      const routeMap = store.readJson<Record<string, string>>("map", {});
+      for (const alias of aliases) routeMap[alias] = request.chatId;
+      store.writeJson("map", routeMap);
+      const replyContexts = store.readJson<Record<string, {
+        chat_id: string | null; reply_to: string | null; thread_id: string | null; in_topic: boolean;
+      }>>("replyctx", {});
+      for (const alias of aliases) replyContexts[alias] = {
+        chat_id: request.chatId, reply_to: request.replyTo || null, thread_id: null, in_topic: Boolean(request.replyTo),
+      };
+      store.writeJson("replyctx", replyContexts);
+
+      const envelope: Record<string, unknown> = {
+        message_id: messageId, seq: Date.now(), sender_id: "external_enqueue",
+        sender_name: request.senderName || "External automation", sender_type: "system",
+        channel_type: topicSlug ? "thread" : "channel", channel_name: topicSlug || chatSlug,
+        ...(topicSlug ? { parent_channel_type: "channel", parent_channel_name: chatSlug } : {}),
+        content: request.content, timestamp: now, thread_id: null, chat_id: request.chatId,
+        target, wake: true, wake_reason: "external-enqueue",
+      };
+      store.prepareInboxDelivery(envelope);
+      const receipt = await runtimeHost.deliver(agent.agentId, envelope);
+      const record = external.records.find((candidate) => candidate.messageId === messageId);
+      if (record) {
+        record.updatedAt = new Date().toISOString();
+        record.status = receipt.status;
+        record.deliveryId = receipt.deliveryId;
+        store.writeJson("externalEnqueue", external);
+      }
+      if (!existing) hostState.appendConversation(agent, {
+        direction: "in", from: request.senderName || "External automation", senderType: "system",
+        target, wake: true, text: request.content, messageId, at: now,
+      });
+      return {
+        ok: receipt.status !== "error", agentId: request.agentId, messageId,
+        status: receipt.status, deliveryId: receipt.deliveryId,
+        ...(receipt.status === "error" ? { error: receipt.reason } : {}),
+      };
     },
     async upsertAgent(candidate): Promise<"added" | "updated" | "unchanged"> {
       const validated = loadAgents({ ...env, LARKIN_AGENTS_CONFIG: JSON.stringify([candidate]) }, false, larkinHome, reconcileAgentWorkspaceImpl)[0];

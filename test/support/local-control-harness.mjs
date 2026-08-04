@@ -80,6 +80,10 @@ const serverOptions = {
     const result = await resetHost.resetSession(request.agentId, request.waitReadyMs);
     return { ok: result.readyForFreshScenario, agentId: request.agentId, ...result };
   },
+  async enqueue(request) {
+    fs.appendFileSync(calls, `enqueue:${request.agentId}:${request.idempotencyKey}\n`);
+    return await resetHost.enqueueExternal(request);
+  },
 };
 let server = createAgentControlServer(serverOptions);
 await server.start();

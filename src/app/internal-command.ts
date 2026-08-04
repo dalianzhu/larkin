@@ -7,6 +7,7 @@ export const INTERNAL_MODES = [
   "setup",
   "agent-config",
   "session-cli",
+  "agent-control-cli",
   "lark",
   "runtime-process",
   "dashboard",
