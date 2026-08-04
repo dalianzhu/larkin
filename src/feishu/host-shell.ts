@@ -79,7 +79,7 @@ export interface HostShell {
   resumeSession(agent: ConfiguredAgent, runtime: string): string | null;
   ingest(agentId: string, event: FeishuInboundEvent, options?: { wake?: boolean }): Promise<void>;
   enqueueExternal(request: {
-    agentId: string; idempotencyKey: string; chatId: string; replyTo?: string; senderName?: string; content: string;
+    agentId: string; idempotencyKey: string; content: string;
   }): Promise<{
     ok: boolean; agentId: string; messageId: string; status: "accepted" | "duplicate" | "deferred" | "error";
     deliveryId: string; error?: string;
@@ -969,8 +969,7 @@ export function createHostShell({
       const messageId = `external_${crypto.createHash("sha256")
         .update(`${request.agentId}\0${request.idempotencyKey}`).digest("hex").slice(0, 32)}`;
       const fingerprint = crypto.createHash("sha256").update(JSON.stringify({
-        chatId: request.chatId, replyTo: request.replyTo || null,
-        senderName: request.senderName || "External automation", content: request.content,
+        content: request.content,
       })).digest("hex");
       type ExternalEnqueueRecord = {
         messageId: string; fingerprint: string; createdAt: string; updatedAt: string;
@@ -995,29 +994,12 @@ export function createHostShell({
         store.writeJson("externalEnqueue", external);
       }
 
-      const chatSlug = `c${slug10(request.chatId)}`;
-      const topicSlug = request.replyTo
-        ? crypto.createHash("sha256").update(request.replyTo).digest("hex").slice(0, 10)
-        : null;
-      const target = topicSlug ? `#${chatSlug}:${topicSlug.slice(0, 8)}` : `#${chatSlug}`;
-      const aliases = topicSlug ? [target, `#${chatSlug}:${topicSlug}`] : [target];
-      const routeMap = store.readJson<Record<string, string>>("map", {});
-      for (const alias of aliases) routeMap[alias] = request.chatId;
-      store.writeJson("map", routeMap);
-      const replyContexts = store.readJson<Record<string, {
-        chat_id: string | null; reply_to: string | null; thread_id: string | null; in_topic: boolean;
-      }>>("replyctx", {});
-      for (const alias of aliases) replyContexts[alias] = {
-        chat_id: request.chatId, reply_to: request.replyTo || null, thread_id: null, in_topic: Boolean(request.replyTo),
-      };
-      store.writeJson("replyctx", replyContexts);
-
+      const target = "runtime:external";
       const envelope: Record<string, unknown> = {
         message_id: messageId, seq: Date.now(), sender_id: "external_enqueue",
-        sender_name: request.senderName || "External automation", sender_type: "system",
-        channel_type: topicSlug ? "thread" : "channel", channel_name: topicSlug || chatSlug,
-        ...(topicSlug ? { parent_channel_type: "channel", parent_channel_name: chatSlug } : {}),
-        content: request.content, timestamp: now, thread_id: null, chat_id: request.chatId,
+        sender_name: "External automation", sender_type: "system",
+        channel_type: "runtime", channel_name: "external",
+        content: request.content, timestamp: now, thread_id: null, chat_id: null,
         target, wake: true, wake_reason: "external-enqueue",
       };
       store.prepareInboxDelivery(envelope);
@@ -1030,7 +1012,7 @@ export function createHostShell({
         store.writeJson("externalEnqueue", external);
       }
       if (!existing) hostState.appendConversation(agent, {
-        direction: "in", from: request.senderName || "External automation", senderType: "system",
+        direction: "in", from: "External automation", senderType: "system",
         target, wake: true, text: request.content, messageId, at: now,
       });
       return {

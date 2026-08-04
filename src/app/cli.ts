@@ -81,8 +81,8 @@ Examples:
 Credentials, internal paths, serverId, activeAgent, and raw config are never exposed here.`,
   session: `Usage: larkin session reset --agent <App ID> --json [--wait-ready <seconds>]
 Atomically replace one idle, zero-backlog Agent Runtime session through authenticated local control.`,
-  agent: `Usage: larkin agent enqueue --agent <App ID> --idempotency-key <key> --chat-id <oc_id>
-       [--reply-to <om_id> --in-topic] [--sender-name <name>] --content-file <path|-> --json
+  agent: `Usage: larkin agent enqueue --agent <App ID> --idempotency-key <key>
+       --content-file <path|-> --json
 Idempotently enqueue one external automation message through authenticated local control.`,
 };
 

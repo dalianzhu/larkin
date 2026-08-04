@@ -15,9 +15,6 @@ export interface DashboardRecoveryResponse { ok: boolean; operationId: string; s
 export interface AgentEnqueueInput {
   agentId: string;
   idempotencyKey: string;
-  chatId: string;
-  replyTo?: string;
-  senderName?: string;
   content: string;
 }
 export interface AgentEnqueueResponse {
@@ -60,8 +57,6 @@ const AGENT_ID = /^cli_[A-Za-z0-9]+$/;
 const OPERATION_ID = /^[A-Za-z0-9_-]{8,128}$/;
 const AUTHORIZATION = /^[A-Za-z0-9_-]{43,128}$/;
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
-const CHAT_ID = /^oc_[A-Za-z0-9_-]+$/;
-const MESSAGE_ID = /^om_[A-Za-z0-9_-]+$/;
 const MAX_CONTROL_REQUEST_BYTES = 65_536;
 const MAX_EXTERNAL_CONTENT_BYTES = 32_768;
 const UNIX_SOCKET_PATH_MAX_BYTES = process.platform === "darwin" ? 103 : 107;
@@ -148,15 +143,9 @@ function parseRequest(line: string): AgentControlRequest {
   }
   if (value.operation === "agent-enqueue") {
     if (Object.keys(value).some((key) => ![
-      "agentId", "authorization", "operation", "idempotencyKey", "chatId", "replyTo", "senderName", "content",
+      "agentId", "authorization", "operation", "idempotencyKey", "content",
     ].includes(key))) throw new Error("agent enqueue control request 包含未知字段");
     if (!IDEMPOTENCY_KEY.test(String(value.idempotencyKey || ""))) throw new Error("invalid enqueue idempotency key");
-    if (!CHAT_ID.test(String(value.chatId || ""))) throw new Error("invalid enqueue chat id");
-    if (value.replyTo !== undefined && !MESSAGE_ID.test(String(value.replyTo))) throw new Error("invalid enqueue reply message id");
-    if (value.senderName !== undefined && (typeof value.senderName !== "string" || !value.senderName.trim()
-        || value.senderName.length > 80 || /[\u0000-\u001f\u007f]/.test(value.senderName))) {
-      throw new Error("invalid enqueue sender name");
-    }
     if (typeof value.content !== "string" || !value.content.trim() || value.content.includes("\u0000")
         || Buffer.byteLength(value.content) > MAX_EXTERNAL_CONTENT_BYTES) {
       throw new Error("invalid enqueue content");
@@ -596,9 +585,6 @@ export function createAgentControlServer({
                   return await enqueue({
                     agentId: enqueueRequest.agentId,
                     idempotencyKey: enqueueRequest.idempotencyKey,
-                    chatId: enqueueRequest.chatId,
-                    ...(enqueueRequest.replyTo ? { replyTo: enqueueRequest.replyTo } : {}),
-                    ...(enqueueRequest.senderName ? { senderName: enqueueRequest.senderName } : {}),
                     content: enqueueRequest.content,
                   });
                 } catch (error) {
@@ -805,8 +791,7 @@ export async function requestAgentEnqueue(input: AgentEnqueueInput & {
     larkinHome: input.larkinHome, timeoutMs: input.timeoutMs,
     request: {
       operation: "agent-enqueue", agentId: input.agentId, idempotencyKey: input.idempotencyKey,
-      chatId: input.chatId, ...(input.replyTo ? { replyTo: input.replyTo } : {}),
-      ...(input.senderName ? { senderName: input.senderName } : {}), content: input.content,
+      content: input.content,
     },
   });
 }

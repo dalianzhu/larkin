@@ -7,9 +7,6 @@ interface AgentControlCliIo { stdout(value: string): void; stderr(value: string)
 interface EnqueueArguments {
   agentId: string;
   idempotencyKey: string;
-  chatId: string;
-  replyTo?: string;
-  senderName?: string;
   contentFile: string;
 }
 
@@ -17,16 +14,14 @@ function parseEnqueueArguments(args: readonly string[]): EnqueueArguments {
   if (args[0] !== "enqueue") throw new Error("unsupported agent subcommand");
   const values = new Map<string, string>();
   let json = false;
-  let inTopic = false;
   for (let index = 1; index < args.length; index += 1) {
     const token = args[index];
-    if (token === "--json" || token === "--in-topic") {
-      if (token === "--json" ? json : inTopic) throw new Error(`duplicate flag: ${token}`);
-      if (token === "--json") json = true;
-      else inTopic = true;
+    if (token === "--json") {
+      if (json) throw new Error(`duplicate flag: ${token}`);
+      json = true;
       continue;
     }
-    if (!["--agent", "--idempotency-key", "--chat-id", "--reply-to", "--sender-name", "--content-file"].includes(token)) {
+    if (!["--agent", "--idempotency-key", "--content-file"].includes(token)) {
       throw new Error(token.startsWith("-") ? `unknown flag: ${token}` : `unexpected positional: ${token}`);
     }
     if (values.has(token)) throw new Error(`duplicate flag: ${token}`);
@@ -40,21 +35,11 @@ function parseEnqueueArguments(args: readonly string[]): EnqueueArguments {
   if (!json) throw new Error("--json is required");
   const agentId = values.get("--agent") || "";
   const idempotencyKey = values.get("--idempotency-key") || "";
-  const chatId = values.get("--chat-id") || "";
-  const replyTo = values.get("--reply-to");
-  const senderName = values.get("--sender-name");
   const contentFile = values.get("--content-file") || "";
   if (!/^cli_[A-Za-z0-9]+$/.test(agentId)) throw new Error("--agent requires an exact App ID");
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(idempotencyKey)) throw new Error("invalid --idempotency-key");
-  if (!/^oc_[A-Za-z0-9_-]+$/.test(chatId)) throw new Error("invalid --chat-id");
-  if (replyTo && !/^om_[A-Za-z0-9_-]+$/.test(replyTo)) throw new Error("invalid --reply-to");
-  if (Boolean(replyTo) !== inTopic) throw new Error("--reply-to and --in-topic must be used together");
-  if (senderName && (!senderName.trim() || senderName.length > 80 || /[\u0000-\u001f\u007f]/.test(senderName))) {
-    throw new Error("invalid --sender-name");
-  }
   if (!contentFile) throw new Error("--content-file is required");
-  return { agentId, idempotencyKey, chatId, ...(replyTo ? { replyTo } : {}),
-    ...(senderName ? { senderName } : {}), contentFile };
+  return { agentId, idempotencyKey, contentFile };
 }
 
 function readContent(file: string): string {
@@ -88,8 +73,7 @@ export async function runAgentControlCli(
     const loaded = loadConfig(env);
     const result = await (dependencies.request ?? requestAgentEnqueue)({
       larkinHome: loaded.config.larkinHome, agentId: parsed.agentId, idempotencyKey: parsed.idempotencyKey,
-      chatId: parsed.chatId, ...(parsed.replyTo ? { replyTo: parsed.replyTo } : {}),
-      ...(parsed.senderName ? { senderName: parsed.senderName } : {}), content,
+      content,
     });
     io.stdout(`${JSON.stringify({
       ok: result.ok, agent_id: result.agentId, status: result.status,

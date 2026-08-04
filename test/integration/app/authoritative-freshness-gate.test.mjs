@@ -252,7 +252,7 @@ test("idempotency is stable for independently current attempts at one seen bound
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
-test("cursor update matrix advances poll and exact JSON head reads, but not check or paged history", () => {
+test("cursor update matrix advances poll, verified message lookup, and exact JSON head reads, but not check or paged history", () => {
   const f = fixture();
   try {
     const raw = { message_id: "om_matrix", chat_id: "oc_matrix", create_time: "700", update_time: "700", content: "full body" };
@@ -291,9 +291,9 @@ test("cursor update matrix advances poll and exact JSON head reads, but not chec
     assert.equal(f.lark(["im", "+messages-mget", "--message-ids", "om_partial", "--json"], {
       LARKIN_TEST_PROVIDER_STDOUT: partialSnapshot,
     }).status, 0);
-    assert.equal(f.lark(["im", "+messages-send", "--chat-id", "oc_partial", "--text", "blocked"], {
+    assert.equal(f.lark(["im", "+messages-send", "--chat-id", "oc_partial", "--text", "current"], {
       LARKIN_TEST_PROVIDER_HISTORY: partialSnapshot,
-    }).status, 3, "partial message reads must not advance a target head cursor");
+    }).status, 0, "authoritative message lookup reconciles and advances the exact target head cursor");
 
     const threadSnapshot = f.history([{
       message_id: "om_thread_head", chat_id: "oc_thread_head", thread_id: "omt_head", create_time: "950", update_time: "950",
@@ -624,7 +624,7 @@ test("history scope fields are mandatory and a second attempt never opens the ga
   }
 });
 
-test("cursor matrix never advances from formatted, ranged, partial, ascending, or failed reads", () => {
+test("cursor matrix never advances from formatted, ranged, partial, ascending, or failed reads", { timeout: 10_000 }, () => {
   const cases = [
     { id: "pretty", read: ["im", "+chat-messages-list", "--chat-id", "oc_pretty", "--order", "desc", "--format", "pretty"], chat: "oc_pretty" },
     { id: "table", read: ["im", "+chat-messages-list", "--chat-id", "oc_table", "--order", "desc", "--format", "table"], chat: "oc_table" },

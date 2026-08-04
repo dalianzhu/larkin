@@ -730,6 +730,21 @@ export class AgentStateStore {
     });
   }
 
+  /** Register the real provider target learned from a successful authoritative read. */
+  observeInboxMessageTarget(messageId: string, target: string): void {
+    if (!messageId || !target) throw new Error("observed Inbox message target is incomplete");
+    this.withInboxLock(this.file("inbox"), () => {
+      const state = this.inboxState();
+      const current = state.targets[target] ?? { latest_received_seq: 0, model_seen_seq: 0 };
+      const seq = Math.max(1, current.latest_received_seq);
+      state.targets[target] = { latest_received_seq: seq, model_seen_seq: Math.min(current.model_seen_seq, seq) };
+      state.messages[messageId] = { target, seq };
+      const messageIds = Object.keys(state.messages);
+      for (const stale of messageIds.slice(0, Math.max(0, messageIds.length - 2_048))) delete state.messages[stale];
+      this.writeJson("inboxState", state);
+    });
+  }
+
   listInboxDrafts(): InboxDraft[] {
     return this.withInboxLock(this.file("inbox"), () => Object.values(this.inboxState().drafts)
       .filter((draft) => draft.status === "held" || draft.status === "sending")

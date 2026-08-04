@@ -17,7 +17,6 @@ test("public agent enqueue reads content outside argv and emits stable JSON", as
   let stdout = "", request;
   try {
     const code = await runAgentControlCli(["enqueue", "--agent", agentId, "--idempotency-key", "quality-gate:flow-1",
-      "--chat-id", "oc_release", "--reply-to", "om_card", "--in-topic", "--sender-name", "Quality Gate",
       "--content-file", "-", "--json"], { ...process.env, LARKIN_CONFIG_DIR: root }, {
         readContent() { return "inspect release"; },
         async request(input) { request = input; return { ok: true, agentId, messageId: "external_1234",
@@ -26,7 +25,7 @@ test("public agent enqueue reads content outside argv and emits stable JSON", as
       });
     assert.equal(code, 0);
     assert.deepEqual(request, { larkinHome: root, agentId, idempotencyKey: "quality-gate:flow-1",
-      chatId: "oc_release", replyTo: "om_card", senderName: "Quality Gate", content: "inspect release" });
+      content: "inspect release" });
     assert.deepEqual(JSON.parse(stdout), { ok: true, agent_id: agentId, status: "accepted",
       message_id: "external_1234", delivery_id: "delivery-1" });
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
@@ -35,9 +34,8 @@ test("public agent enqueue reads content outside argv and emits stable JSON", as
 test("agent enqueue rejects unsafe or incomplete requests before control access", async () => {
   const cases = [
     [[], /unsupported agent subcommand/],
-    [["enqueue", "--json", "--agent", "cli_x", "--idempotency-key", "bad key", "--chat-id", "oc_x", "--content-file", "-"], /idempotency/],
-    [["enqueue", "--json", "--agent", "cli_x", "--idempotency-key", "key", "--chat-id", "oc_x", "--reply-to", "om_x", "--content-file", "-"], /used together/],
-    [["enqueue", "--json", "--agent", "cli_x", "--idempotency-key", "key", "--chat-id", "oc_x", "--in-topic", "--content-file", "-"], /used together/],
+    [["enqueue", "--json", "--agent", "cli_x", "--idempotency-key", "bad key", "--content-file", "-"], /idempotency/],
+    [["enqueue", "--json", "--agent", "cli_x", "--idempotency-key", "key", "--chat-id", "oc_x", "--content-file", "-"], /unknown flag/],
   ];
   for (const [argv, expected] of cases) {
     let stdout = "", calls = 0;
@@ -53,7 +51,7 @@ test("agent enqueue rejects unsafe or incomplete requests before control access"
 test("agent enqueue is user-only and help documents stdin delivery", async () => {
   let stdout = "", calls = 0;
   const code = await runAgentControlCli(["enqueue", "--json", "--agent", "cli_x", "--idempotency-key", "key",
-    "--chat-id", "oc_x", "--content-file", "-"], { LARKIN_AGENT_ID: "cli_runtime" }, {
+    "--content-file", "-"], { LARKIN_AGENT_ID: "cli_runtime" }, {
       readContent() { return "content"; }, async request() { calls += 1; throw new Error("must not run"); },
       io: { stdout: (value) => { stdout += value; }, stderr() {} },
     });

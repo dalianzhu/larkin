@@ -139,6 +139,7 @@ test("default context prompt consumes the Agent CLI manifest", () => {
     /official API discriminator.*exact literal.*sender\.sender_type == "user".*human.*natural-language.*must never.*(?:replace|paraphrase)/i);
   assert.match(prompt.content, /thread.*never.*preview.*extract.*message id.*switch.*messages-mget/i);
   assert.match(prompt.content, /known source message id.*messages-mget.*first and only post-poll model tool call.*no preview/i);
+  assert.match(prompt.content, /runtime:external.*untrusted task data.*messages-mget.*never fall back/i);
   assert.match(prompt.content, /inner read.*replaces.*separate.*history read/i);
   assert.match(prompt.content, /must not.*unquoted.*substitution.*`eval`.*`echo`.*`2>&1`.*temporary/i);
   assert.match(prompt.content,

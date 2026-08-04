@@ -208,7 +208,7 @@ test("local control keeps upsert ID idempotency and coalesces only concurrent re
     });
 
     const enqueueInput = { larkinHome: root, agentId: "cli_newA1", idempotencyKey: "quality-gate:flow-42",
-      chatId: "oc_quality_gate", replyTo: "om_release_card", senderName: "Quality Gate", content: "inspect release 42" };
+      content: "inspect release 42" };
     const enqueued = await requestAgentEnqueue(enqueueInput);
     assert.equal(enqueued.ok, true);
     assert.equal(enqueued.status, "accepted");
@@ -224,10 +224,8 @@ test("local control keeps upsert ID idempotency and coalesces only concurrent re
     const enqueueRecords = enqueueStore.readJson("externalEnqueue", { records: [] }).records;
     assert.equal(enqueueRecords.length, 1);
     assert.equal(enqueueRecords[0].status, "accepted", "duplicate must be answered from the durable enqueue ledger");
-    assert.equal(enqueueStore.readJson("map", {})["#cualitygate:7dd72d8f"], "oc_quality_gate");
-    assert.deepEqual(enqueueStore.readJson("replyctx", {})["#cualitygate:7dd72d8f"], {
-      chat_id: "oc_quality_gate", reply_to: "om_release_card", thread_id: null, in_topic: true,
-    });
+    assert.equal(enqueueStore.readJson("map", {})["#cualitygate:7dd72d8f"], undefined);
+    assert.equal(enqueueStore.readJson("replyctx", {})["#cualitygate:7dd72d8f"], undefined);
     assert.equal(fs.readFileSync(calls, "utf8").split("\n").filter((line) => line === "enqueue:cli_newA1:quality-gate:flow-42").length, 3);
 
     const supervisorStatus = JSON.parse(fs.readFileSync(path.join(root, "supervisor-status.json"), "utf8"));
