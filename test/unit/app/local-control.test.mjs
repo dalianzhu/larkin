@@ -13,6 +13,7 @@ import {
   createAgentControlServer,
   initializeControlAuthority,
   requestAgentUpsert,
+  requestAgentEnqueue,
   requestSessionReset,
 } from "../../../dist/app/local-control.mjs";
 import { createAgentStateStore } from "../../../dist/agent/agent-state-store.mjs";
@@ -205,6 +206,27 @@ test("local control keeps upsert ID idempotency and coalesces only concurrent re
       ready_for_fresh_scenario: false, inbound_observed: false, code: "channel_reconnecting",
       error: "Agent cli_newA1 channel is reconnecting",
     });
+
+    const enqueueInput = { larkinHome: root, agentId: "cli_newA1", idempotencyKey: "quality-gate:flow-42",
+      content: "inspect release 42" };
+    const enqueued = await requestAgentEnqueue(enqueueInput);
+    assert.equal(enqueued.ok, true);
+    assert.equal(enqueued.status, "accepted");
+    assert.match(enqueued.messageId, /^external_[a-f0-9]{32}$/);
+    const duplicate = await requestAgentEnqueue(enqueueInput);
+    assert.equal(duplicate.ok, true);
+    assert.equal(duplicate.status, "duplicate");
+    assert.equal(duplicate.messageId, enqueued.messageId);
+    const conflict = await requestAgentEnqueue({ ...enqueueInput, content: "different payload" });
+    assert.equal(conflict.ok, false);
+    assert.equal(conflict.code, "idempotency_conflict");
+    const enqueueStore = createAgentStateStore(root, "cli_newA1");
+    const enqueueRecords = enqueueStore.readJson("externalEnqueue", { records: [] }).records;
+    assert.equal(enqueueRecords.length, 1);
+    assert.equal(enqueueRecords[0].status, "accepted", "duplicate must be answered from the durable enqueue ledger");
+    assert.equal(enqueueStore.readJson("map", {})["#cualitygate:7dd72d8f"], undefined);
+    assert.equal(enqueueStore.readJson("replyctx", {})["#cualitygate:7dd72d8f"], undefined);
+    assert.equal(fs.readFileSync(calls, "utf8").split("\n").filter((line) => line === "enqueue:cli_newA1:quality-gate:flow-42").length, 3);
 
     const supervisorStatus = JSON.parse(fs.readFileSync(path.join(root, "supervisor-status.json"), "utf8"));
     const daemonStatus = JSON.parse(fs.readFileSync(path.join(root, "daemon-status.json"), "utf8"));

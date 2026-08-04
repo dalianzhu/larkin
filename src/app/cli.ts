@@ -38,6 +38,7 @@ const routes: Record<string, Route> = {
   chats: ["agent-config", "chats"],
   config: ["agent-config", "config"],
   session: ["session-cli"],
+  agent: ["agent-control-cli"],
 };
 const runtimeAgentAuthority = typeof process.env.LARKIN_AGENT_ID === "string"
   && process.env.LARKIN_AGENT_ID.trim().length > 0;
@@ -80,6 +81,9 @@ Examples:
 Credentials, internal paths, serverId, activeAgent, and raw config are never exposed here.`,
   session: `Usage: larkin session reset --agent <App ID> --json [--wait-ready <seconds>]
 Atomically replace one idle, zero-backlog Agent Runtime session through authenticated local control.`,
+  agent: `Usage: larkin agent enqueue --agent <App ID> --idempotency-key <key>
+       --content-file <path|-> --json
+Idempotently enqueue one external automation message through authenticated local control.`,
 };
 
 if (command === "--version" || command === "-V") {
@@ -125,6 +129,7 @@ Usage: larkin <command>
   chats            List known chats; use free/strict <oc_id> to configure mention requirements
   config           Inspect effective config/source, edit mention inheritance, or explicitly apply runtime changes
   session reset    Replace one idle, zero-backlog Agent Runtime session for a fresh scenario
+  agent enqueue    Idempotently enqueue an external automation message for one Agent
   <lark-cli 命令组>  im/docs/wiki/drive 等 lark-cli 命令原样转发，机器人身份已锁定（如 larkin im +chat-list）
 Getting started:
   First-time setup: larkin setup

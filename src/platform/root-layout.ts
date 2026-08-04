@@ -20,6 +20,7 @@ export interface AgentStatePaths {
   inboxState: string;
   freshnessState: string;
   interactions: string;
+  externalEnqueue: string;
   conversation: string;
   inbox: string;
   reminders: string;
@@ -92,6 +93,7 @@ export class TargetRootLayout {
       inboxState: path.join(root, "inbox-state.json"),
       freshnessState: path.join(root, "freshness-state.json"),
       interactions: path.join(root, "interactions.json"),
+      externalEnqueue: path.join(root, "external-enqueue.json"),
       conversation: path.join(root, "conversation.ndjson"),
       inbox: path.join(root, "feishu-inbox.ndjson"),
       reminders: path.join(root, "reminders.json"),

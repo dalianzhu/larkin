@@ -9,7 +9,7 @@ const ROOT = path.resolve(import.meta.dirname, "../../..");
 const launcher = await import(pathToFileURL(path.join(ROOT, "dist/app/lark-cli.mjs")).href);
 const stateModule = await import(pathToFileURL(path.join(ROOT, "dist/agent/agent-state-store.mjs")).href);
 
-function fixture(history = { ok: true, identity: "bot", data: { messages: [] } }) {
+function fixture(history = { ok: true, identity: "bot", data: { messages: [] } }, lookup = null) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-native-lark-cli-"));
   const agentId = "cli_nativeLarkA1";
   fs.writeFileSync(path.join(root, "config.json"), `${JSON.stringify({
@@ -25,6 +25,9 @@ function fixture(history = { ok: true, identity: "bot", data: { messages: [] } }
     calls.push({ command, args, options });
     const isHistory = ["+chat-messages-list", "+threads-messages-list"].includes(args[2])
       || (args[1] === "api" && args[2] === "GET" && args[3] === "/open-apis/im/v1/messages");
+    if (args[2] === "+messages-mget" && lookup) {
+      return { status: 0, signal: null, output: [], pid: 1, stdout: JSON.stringify(lookup), stderr: "", error: undefined };
+    }
     return isHistory
       ? { status: 0, signal: null, output: [], pid: 1, stdout: JSON.stringify(history), stderr: "", error: undefined }
       : writeResult;
@@ -100,6 +103,22 @@ test("native help and safe reads remain byte-preserving passthroughs", () => {
     });
     assert.equal(f.calls.length, 1);
     assert.equal(fs.existsSync(f.store.paths.freshnessState), false);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("authoritative message lookup makes real provider messages guarded-reply addressable", () => {
+  const message = { message_id: "om_observed", chat_id: "oc_observed", create_time: "100", update_time: "100" };
+  const f = fixture({ ok: true, identity: "bot", data: { messages: [message] } },
+    { ok: true, identity: "bot", data: { messages: [message] } });
+  try {
+    const read = f.run(["im", "+messages-mget", "--message-ids", "om_observed", "--no-reactions", "--json"]);
+    assert.equal(read.code, 0);
+    assert.equal(f.store.resolveInboxMessageTarget("om_observed"), "chat:oc_observed");
+    f.setWriteResult({ status: 0, signal: null, output: [], pid: 1,
+      stdout: JSON.stringify({ ok: true, data: { message } }), stderr: "", error: undefined });
+    const reply = f.run(["im", "+messages-reply", "--message-id", "om_observed", "--reply-in-thread", "--text", "done", "--json"]);
+    assert.equal(reply.code, 0, reply.stderr);
+    assert.equal(f.calls.some((call) => call.args.includes("+messages-reply")), true);
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 

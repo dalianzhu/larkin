@@ -6,11 +6,11 @@ import { acquireProcessLock, inspectProcess } from "../platform/process-state.js
 import { targetKeyOfInboxEnvelope, type InboxEnvelope } from "./inbox-projection.js";
 
 export type JsonStateKey = "agentState" | "status" | "map" | "replyctx" | "botIdentity" |
-  "senderProfiles" | "readReceipts" | "pendingReact" | "runtimeDeliveries" | "inboxState" | "freshnessState" | "reminders" | "interactions";
+  "senderProfiles" | "readReceipts" | "pendingReact" | "runtimeDeliveries" | "inboxState" | "freshnessState" | "reminders" | "interactions" | "externalEnqueue";
 export type NdjsonStateKey = "conversation" | "inbox";
 
 const JSON_KEYS: ReadonlySet<string> = new Set([
-  "agentState", "status", "map", "replyctx", "botIdentity", "senderProfiles", "readReceipts", "pendingReact", "runtimeDeliveries", "inboxState", "freshnessState", "reminders", "interactions",
+  "agentState", "status", "map", "replyctx", "botIdentity", "senderProfiles", "readReceipts", "pendingReact", "runtimeDeliveries", "inboxState", "freshnessState", "reminders", "interactions", "externalEnqueue",
 ]);
 const NDJSON_KEYS: ReadonlySet<string> = new Set(["conversation", "inbox"]);
 const INBOX_LOCK_TIMEOUT_MS = 2_000;
@@ -727,6 +727,21 @@ export class AgentStateStore {
       if (known) return known;
       const row = this.readNdjson<InboxEnvelope>("inbox").find((candidate) => candidate.message_id === messageId);
       return row ? (typeof row.target === "string" ? row.target : targetKeyOfInboxEnvelope(row)) : null;
+    });
+  }
+
+  /** Register the real provider target learned from a successful authoritative read. */
+  observeInboxMessageTarget(messageId: string, target: string): void {
+    if (!messageId || !target) throw new Error("observed Inbox message target is incomplete");
+    this.withInboxLock(this.file("inbox"), () => {
+      const state = this.inboxState();
+      const current = state.targets[target] ?? { latest_received_seq: 0, model_seen_seq: 0 };
+      const seq = Math.max(1, current.latest_received_seq);
+      state.targets[target] = { latest_received_seq: seq, model_seen_seq: Math.min(current.model_seen_seq, seq) };
+      state.messages[messageId] = { target, seq };
+      const messageIds = Object.keys(state.messages);
+      for (const stale of messageIds.slice(0, Math.max(0, messageIds.length - 2_048))) delete state.messages[stale];
+      this.writeJson("inboxState", state);
     });
   }
 

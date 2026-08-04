@@ -464,6 +464,46 @@ function eligibleThreadHeadRead(argv: readonly string[]): string | null {
   return (!format || format === "json") && order === "desc" ? rawFlagValue(argv, "--thread") : null;
 }
 
+function isMessageLookupRead(argv: readonly string[]): boolean {
+  const nativeArgv = nativeArgvBeforeBoundary(argv);
+  const im = nativeArgv.indexOf("im");
+  return im >= 0 && nativeArgv[im + 1] === "+messages-mget"
+    && !["--jq", "-q"].some((flag) => nativeArgv.includes(flag)
+      || nativeArgv.some((argument) => argument.startsWith(`${flag}=`)))
+    && (!rawFlagValue(argv, "--format") || rawFlagValue(argv, "--format") === "json");
+}
+
+function observeMessageLookup(
+  result: SpawnSyncReturns<string>, env: Env, io: LarkCliIo,
+  dependencies: LarkCliLauncherDependencies, store: AgentStateStore,
+): void {
+  if (result.error || result.status !== 0) return;
+  const value = JSON.parse(result.stdout || "") as { ok?: unknown; data?: { messages?: unknown; items?: unknown } };
+  const rows = value?.ok === true && value.data ? (value.data.messages ?? value.data.items) : null;
+  if (!Array.isArray(rows)) throw new Error("message lookup omitted messages");
+  const targets = new Map<string, FreshnessTarget>();
+  for (const row of rows) {
+    if (!row || typeof row !== "object") throw new Error("message lookup contained a malformed message");
+    const message = row as { message_id?: unknown; chat_id?: unknown; thread_id?: unknown };
+    if (typeof message.message_id !== "string" || !message.message_id
+        || typeof message.chat_id !== "string" || !message.chat_id) {
+      throw new Error("message lookup omitted message_id or chat_id");
+    }
+    const inboxTarget = typeof message.thread_id === "string" && message.thread_id
+      ? `thread:${message.chat_id}:${message.thread_id}` : `chat:${message.chat_id}`;
+    store.observeInboxMessageTarget(message.message_id, inboxTarget);
+    const freshnessTarget = feishuImTarget(inboxTarget);
+    targets.set(serializeFeishuImTarget(freshnessTarget), freshnessTarget);
+  }
+  for (const [targetKey, target] of targets) {
+    try {
+      const snapshot = parseHistory(callNative(probeArgv(target), env, io, dependencies), target, true);
+      const cursor = feishuImFreshnessAdapter.cursor(snapshot);
+      if (cursor) store.mergeFreshnessCursor(targetKey, cursor, mergeFeishuImCursor, freshnessGeneration(env));
+    } catch { /* the verified message remains reply-addressable; write-time freshness will fail closed */ }
+  }
+}
+
 function displayedHeadIds(result: SpawnSyncReturns<string>, target: FreshnessTarget): string[] {
   if (result.error || result.status !== 0) throw new Error("displayed history read failed");
   const value = JSON.parse(result.stdout || "") as { ok?: unknown; data?: { messages?: unknown; items?: unknown } };
@@ -489,6 +529,10 @@ function passthroughWithObservation(
 ): number {
   const effectiveArgv = boundedHistoryArgv(argv);
   const result = callNative(effectiveArgv, env, io, dependencies);
+  if (isMessageLookupRead(effectiveArgv)) {
+    try { observeMessageLookup(result, env, io, dependencies, store); }
+    catch { /* malformed successful output is never trusted as routing state */ }
+  }
   let target = conditionalHeadReadTarget(effectiveArgv);
   const threadLocator = eligibleThreadHeadRead(effectiveArgv);
   if (!target && threadLocator && !result.error && result.status === 0) {
@@ -535,7 +579,8 @@ function passthroughWithObservation(
 
 function requiresCapturedPassthrough(argv: readonly string[]): boolean {
   const effectiveArgv = boundedHistoryArgv(argv);
-  return conditionalHeadReadTarget(effectiveArgv) !== null || eligibleThreadHeadRead(effectiveArgv) !== null;
+  return conditionalHeadReadTarget(effectiveArgv) !== null || eligibleThreadHeadRead(effectiveArgv) !== null
+    || isMessageLookupRead(effectiveArgv);
 }
 
 function writeResponseMessage(result: SpawnSyncReturns<string>): FeishuImMessage | null {
