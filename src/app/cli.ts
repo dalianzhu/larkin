@@ -39,20 +39,23 @@ const routes: Record<string, Route> = {
   config: ["agent-config", "config"],
   session: ["session-cli"],
   agent: ["agent-control-cli"],
+  "pi-auth": ["pi-auth"],
+  telemetry: ["telemetry"],
 };
 const runtimeAgentAuthority = typeof process.env.LARKIN_AGENT_ID === "string"
   && process.env.LARKIN_AGENT_ID.trim().length > 0;
 const runtimeAgentCommand = runtimeAgentAuthority
   && ["inbox", "reminder", "interaction", "profile", "config"].includes(command);
 if (runtimeAgentCommand) routes[command] = ["agent-cli", command];
+if (runtimeAgentAuthority && command === "comment") routes.comment = ["lark-cli", "comment"];
 
 // Help stays in the outer CLI so it never loads configuration, inspects a process,
 // or starts a foreground service merely to print usage.
 const commandHelp: Record<string, string> = {
   start: `Usage: larkin start [--agent <App ID> | --agents <App ID,...>]
 Start one foreground supervisor for the daemon and local dashboard, or reuse it.`,
-  setup: `Usage: larkin setup [--runtime <runtime>] [--no-start]
-Run the interactive setup to create or connect a bot and configure its Agent.`,
+  setup: `Usage: larkin setup [--runtime <builtin-pi|external-pi|codex|claude>] [--provider <id> --api-key <key>]
+Run setup to create or connect a bot, configure its Agent, and attach it. Interactive terminals keep the guided flow; Agent-driven (non-TTY) runs default to builtin-pi and need --provider/--api-key (or --runtime external-pi).`,
   status: `Usage: larkin status [--json]
 Show Agent configuration, bot identity, credentials, and connection status. Use --json for readiness automation.`,
   agents: `Usage: larkin agents [--json]
@@ -84,6 +87,13 @@ Atomically replace one idle, zero-backlog Agent Runtime session through authenti
   agent: `Usage: larkin agent enqueue --agent <App ID> --idempotency-key <key>
        --content-file <path|-> --json
 Idempotently enqueue one external automation message through authenticated local control.`,
+  "pi-auth": `Usage: larkin pi-auth status [--agent <App ID>] [--json]
+       larkin pi-auth logout <provider> [--agent <App ID>]
+Show non-sensitive official Pi credential metadata or remove one target provider credential.`,
+  comment: `Usage: larkin comment reply --message-id <doc_comment_message_id> --text '<reply>' --json
+Reply once, as the Runtime-bound Bot, to the exact cloud-document comment locator supplied by canonical Inbox.`,
+  telemetry: `Usage: larkin telemetry <status|export|import|flush>
+Inspect the durable local trace queue, move an offline bundle, or upload queued OTLP traces.`,
 };
 
 if (command === "--version" || command === "-V") {
@@ -116,7 +126,7 @@ if (!routes[command] && !wantsHelp) {
 }
 
 if (!routes[command]) {
-  console.log(`larkin — Run persistent-personality agents on Feishu
+  console.log(`larkin — Run persistent-personality agents on Feishu (Lark)
 
 Usage: larkin <command>
   setup            Create or connect a bot, configure its Agent, start it, and open the dashboard
@@ -130,6 +140,9 @@ Usage: larkin <command>
   config           Inspect effective config/source, edit mention inheritance, or explicitly apply runtime changes
   session reset    Replace one idle, zero-backlog Agent Runtime session for a fresh scenario
   agent enqueue    Idempotently enqueue an external automation message for one Agent
+  pi-auth          Show non-sensitive built-in Pi auth status or logout one provider
+  comment reply    Reply to the exact cloud-document comment bound by a polled Inbox message
+  telemetry        Inspect, export, import, or flush the durable OpenTelemetry trace queue
   <lark-cli 命令组>  im/docs/wiki/drive 等 lark-cli 命令原样转发，机器人身份已锁定（如 larkin im +chat-list）
 Getting started:
   First-time setup: larkin setup

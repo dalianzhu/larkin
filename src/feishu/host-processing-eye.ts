@@ -164,6 +164,7 @@ export class ProcessingEyeOrchestrator {
         }
       });
     }
+    // 执行结束（含正常完成）：只摘除 👀，不再追加任何完成 reaction（用户 2026-08-12 要求）。
     this.log(`👀 已摘 agent=${agent.name} n=${list.length} 原因=${reason || "?"}`);
   }
 

@@ -13,6 +13,11 @@ import {
 import * as larkinConfig from "../platform/config.js";
 import { resolveOfficialLarkCli, type OfficialLarkCliCommand } from "./official-lark-cli.js";
 import { assertAgentWorkspaceBound, managedLarkCliEnv } from "./agent-lark-cli-workspace.js";
+import { parseDocumentCommentTarget } from "../feishu/document-comment.js";
+import { SpanKind } from "@opentelemetry/api";
+import { loadTelemetryConfig } from "../platform/telemetry-config.js";
+import { telemetrySingleton, type TelemetryRuntime } from "../platform/telemetry-tracing.js";
+import { packageVersion } from "../platform/build-info.js";
 
 type Env = Record<string, string | undefined>;
 
@@ -27,6 +32,7 @@ export interface LarkCliLauncherDependencies {
   nativeCommand?: OfficialLarkCliCommand;
   stateStore?: AgentStateStore;
   now?(): number;
+  telemetry?: TelemetryRuntime;
 }
 
 function portableSignalCode(signal: NodeJS.Signals): number {
@@ -39,6 +45,7 @@ function portableSignalCode(signal: NodeJS.Signals): number {
 export type LarkCliCommandDecision =
   | { kind: "passthrough" }
   | { kind: "guarded"; operation: "send" | "reply" | "card" }
+  | { kind: "comment-reply" }
   | { kind: "denied"; reason: string };
 
 const HELP_FLAGS = new Set(["--help", "-h"]);
@@ -196,6 +203,9 @@ export function classifyLarkCliCommand(argv: readonly string[]): LarkCliCommandD
   const as = parsed.flags.get("--as");
   if (as && as !== "bot") return { kind: "denied", reason: "身份边界：Runtime 内 lark-cli 只允许 Bot identity" };
   const command = parsed.commandArgv[0] || "";
+  if (command === "comment") return exactPath(parsed.commandArgv, ["comment", "reply"])
+    ? { kind: "comment-reply" }
+    : { kind: "denied", reason: "comment 只支持绑定 canonical Inbox locator 的 `comment reply`" };
   if (MANAGEMENT_COMMANDS.has(command)) return { kind: "denied", reason: `身份边界：Runtime 不开放 lark-cli ${command} 管理命令` };
   if (command === "event") return { kind: "denied", reason: "Runtime 不允许另开 event 连接与 Host 争抢事件流" };
   if (USER_ONLY_COMMANDS.has(command)) return { kind: "denied", reason: `${command} 是 user-only identity 域` };
@@ -241,6 +251,146 @@ export function classifyLarkCliCommand(argv: readonly string[]): LarkCliCommandD
     : noncanonicalProtectedDecision();
   if (protectedPaths.length > 0) return noncanonicalProtectedDecision();
   return { kind: "passthrough" };
+}
+
+function parseCommentReply(argv: readonly string[]): { messageId: string; text: string } {
+  const values = new Map<string, string>();
+  const positionals: string[] = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (argument === "--json") continue;
+    const inline = ["--message-id", "--text"].find((flag) => argument.startsWith(`${flag}=`));
+    const flag = inline ?? (["--message-id", "--text"].includes(argument) ? argument : null);
+    if (!flag) {
+      if (argument.startsWith("-")) throw new Error(`comment reply 不支持参数 ${argument}`);
+      positionals.push(argument);
+      continue;
+    }
+    if (values.has(flag)) throw new Error(`${flag} 只能指定一次`);
+    const value = inline ? argument.slice(flag.length + 1) : argv[++index];
+    if (value === undefined) throw new Error(`${flag} 需要值`);
+    values.set(flag, value);
+  }
+  if (positionals.length !== 2 || positionals[0] !== "comment" || positionals[1] !== "reply") {
+    throw new Error("用法: larkin comment reply --message-id <doc_comment_id> --text '<reply>' --json");
+  }
+  const messageId = values.get("--message-id") || "";
+  const text = values.get("--text") || "";
+  if (!/^doc_comment_[0-9a-f]{32}$/.test(messageId)) throw new Error("comment reply 需要 Inbox 提供的 doc_comment message id");
+  if (!text.trim()) throw new Error("comment reply 的 --text 不能为空");
+  if (text.length > 20_000) throw new Error("comment reply 的 --text 超过 20000 字符");
+  return { messageId, text };
+}
+
+type CommentReplyLedger = {
+  version: 1;
+  cursors?: Record<string, unknown>;
+  document_comment_replies?: Record<string, { digest: string; status: "sending" | "sent" | "failed"; updated_at: string }>;
+};
+
+type ImWriteMemoEntry = { message_id: string; updated_at: string };
+type ImWriteMemoState = {
+  version: 1;
+  cursors?: Record<string, unknown>;
+  im_write_memo?: Record<string, ImWriteMemoEntry>;
+};
+
+const IM_WRITE_MEMO_LIMIT = 512;
+
+// 只标注、不拦截：每次成功写把「实际生效的幂等 key → 服务端返回的 message_id」记进备忘。
+// 同 key 再次成功且服务端返回同一个 message_id，说明服务端走了幂等去重（没有产生新消息），
+// 返回 true 供输出标注 duplicate。拦截权始终在服务端，备忘不会吞掉任何发送。
+function recordImWriteMemo(store: AgentStateStore, key: string, messageId: string): boolean {
+  let duplicate = false;
+  store.mutateJson<ImWriteMemoState, void>("freshnessState", { version: 1, cursors: {} }, (state) => {
+    state.im_write_memo ??= {};
+    const prior = state.im_write_memo[key];
+    if (prior && prior.message_id === messageId) duplicate = true;
+    state.im_write_memo[key] = { message_id: messageId, updated_at: new Date().toISOString() };
+    const keys = Object.keys(state.im_write_memo);
+    for (const stale of keys.slice(0, Math.max(0, keys.length - IM_WRITE_MEMO_LIMIT))) delete state.im_write_memo[stale];
+  });
+  return duplicate;
+}
+
+function runCommentReply(
+  argv: readonly string[], privateEnv: Env, io: LarkCliIo, dependencies: LarkCliLauncherDependencies, store: AgentStateStore,
+): number {
+  const input = parseCommentReply(argv);
+  const targetKey = store.resolveInboxMessageTarget(input.messageId);
+  const target = targetKey ? parseDocumentCommentTarget(targetKey) : null;
+  if (!target) throw new Error("comment reply 无法从当前 Agent Inbox 绑定文档评论 locator；先 poll 该消息且不得跨 Agent/评论回复");
+  if (!store.inboxTargetIsFresh(targetKey!)) throw new Error("comment reply 需要先 poll 当前 document-comment target 的最新 Inbox 消息");
+  const digest = createHash("sha256").update(input.text).digest("hex");
+  const claim = store.mutateJson<CommentReplyLedger, "ready" | "sent" | "ambiguous" | "conflict">(
+    "freshnessState", { version: 1, cursors: {} }, (state) => {
+      state.document_comment_replies ??= {};
+      const prior = state.document_comment_replies[input.messageId];
+      if (prior?.status === "sent" && prior.digest === digest) return "sent";
+      if (prior?.status === "sending" && prior.digest === digest) return "ambiguous";
+      if (prior && prior.status !== "failed" && prior.digest !== digest) return "conflict";
+      state.document_comment_replies[input.messageId] = { digest, status: "sending", updated_at: new Date().toISOString() };
+      const keys = Object.keys(state.document_comment_replies);
+      for (const stale of keys.slice(0, Math.max(0, keys.length - 512))) delete state.document_comment_replies[stale];
+      return "ready";
+    },
+  );
+  if (claim === "sent") {
+    io.stdout(`${JSON.stringify({ ok: true, identity: "bot", committed: true, duplicate: true, target: targetKey })}\n`);
+    return 0;
+  }
+  if (claim === "ambiguous") throw new Error("comment reply 上次调用结果不明确，已 fail-closed 以避免重复评论；请由用户检查原评论线程");
+  if (claim === "conflict") throw new Error("comment reply 已为同一 Inbox 消息提交不同正文，拒绝覆盖或重复发送");
+  const nativeArgs = target.topLevel
+    ? [
+        "drive", "file.comments", "create_v2",
+        "--file-token", target.fileToken,
+        "--data", JSON.stringify({
+          file_type: target.fileType,
+          reply_elements: [{ type: "text", text: input.text }],
+        }),
+        "--as", "bot",
+      ]
+    : [
+        "drive", "file.comment.replys", "create",
+        "--file-token", target.fileToken,
+        "--comment-id", target.commentId,
+        "--file-type", target.fileType,
+        "--data", JSON.stringify({
+          content: { elements: [{ type: "text_run", text_run: { text: input.text } }] },
+        }),
+        "--as", "bot",
+      ];
+  const result = callNative(nativeArgs, privateEnv, io, dependencies);
+  const terminalStatus = !result.error && result.status === 0 ? "sent"
+    : definitiveProviderRejection(result) ? "failed" : null;
+  if (terminalStatus) {
+    store.mutateJson<CommentReplyLedger, void>("freshnessState", { version: 1, cursors: {} }, (state) => {
+      state.document_comment_replies ??= {};
+      state.document_comment_replies[input.messageId] = {
+        digest,
+        status: terminalStatus,
+        updated_at: new Date().toISOString(),
+      };
+    });
+  }
+  return emitNativeResult(result, io);
+}
+
+function definitiveProviderRejection(result: SpawnSyncReturns<string>): boolean {
+  if (result.error || result.signal || result.status === null || result.status === 0) return false;
+  for (const text of [result.stdout, result.stderr]) {
+    let value: unknown;
+    try { value = JSON.parse(text || ""); } catch { continue; }
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const response = value as { ok?: unknown; code?: unknown; error?: unknown };
+    const error = response.error && typeof response.error === "object" && !Array.isArray(response.error)
+      ? response.error as { code?: unknown } : null;
+    if ((response.ok === false || (typeof response.code === "number" && response.code !== 0))
+        && ((typeof response.code === "number" && response.code !== 0)
+          || (typeof error?.code === "number" && error.code !== 0))) return true;
+  }
+  return false;
 }
 
 function callNative(
@@ -374,9 +524,12 @@ function parseHistory(result: SpawnSyncReturns<string>, target: FreshnessTarget,
   return { messages };
 }
 
-function intentId(target: string, cursor: FeishuImCursor | null, argv: readonly string[]): string {
+// 防重编号只由 target + argv 决定：同一逻辑命令的重试永远得到同一个 key，
+// 服务端幂等去重才能生效。cursor（freshness 水位）会随每次观察读/冲突合并推进，
+// 掺入会让「已送达但回执丢失」的重试漂移成新 key，从而发出第二条消息。
+function intentId(target: string, argv: readonly string[]): string {
   const fingerprint = createHash("sha256")
-    .update(JSON.stringify([target, cursor, argv])).digest("hex");
+    .update(JSON.stringify([target, argv])).digest("hex");
   return `larkin-${fingerprint.slice(0, 32)}`;
 }
 
@@ -618,6 +771,27 @@ function emitNativeResult(result: SpawnSyncReturns<string>, io: LarkCliIo): numb
   return result.status ?? (result.signal ? portableSignalCode(result.signal) : 1);
 }
 
+function emitDuplicatedWrite(
+  result: SpawnSyncReturns<string>,
+  io: LarkCliIo,
+  input: { target: string },
+): number {
+  let providerResponse: unknown;
+  try { providerResponse = JSON.parse(result.stdout || ""); }
+  catch { providerResponse = { raw_stdout: result.stdout || "" }; }
+  const providerDocument = providerResponse && typeof providerResponse === "object" && !Array.isArray(providerResponse)
+    ? providerResponse as Record<string, unknown>
+    : { provider_response: providerResponse };
+  io.stdout(`${JSON.stringify({
+    ...providerDocument,
+    ok: true,
+    duplicate: true,
+    target: input.target,
+    ...(result.stderr ? { provider_stderr_present: true } : {}),
+  })}\n`);
+  return 0;
+}
+
 function emitCommittedUnverified(
   result: SpawnSyncReturns<string>,
   io: LarkCliIo,
@@ -652,12 +826,13 @@ export function runLarkCli(
   argv: readonly string[], env: Env = process.env, dependencies: LarkCliLauncherDependencies = {},
 ): number {
   const io = dependencies.io ?? defaultIo();
+  const effectiveArgv = argv;
   const runtimeAgentId = larkinConfig.resolveRuntimeAuthority(env);
   if (!runtimeAgentId) {
     try {
       const nativeDependencies = dependencies.nativeCommand ? dependencies
         : { ...dependencies, nativeCommand: resolveOfficialLarkCli({ spawn: dependencies.spawn, env }) };
-      return spawnNative(argv, env, io, nativeDependencies);
+      return spawnNative(effectiveArgv, env, io, nativeDependencies);
     } catch (error) {
       io.stderr(`lark-cli: ${error instanceof Error ? error.message : String(error)}\n`);
       return 1;
@@ -672,7 +847,7 @@ export function runLarkCli(
     io.stderr(`lark-cli: ${error instanceof Error ? error.message : String(error)}\n`);
     return 2;
   }
-  const decision = classifyLarkCliCommand(argv);
+  const decision = classifyLarkCliCommand(effectiveArgv);
   if (decision.kind === "denied") {
     io.stderr(`lark-cli: ${decision.reason}\n`);
     return 2;
@@ -687,9 +862,26 @@ export function runLarkCli(
     return 2;
   }
   const store = dependencies.stateStore ?? createAgentStateStore(config.larkinHome, agent.agentId);
-  if (decision.kind === "passthrough") return passthroughWithObservation(argv, privateEnv, io, nativeDependencies, store);
+  if (decision.kind === "comment-reply") {
+    try {
+      let telemetry = dependencies.telemetry ?? telemetrySingleton();
+      if (!dependencies.telemetry) {
+        try {
+          const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+          telemetry = telemetrySingleton(loadTelemetryConfig(env), { serviceVersion: packageVersion(sourceRoot) });
+        } catch { /* telemetry is failure-isolated */ }
+      }
+      return telemetry.externalPhase(agent.agentId, store.paths.root, "document.comment.reply", SpanKind.CLIENT,
+        () => runCommentReply(argv, privateEnv, io, nativeDependencies, store), "comment_cli") as number;
+    }
+    catch (error) {
+      io.stderr(`lark-cli: ${error instanceof Error ? error.message : String(error)}\n`);
+      return 2;
+    }
+  }
+  if (decision.kind === "passthrough") return passthroughWithObservation(effectiveArgv, privateEnv, io, nativeDependencies, store);
   try {
-    const target = guardedTarget(decision, argv, store);
+    const target = guardedTarget(decision, effectiveArgv, store);
     const targetKey = serializeFeishuImTarget(target);
     const generation = freshnessGeneration(privateEnv);
     const seen = store.readFreshnessCursor<FeishuImCursor>(targetKey, generation);
@@ -707,7 +899,16 @@ export function runLarkCli(
       store.mergeFreshnessCursor(targetKey, gated.current, mergeFeishuImCursor, generation);
       return 3;
     }
-    const write = callNative(botArgv(argv, intentId(targetKey, gated.current, argv)), privateEnv, io, nativeDependencies);
+    const intentKey = policyFlagValue(effectiveArgv, "--idempotency-key") ?? intentId(targetKey, effectiveArgv);
+    const write = callNative(botArgv(effectiveArgv, intentKey), privateEnv, io, nativeDependencies);
+    const writeMessage = writeResponseMessage(write);
+    const duplicate = !write.error && write.status === 0 && writeMessage
+      ? recordImWriteMemo(store, intentKey, writeMessage.message_id) : false;
+    if (duplicate) {
+      observeSuccessfulWrite(write, target, targetKey, store, generation);
+      emitDuplicatedWrite(write, io, { target: targetKey });
+      return 0;
+    }
     if (!write.error && write.status === 0 && !observeSuccessfulWrite(write, target, targetKey, store, generation)) {
       const responseMessage = writeResponseMessage(write);
       try {
@@ -743,10 +944,11 @@ export function runLarkCli(
 }
 
 export async function runLarkCliProcess(argv: readonly string[], env: Env = process.env): Promise<number> {
+  const effectiveArgv = argv;
   const runtimeAgentId = larkinConfig.resolveRuntimeAuthority(env);
   if (!runtimeAgentId) {
     try {
-      return await spawnNativeTransparent(argv, env, resolveOfficialLarkCli({ env }));
+      return await spawnNativeTransparent(effectiveArgv, env, resolveOfficialLarkCli({ env }));
     } catch (error) {
       process.stderr.write(`lark-cli: ${error instanceof Error ? error.message : String(error)}\n`);
       return 1;
@@ -756,16 +958,16 @@ export async function runLarkCliProcess(argv: readonly string[], env: Env = proc
     const { config } = larkinConfig.loadConfig(env);
     const agent = larkinConfig.selectAgent(config, { ...env, LARKIN_AGENT_ID: runtimeAgentId });
     assertAgentWorkspaceBound(agent);
-    const decision = classifyLarkCliCommand(argv);
-    if (decision.kind === "passthrough" && !requiresCapturedPassthrough(argv)) {
+    const decision = classifyLarkCliCommand(effectiveArgv);
+    if (decision.kind === "passthrough" && !requiresCapturedPassthrough(effectiveArgv)) {
       const privateEnv = managedLarkCliEnv(agent, { ...env, LARKIN_AGENT_ID: agent.agentId });
-      return await spawnNativeTransparent(argv, privateEnv, resolveOfficialLarkCli({ env: privateEnv }));
+      return await spawnNativeTransparent(effectiveArgv, privateEnv, resolveOfficialLarkCli({ env: privateEnv }));
     }
   } catch (error) {
     process.stderr.write(`lark-cli: ${error instanceof Error ? error.message : String(error)}\n`);
     return 2;
   }
-  return runLarkCli(argv, env);
+  return runLarkCli(effectiveArgv, env);
 }
 
 export async function main(argv = process.argv.slice(2), env: Env = process.env): Promise<never> {

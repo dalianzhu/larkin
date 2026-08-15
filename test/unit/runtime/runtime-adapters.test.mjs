@@ -4,13 +4,33 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { spawnSync } from "node:child_process";
-import { test } from "bun:test";
+import { afterEach, test } from "bun:test";
 import { ContextPromptBuilder } from "../../../dist/agent/context-prompt.mjs";
 import { resolveAgentCliExecutable } from "../../../dist/agent/agent-cli-capabilities.mjs";
-import { classifyPiProviderError, createNativeRuntimeAdapter, createPiSessionManager, requirePiResumeSessionFile } from "../../../dist/runtime/runtime-adapters.mjs";
+import {
+  classifyPiProviderError,
+  createNativeRuntimeAdapter,
+  createPiSessionManager,
+  requirePiResumeSessionFile,
+  resolvePiProcessExtensionArgs,
+} from "../../../dist/runtime/runtime-adapters.mjs";
+
+const fakeProcesses = new Set();
+
+afterEach(() => {
+  for (const child of fakeProcesses) {
+    child.stdin.destroyed = true;
+    child.stdout.destroy();
+    child.stderr.destroy();
+  }
+  fakeProcesses.clear();
+});
 
 class FakeProcess extends EventEmitter {
+  constructor() {
+    super();
+    fakeProcesses.add(this);
+  }
   stdout = new PassThrough();
   stderr = new PassThrough();
   writes = [];
@@ -72,10 +92,15 @@ test("context prompt is capability-driven, versioned and produces bounded notifi
 
 test("default context prompt consumes the Agent CLI manifest", () => {
   const prompt = new ContextPromptBuilder().build({ agentId: "cli_test", runtime: "pi" });
-  assert.equal(prompt.version, "larkin-standing-v6");
+  assert.equal(prompt.version, "larkin-standing-v19");
   assert.match(prompt.content, /larkin reminder schedule/);
   assert.match(prompt.content, /larkin reminder cancel/);
   assert.match(prompt.content, /larkin interaction resolve/);
+  assert.match(prompt.content, /larkin comment reply --message-id/);
+  assert.match(prompt.content, /kind=document_comment/);
+  assert.match(prompt.content, /comment_subscription_mode\/status\/source\/dimension.*mentioned_bot.*IM require\/free settings do not apply/);
+  assert.doesNotMatch(prompt.content, /document_comment is a verified explicit @/);
+  assert.match(prompt.content, /not an IM target/);
   assert.match(prompt.content, /Only a successful interaction resolve/);
   assert.match(prompt.content, /Use only the Larkin-owned `larkin` command/);
   assert.match(prompt.content, /never invoke bare `lark-cli`/);
@@ -94,8 +119,11 @@ test("default context prompt consumes the Agent CLI manifest", () => {
   assert.doesNotMatch(prompt.content, /rejected|--literal-text/i);
   assert.doesNotMatch(prompt.content, /use `--text` for brief single-line replies/i);
   assert.match(prompt.content, /attachment-only send\/reply.*attachment flag.*without a text body flag/i);
-  assert.match(prompt.content, /put real newline characters directly in the argument/);
-  assert.ok(prompt.content.includes("Do not use the two literal characters `\\n` inside ordinary quotes"));
+  assert.match(prompt.content, /passes one argument with real newline characters/);
+  assert.match(prompt.content, /ordinary (?:double )?quotes.*do not decode.*`\\n`.*backslash.*letter `n`/i);
+  assert.ok(prompt.content.includes("$'First line\\nSecond line'"));
+  assert.ok(prompt.content.includes('"First line\\nSecond line"'));
+  assert.match(prompt.content, /zsh.*bash.*ANSI-C quoting/i);
   assert.match(prompt.content, /authoritative self identity.*cli_test/i);
   assert.match(prompt.content, /do not call.*profile show.*learn.*identity/i);
   assert.match(prompt.content, /exclusively (?:assigns|addresses).*another named Agent.*stay silent/i);
@@ -143,11 +171,11 @@ test("default context prompt consumes the Agent CLI manifest", () => {
   assert.match(prompt.content, /inner read.*replaces.*separate.*history read/i);
   assert.match(prompt.content, /must not.*unquoted.*substitution.*`eval`.*`echo`.*`2>&1`.*temporary/i);
   assert.match(prompt.content,
-    /larkin im \+messages-reply --message-id <real_om_message_id> --text '<exact_body_as_one_literal_argument>' --json/i);
+    /source's thread membership.*structural Inbox fact.*not a guess.*MUST stay in that same thread.*messages-reply --message-id <real_om_message_id> --text '<exact_body_as_one_literal_argument>' --reply-in-thread --json.*chat-level source.*omit.*--reply-in-thread/i);
   assert.match(prompt.content,
-    /ordinary current Inbox.*exact reply.*does not explicitly request.*topic.*in-thread.*larkin im \+messages-reply --message-id <real_om_message_id> --text '<exact_body_as_one_literal_argument>' --json.*omit.*--reply-in-thread.*original.*chat.*main timeline/i);
+    /chat-level source.*no thread.*main timeline.*omit.*--reply-in-thread/i);
   assert.match(prompt.content,
-    /only when.*user.*current Inbox event.*explicitly.*topic.*in-thread.*thread reply.*larkin im \+messages-reply --message-id <real_om_message_id> --text '<exact_body_as_one_literal_argument>' --reply-in-thread --json.*must not infer.*thread metadata.*message id.*ordinary reply/i);
+    /Use the .--reply-in-thread. recipe only when the source is a thread or the user or current Inbox event explicitly asks.*topic.*in-thread.*thread reply.*Never invent a topic request from ordinary reply wording or a bare source message id.*thread membership.*thread:.*target.*thread_id.*explicit request.*never from wording alone/i);
   assert.match(prompt.content,
     /exactly one post-poll.*model tool call.*must not.*skill.*reference.*help.*discovery.*without.*freshness_conflict.*two.*model tool calls.*pre-commit.*provider-not-reached.*retry.*identical.*three.*model tool calls/i);
   assert.match(prompt.content,
@@ -238,6 +266,7 @@ test("Codex adapter initializes a thread and maps busy input to turn/steer", asy
   assert.equal(child.writes[1].method, "initialized");
   assert.equal(child.writes[2].method, "thread/start");
   assert.equal(child.writes[2].params.developerInstructions, "standing");
+  assert.equal(Object.keys(child.writes[2].params).filter((key) => /instructions|prompt/i.test(key)).length, 1);
   child.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, result: { thread: { id: "thread-1" } } })}\n`);
   child.stdout.write(`${JSON.stringify({ method: "turn/started", params: { turn: { id: "turn-1" } } })}\n`);
   await new Promise((resolve) => setImmediate(resolve));
@@ -269,6 +298,8 @@ test("Codex resume failure falls back to a fresh thread with the same standing p
   await new Promise((resolve) => setImmediate(resolve));
   const resume = child.writes.find((request) => request.method === "thread/resume");
   assert.equal(resume.params.threadId, "stale-thread");
+  assert.equal(resume.params.developerInstructions, "standing");
+  assert.equal(Object.keys(resume.params).filter((key) => /instructions|prompt/i.test(key)).length, 1);
   child.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: resume.id, error: { code: -32602, message: "rollout not found" } })}\n`);
   await new Promise((resolve) => setImmediate(resolve));
   const fallback = child.writes.at(-1);
@@ -309,12 +340,15 @@ test("Codex steer precondition failure is deferred and clears the stale active t
 test("Claude adapter appends standing prompt and gates busy input to assistant boundaries", async () => {
   const child = new FakeProcess();
   let promptWrite;
+  let launchArgs;
   const session = await createNativeRuntimeAdapter("claude", {
-    spawn: () => child,
+    spawn: (_command, args) => { launchArgs = args; return child; },
     mkdir: () => {},
     writeFile: (...args) => { promptWrite = args; },
   }).createSession(create());
   assert.equal(promptWrite[1], "standing");
+  assert.equal(launchArgs.filter((arg) => arg === "--append-system-prompt-file").length, 1);
+  assert.equal(launchArgs.includes("--system-prompt"), false);
   const initial = await session.prompt({ inputId: "initial", kind: "initial", text: "start" });
   assert.equal(initial.status, "accepted");
   const gated = session.busyInput({ inputId: "early", kind: "inbox_update", text: "update" });
@@ -343,6 +377,19 @@ test("Claude native stream normalizes start, text/tool output, and result bounda
   ["turn-start", "activity:thinking", "activity:text", "activity:tool", "turn-end"]);
 });
 
+test("Claude resume keeps exactly one append standing-prompt file", async () => {
+  const child = new FakeProcess();
+  let launchArgs;
+  await createNativeRuntimeAdapter("claude", {
+    spawn: (_command, args) => { launchArgs = args; return child; },
+    mkdir: () => {}, writeFile: () => {},
+  }).createSession(create({ resumeSessionId: "claude-resume-session" }));
+  assert.deepEqual(launchArgs.slice(launchArgs.indexOf("--resume"), launchArgs.indexOf("--resume") + 2),
+    ["--resume", "claude-resume-session"]);
+  assert.equal(launchArgs.filter((arg) => arg === "--append-system-prompt-file").length, 1);
+  assert.equal(launchArgs.includes("--system-prompt"), false);
+});
+
 test("Pi adapter maps prompt, steer and abort to its process backend", async () => {
   const calls = [];
   const sdk = {
@@ -366,6 +413,90 @@ test("Pi adapter maps prompt, steer and abort to its process backend", async () 
   assert.deepEqual(calls, [["prompt", "one"], ["steer", "two"], ["abort"]]);
 });
 
+test.each(["win32", "linux"])("builtin Pi resolves no -e extension args on simulated %s", (platform) => {
+  let resolverCalls = 0;
+  const args = resolvePiProcessExtensionArgs({
+    distribution: "builtin", piCommand: "builtin-pi", env: {}, platform,
+  }, {
+    subagents: () => { resolverCalls += 1; return "/must/not/resolve-subagents.js"; },
+    bashTimeout: () => { resolverCalls += 1; return "/must/not/resolve-bash-timeout.js"; },
+  });
+  assert.deepEqual(args, []);
+  assert.equal(resolverCalls, 0, "builtin must not resolve file-based extensions");
+});
+
+test.each(["win32", "linux"])("external Pi retains both -e extension args on simulated %s", (platform) => {
+  const args = resolvePiProcessExtensionArgs({
+    distribution: "external", piCommand: "external-pi", env: {}, platform,
+  }, {
+    subagents: () => "/fixture/pi-subagents.bundle.js",
+    bashTimeout: () => "/fixture/pi-bash-timeout.bundle.js",
+  });
+  assert.deepEqual(args, [
+    "-e", "/fixture/pi-subagents.bundle.js",
+    "-e", "/fixture/pi-bash-timeout.bundle.js",
+  ]);
+});
+
+test.each(["external", "builtin"])("%s Pi launches one shared append standing-prompt path without replacement", async (distribution) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `larkin-pi-single-prompt-${distribution}-`));
+  const child = new FakeProcess();
+  child.kill = (signal) => {
+    child.killed.push(signal);
+    child.emit("exit", 0, null);
+    return true;
+  };
+  let launch;
+  try {
+    const input = create({
+      workspaceDir: path.join(root, "workspace"), stateDir: path.join(root, "state"), model: "default",
+      resumeSessionId: `resume-${distribution}`,
+      env: distribution === "builtin" ? { LARKIN_PI_DISTRIBUTION: "builtin", LARKIN_CONFIG_DIR: path.join(root, "config") } : {},
+    });
+    fs.mkdirSync(input.workspaceDir, { recursive: true });
+    const sessionDir = path.join(input.stateDir, "runtime", "pi-sessions");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const sessionFile = path.join(sessionDir, `${input.resumeSessionId}.jsonl`);
+    fs.writeFileSync(sessionFile, `${JSON.stringify({ type: "session", id: input.resumeSessionId })}\n`);
+    const piCommand = "/fixture/external-pi";
+    const pending = createNativeRuntimeAdapter("pi", {
+      env: { LARKIN_PI_COMMAND: piCommand },
+      resolvePiProcessExtensionArgs: () => [],
+      spawn: (command, args, options) => { launch = { command, args: [...args], options }; return child; },
+    }).createSession(input);
+    await new Promise((resolve) => setImmediate(resolve));
+    for (const request of child.writes.slice(0, 2)) {
+      const data = request.type === "get_state"
+        ? { sessionId: `session-${distribution}`, model: { provider: "fixture", id: "model" }, thinkingLevel: "off" }
+        : { models: [{ provider: "fixture", id: "model" }] };
+      child.stdout.write(`${JSON.stringify({ type: "response", id: request.id, command: request.type, success: true, data })}\n`);
+    }
+    const session = await pending;
+    const appendIndex = launch.args.indexOf("--append-system-prompt");
+    assert.notEqual(appendIndex, -1);
+    assert.equal(launch.args.filter((arg) => arg === "--append-system-prompt").length, 1);
+    assert.equal(launch.args.includes("--system-prompt"), false);
+    assert.deepEqual(launch.args.slice(launch.args.indexOf("--session"), launch.args.indexOf("--session") + 2),
+      ["--session", sessionFile]);
+    const promptFile = launch.args[appendIndex + 1];
+    assert.equal(fs.readFileSync(promptFile, "utf8"), "standing");
+    if (process.platform !== "win32") assert.equal(fs.statSync(promptFile).mode & 0o777, 0o600);
+    if (distribution === "external") {
+      assert.equal(launch.command, piCommand);
+      assert.deepEqual(launch.args.slice(0, 2), ["--mode", "rpc"]);
+      assert.equal(launch.options.env.LARKIN_PI_DISTRIBUTION, undefined);
+    } else {
+      assert.ok(launch.args.includes("__internal") && launch.args.includes("pi-rpc"));
+      assert.equal(launch.args.includes("-e"), false, "builtin extensions are passed inline by binary-entry");
+      assert.equal(launch.options.env.LARKIN_PI_DISTRIBUTION, "builtin");
+      assert.equal(launch.options.env.PI_TELEMETRY, "0");
+    }
+    await session.close("test complete");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Pi prompt reports acceptance only after the RPC command acknowledgement", async () => {
   let acknowledge;
   const acceptedByRpc = new Promise((resolve) => { acknowledge = resolve; });
@@ -385,25 +516,90 @@ test("Pi prompt reports acceptance only after the RPC command acknowledgement", 
   assert.deepEqual(result, { status: "accepted", inputId: "pi-input" });
 });
 
-test("Pi official RPC events normalize start, text/tool output, and settled boundary", async () => {
+test("bundled Pi normalizes preflight compaction, retry, and terminal timeout without payload fields or a false turn", async () => {
+  let listener; let rejectPrompt;
+  const sdk = {
+    sessionId: "pi-preflight", prompt() { return new Promise((_resolve, reject) => { rejectPrompt = reject; }); },
+    steer() {}, abort() {}, subscribe(next) { listener = next; return () => {}; },
+  };
+  const session = await createNativeRuntimeAdapter("pi", {
+    createPiSession: async () => sdk, env: { LARKIN_PI_DISTRIBUTION: "builtin" },
+  }).createSession(create());
+  const events = []; session.subscribe((event) => events.push(event));
+  const pending = session.prompt({ inputId: "PRIVATE_INPUT", kind: "user", text: "PRIVATE_PROMPT", attempt: 0 });
+  listener({ type: "compaction_start", reason: "threshold", privateSummary: "PRIVATE_SUMMARY" });
+  listener({ type: "summarization_retry_scheduled", attempt: 1, maxAttempts: 3, delayMs: 5,
+    errorMessage: "PRIVATE_PROVIDER_ERROR" });
+  listener({ type: "compaction_end", reason: "threshold", aborted: false, willRetry: false,
+    result: { summary: "PRIVATE_SUMMARY" } });
+  listener({ type: "larkin_rpc_failure", message: "Pi RPC prompt preflight timed out at absolute 600000ms limit" });
+  rejectPrompt(new Error("Pi RPC prompt preflight timed out at absolute 600000ms limit"));
+  assert.equal((await pending).status, "rejected");
+  const observations = events.filter((event) => event.type === "runtime-observation");
+  assert.deepEqual(observations.map((event) => event.phase), [
+    "rpc_submit", "compaction_start", "retry_progress", "compaction_end", "rpc_timeout",
+  ]);
+  assert.equal(events.some((event) => event.type === "turn-start"), false);
+  assert.doesNotMatch(JSON.stringify(observations), /PRIVATE|summary|provider|message|input/i);
+});
+
+test("bundled Pi emits content-free RPC timing phases while preserving normalized activity", async () => {
   let listener;
   const sdk = {
     sessionId: "pi-eye", prompt() {}, steer() {}, abort() {},
     subscribe(next) { listener = next; return () => {}; },
   };
-  const session = await createNativeRuntimeAdapter("pi", { createPiSession: async () => sdk }).createSession(create());
+  const session = await createNativeRuntimeAdapter("pi", {
+    createPiSession: async () => sdk,
+    env: { LARKIN_PI_DISTRIBUTION: "builtin" },
+  }).createSession(create());
   const events = [];
   session.subscribe((event) => events.push(event));
   await session.prompt({ inputId: "pi-eye-input", kind: "user", text: "work", attempt: 0 });
   listener({ type: "turn_start" });
+  listener({ type: "turn_start" });
   listener({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "reason" } });
   listener({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "answer" } });
+  listener({ type: "tool_execution_end", toolName: "out-of-order", result: "FORBIDDEN_EARLY_RESULT" });
   listener({ type: "tool_execution_start", toolName: "read" });
   listener({ type: "agent_end", messages: [{ role: "assistant", stopReason: "stop" }] });
+  listener({ type: "agent_end", messages: [{ role: "assistant", stopReason: "stop" }] });
+  listener({ type: "agent_settled" });
   listener({ type: "agent_settled" });
   assert.deepEqual(events.filter((event) => ["turn-start", "activity", "turn-end"].includes(event.type))
     .map((event) => event.type === "activity" ? `${event.type}:${event.activity}` : event.type),
   ["turn-start", "activity:thinking", "activity:text", "activity:tool", "turn-end"]);
+  const observations = events.filter((event) => event.type === "runtime-observation");
+  assert.deepEqual(observations.map((event) => event.phase), [
+    "rpc_submit", "rpc_accepted", "turn_start", "first_output", "tool_call", "completed", "tool_result", "settled",
+  ]);
+  assert.ok(observations.every((event) => event.runtime === "pi" && event.distribution === "builtin"));
+  assert.equal(events.filter((event) => event.type === "turn-start").length, 1);
+  assert.equal(events.filter((event) => event.type === "turn-end").length, 1);
+  assert.doesNotMatch(JSON.stringify(observations), /reason|answer|read|out-of-order|FORBIDDEN|toolName|toolResult|message|text/);
+});
+
+test("bundled Pi closes an epoch RPC observation only from its original submit owner", async () => {
+  let acknowledgePrompt; let listener;
+  const sdk = {
+    sessionId: "pi-overlap", prompt() { return new Promise((resolve) => { acknowledgePrompt = resolve; }); },
+    steer() {}, abort() {}, subscribe(next) { listener = next; return () => {}; },
+  };
+  const session = await createNativeRuntimeAdapter("pi", {
+    createPiSession: async () => sdk, env: { LARKIN_PI_DISTRIBUTION: "builtin" },
+  }).createSession(create());
+  const events = []; session.subscribe((event) => events.push(event));
+  const original = session.prompt({ inputId: "pi-overlap-original", kind: "user", text: "one", attempt: 0 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(await session.busyInput({ inputId: "pi-overlap-steer", kind: "inbox_update", text: "two", attempt: 0 }),
+    { status: "accepted", inputId: "pi-overlap-steer" });
+  assert.deepEqual(events.filter((event) => event.type === "runtime-observation").map((event) => event.phase), ["rpc_submit"]);
+  acknowledgePrompt();
+  assert.deepEqual(await original, { status: "accepted", inputId: "pi-overlap-original" });
+  assert.deepEqual(events.filter((event) => event.type === "runtime-observation").map((event) => event.phase), ["rpc_submit", "rpc_accepted"]);
+  listener({ type: "turn_start" });
+  listener({ type: "agent_end", messages: [{ role: "assistant", stopReason: "stop" }] });
+  listener({ type: "agent_settled" });
 });
 
 test("Pi partial output followed by an aborted assistant remains an interrupted delivery", async () => {
@@ -656,40 +852,28 @@ test("Pi replaces only a provably zero-turn missing session and keeps meaningful
 
 test("Pi default runtime fails closed with an empty unauthenticated official agent directory", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-pi-no-auth-"));
+  const child = new FakeProcess();
+  child.kill = () => { child.emit("exit", 0, null); return true; };
   try {
-    const agentDir = path.join(root, "pi-agent");
-    const workspaceDir = path.join(root, "workspace");
-    const piCommand = path.join(root, "pi");
-    fs.mkdirSync(agentDir, { recursive: true });
-    fs.mkdirSync(workspaceDir, { recursive: true });
-    fs.writeFileSync(piCommand, `#!/usr/bin/env bun
-import readline from "node:readline";
-if (process.argv.includes("--version")) { console.log("0.82.0"); process.exit(0); }
-const lines = readline.createInterface({ input: process.stdin });
-lines.on("line", (line) => {
-  const request = JSON.parse(line);
-  const data = request.type === "get_available_models" ? { models: [] } : { model: null, thinkingLevel: "off" };
-  console.log(JSON.stringify({ type: "response", id: request.id, command: request.type, success: true, data }));
-});
-`, { mode: 0o755 });
-    fs.chmodSync(piCommand, 0o755);
-    const moduleUrl = new URL("../../../dist/runtime/runtime-adapters.mjs", import.meta.url).href;
-    const script = `
-      import { createNativeRuntimeAdapter } from ${JSON.stringify(moduleUrl)};
-      const input = { agentId: "cli_test", workspaceDir: ${JSON.stringify(workspaceDir)}, stateDir: ${JSON.stringify(path.join(root, "state"))}, standingPrompt: { version: "v1", content: "standing", hash: "abc" }, model: "default" };
-      createNativeRuntimeAdapter("pi").createSession(input).then(() => process.exit(2), error => { console.error(error.message); process.exit(1); });
-    `;
-    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
-      encoding: "utf8",
-      env: {
-        HOME: path.join(root, "home"),
-        PATH: process.env.PATH || "",
-        PI_CODING_AGENT_DIR: agentDir,
-        LARKIN_PI_COMMAND: piCommand,
-      },
-    });
-    assert.equal(result.status, 1, result.stderr || result.stdout);
-    assert.match(result.stderr, /no authenticated available models.*will not create a fallback session/i);
+    const pending = createNativeRuntimeAdapter("pi", {
+      env: { LARKIN_PI_COMMAND: process.execPath },
+      resolvePiProcessExtensionArgs: () => [],
+      spawn: () => child,
+    }).createSession(create({
+      workspaceDir: path.join(root, "workspace"),
+      stateDir: path.join(root, "state"),
+      model: "default",
+    }));
+    await new Promise((resolve) => setImmediate(resolve));
+    for (const request of child.writes.slice(0, 2)) {
+      const data = request.type === "get_available_models"
+        ? { models: [] }
+        : { model: null, thinkingLevel: "off" };
+      child.stdout.write(`${JSON.stringify({
+        type: "response", id: request.id, command: request.type, success: true, data,
+      })}\n`);
+    }
+    await assert.rejects(pending, /no authenticated available models.*will not create a fallback session/i);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

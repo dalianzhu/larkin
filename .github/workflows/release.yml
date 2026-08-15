@@ -240,7 +240,7 @@ jobs:
     needs:
       - resolve-release
       - prepare-release
-    if: needs.prepare-release.outputs.should_publish == 'true'
+    if: needs.prepare-release.outputs.should_publish == 'true' && github.event_name != 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -253,6 +253,8 @@ jobs:
             target: darwin-arm64
           - runner: macos-15-intel
             target: darwin-x64
+          - runner: ubuntu-24.04
+            target: windows-x64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
@@ -302,6 +304,7 @@ jobs:
         run: bun run scripts/check-publication.mjs --trusted --denylist "$RUNNER_TEMP/larkin-publication-denylist.txt" artifacts/release/larkin-v* artifacts/release/THIRD_PARTY_NOTICES.txt
 
       - name: Smoke current platform artifact
+        if: matrix.target != 'windows-x64'
         run: bun run release:smoke -- --release-dir artifacts/release
 
       - name: Upload platform artifact to draft release
@@ -317,17 +320,111 @@ jobs:
           mv artifacts/release/release-manifest.json "$manifest"
           gh release upload "$RELEASE_TAG" \
             artifacts/release/larkin-v* "$manifest" \
-            --repo "$GITHUB_REPOSITORY" --clobber
+            --repo "$GITHUB_REPOSITORY"
 
-  publish:
+  assemble-release:
     needs:
       - resolve-release
       - prepare-release
       - build
-    if: needs.prepare-release.outputs.should_publish == 'true'
+    if: >-
+      always() &&
+      needs.prepare-release.outputs.should_publish == 'true' &&
+      (needs.build.result == 'success' ||
+      (github.event_name == 'workflow_dispatch' && needs.build.result == 'skipped'))
     runs-on: ubuntu-24.04
     permissions:
+      # GitHub hides draft releases and their assets from read-only workflow tokens.
       contents: write
+    defaults:
+      run:
+        working-directory: release-source
+    steps:
+      - name: Check out immutable release source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-release.outputs.source_sha }}
+          path: release-source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up pinned Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install locked dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Download platform artifacts from draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+        run: |
+          mkdir -p artifacts/platform
+          release_id="$(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq ".[] | select(.tag_name == \"${RELEASE_TAG}\" and .draft == true) | .id"
+          )"
+          test -n "$release_id" && test "${release_id//$'\n'/}" = "$release_id" || {
+            echo "Expected exactly one draft release for $RELEASE_TAG" >&2
+            exit 1
+          }
+          metadata="$RUNNER_TEMP/larkin-release-assets.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" > "$metadata"
+          expected_assets=(
+            "larkin-${RELEASE_TAG}-linux-x64"
+            "larkin-${RELEASE_TAG}-linux-arm64"
+            "larkin-${RELEASE_TAG}-darwin-arm64"
+            "larkin-${RELEASE_TAG}-darwin-x64"
+            "larkin-${RELEASE_TAG}-windows-x64.exe"
+            release-manifest-linux-x64.json
+            release-manifest-linux-arm64.json
+            release-manifest-darwin-arm64.json
+            release-manifest-darwin-x64.json
+            release-manifest-windows-x64.json
+          )
+          for asset_name in "${expected_assets[@]}"; do
+            mapfile -t asset_ids < <(
+              jq -r --arg name "$asset_name" \
+                '.[] | select(.name == $name and .state == "uploaded") | .id' "$metadata"
+            )
+            test "${#asset_ids[@]}" -eq 1 || {
+              echo "Expected exactly one uploaded draft asset named $asset_name" >&2
+              exit 1
+            }
+            gh api "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_ids[0]}" \
+              -H 'Accept: application/octet-stream' > "artifacts/platform/$asset_name"
+          done
+
+      - name: Assemble release manifest and checksums
+        run: bun scripts/release/assemble.ts --input-dir artifacts/platform --out-dir artifacts/release
+
+      - name: Verify release notices
+        run: |
+          cmp LICENSE artifacts/release/LICENSE
+          bun run scripts/generate-third-party-notices.mjs --check --output artifacts/release/THIRD_PARTY_NOTICES.txt
+
+      - name: Upload immutable assembled release
+        uses: actions/upload-artifact@v4
+        with:
+          name: assembled-release-${{ needs.resolve-release.outputs.source_sha }}
+          path: release-source/artifacts/release/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  verify-windows-release:
+    needs:
+      - resolve-release
+      - prepare-release
+      - assemble-release
+    if: >-
+      always() &&
+      needs.prepare-release.outputs.should_publish == 'true' &&
+      needs.assemble-release.result == 'success'
+    runs-on: windows-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: release-source
@@ -356,18 +453,80 @@ jobs:
       - name: Install locked dependencies
         run: bun install --frozen-lockfile
 
-      - name: Download platform artifacts from draft release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
-        run: |
-          mkdir -p artifacts/platform
-          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            --pattern 'larkin-v*' --pattern 'release-manifest-*.json' \
-            --dir artifacts/platform
+      - name: Download exact assembled release
+        uses: actions/download-artifact@v4
+        with:
+          name: assembled-release-${{ needs.resolve-release.outputs.source_sha }}
+          path: release-source/artifacts/release
 
-      - name: Assemble release manifest and checksums
-        run: bun scripts/release/assemble.ts --input-dir artifacts/platform --out-dir artifacts/release
+      - name: Verify immutable source, Windows manifest, and SHA256SUMS
+        shell: pwsh
+        env:
+          RELEASE_SOURCE_SHA: ${{ needs.resolve-release.outputs.source_sha }}
+        run: |
+          if ((git rev-parse HEAD) -ne $env:RELEASE_SOURCE_SHA) { throw "immutable source checkout mismatch" }
+          $manifest = Get-Content artifacts/release/release-manifest.json -Raw | ConvertFrom-Json
+          if ($manifest.sourceCommit -ne $env:RELEASE_SOURCE_SHA -or $manifest.sourceDirty -ne $false) { throw "Windows manifest source provenance mismatch" }
+          $records = @($manifest.artifacts | Where-Object { $_.platform -eq 'windows' -and $_.arch -eq 'x64' })
+          if ($records.Count -ne 1) { throw "expected exactly one Windows x64 manifest record" }
+          $record = $records[0]
+          $sumLines = @(Get-Content artifacts/release/SHA256SUMS | Where-Object { $_ -match ('  ' + [regex]::Escape($record.file) + '$') })
+          if ($sumLines.Count -ne 1) { throw "expected exactly one Windows x64 SHA256SUMS record" }
+          $expected = ($sumLines[0] -split '\s+', 2)[0].ToLowerInvariant()
+          $actual = (Get-FileHash (Join-Path artifacts/release $record.file) -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($expected -ne $record.sha256 -or $actual -ne $record.sha256) { throw "Windows artifact checksum mismatch" }
+
+      - name: Smoke exact assembled Windows executable natively
+        run: bun "${{ github.workspace }}/release-tooling/scripts/release/smoke.ts" --release-dir artifacts/release
+
+  publish:
+    needs:
+      - resolve-release
+      - prepare-release
+      - assemble-release
+      - verify-windows-release
+    if: >-
+      always() &&
+      needs.prepare-release.outputs.should_publish == 'true' &&
+      needs.assemble-release.result == 'success' &&
+      needs.verify-windows-release.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: write
+    defaults:
+      run:
+        working-directory: release-source
+    steps:
+      - name: Check out release workflow tooling
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: release-tooling
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out immutable release source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-release.outputs.source_sha }}
+          path: release-source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up pinned Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install locked dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Download Windows-verified assembled release
+        uses: actions/download-artifact@v4
+        with:
+          name: assembled-release-${{ needs.resolve-release.outputs.source_sha }}
+          path: release-source/artifacts/release
 
       - name: Verify release notices
         run: |
@@ -385,9 +544,17 @@ jobs:
           gh release upload "$RELEASE_TAG" \
             artifacts/release/SHA256SUMS artifacts/release/release-manifest.json \
             artifacts/release/LICENSE artifacts/release/THIRD_PARTY_NOTICES.txt \
-            --repo "$GITHUB_REPOSITORY" --clobber
-          for manifest in artifacts/platform/release-manifest-*.json; do
-            gh release delete-asset "$RELEASE_TAG" "$(basename "$manifest")" \
+            --repo "$GITHUB_REPOSITORY"
+          for target in linux-x64 linux-arm64 darwin-arm64 darwin-x64 windows-x64; do
+            gh release delete-asset "$RELEASE_TAG" "release-manifest-${target}.json" \
               --repo "$GITHUB_REPOSITORY" --yes
           done
           gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+      - name: Trigger npm publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+        run: |
+          gh workflow run "Publish npm package" --repo "$GITHUB_REPOSITORY" \
+            --ref main -f release_tag="$RELEASE_TAG"

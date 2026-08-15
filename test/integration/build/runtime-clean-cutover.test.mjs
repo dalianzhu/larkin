@@ -21,7 +21,7 @@ test("authored source and generated runtime use the seven-domain mirrored layout
     "src root must not retain flat production modules",
   );
   const packageJson = JSON.parse(source("package.json"));
-  assert.equal(packageJson.bin.larkin, "dist/app/cli.mjs");
+  assert.equal(packageJson.bin.larkin, "scripts/npm/larkin-bin-shim.mjs");
   assert.equal(packageJson.packageManager, "bun@1.3.14");
   assert.equal(fs.existsSync(path.join(ROOT, "bun.lock")), true);
   assert.equal(fs.existsSync(path.join(ROOT, "package-lock.json")), false);
@@ -39,9 +39,18 @@ test("authored source and generated runtime use the seven-domain mirrored layout
 
 test("production build, start, and Agent CLI graph contain only current entries", () => {
   const packageJson = JSON.parse(source("package.json"));
-  assert.equal(packageJson.private, true);
-  assert.equal(packageJson.larkinPackageRole, "development-source-checkout");
-  assert.equal(packageJson.files, undefined, "the source checkout must not declare a publishable source inventory");
+  assert.equal(packageJson.private, false, "the source checkout must remain publishable to the npm registry");
+  assert.equal(packageJson.larkinPackageRole, "npm-published");
+  assert.deepEqual(packageJson.files, [
+    "dist/",
+    "assets/",
+    "scripts/npm/",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "artifacts/release/THIRD_PARTY_NOTICES.txt",
+  ], "the npm package inventory must stay explicit");
   assert.equal(packageJson.scripts.prepack, undefined);
   assert.equal(packageJson.scripts[["pack", "dist"].join(":")], undefined);
   assert.equal(packageJson.scripts[["test", "installed", "tarball"].join(":")], undefined);

@@ -38,6 +38,9 @@ export interface UpstreamProviderError {
 
 export type NormalizedRuntimeEvent =
   | { type: "session-init"; sessionId: string; model?: string; reasoningEffort?: string }
+  | { type: "runtime-observation"; runtime: "pi"; distribution: "builtin" | "external";
+      phase: "rpc_submit" | "rpc_accepted" | "compaction_start" | "compaction_end" | "retry_progress"
+        | "rpc_timeout" | "rpc_error" | "turn_start" | "first_output" | "tool_call" | "tool_result" | "completed" | "settled" }
   | { type: "turn-start"; turnId?: string }
   | { type: "activity"; activity: "thinking" | "text" | "tool" | "internal"; text?: string; name?: string }
   | { type: "turn-end"; sessionId?: string; turnId?: string }
@@ -79,7 +82,7 @@ export interface RuntimeSession {
 export interface RuntimeAdapter {
   readonly id: RuntimeId;
   readonly capabilities: RuntimeCapabilities;
-  probe?(input: Pick<RuntimeSessionCreate, "workspaceDir" | "env">): Promise<import("./runtime-readiness.js").RuntimeReadiness>;
+  probe?(input: Pick<RuntimeSessionCreate, "agentId" | "workspaceDir" | "stateDir" | "env">): Promise<import("./runtime-readiness.js").RuntimeReadiness>;
   createSession(input: RuntimeSessionCreate): Promise<RuntimeSession>;
   recoverConfigurationError?(message: string): Promise<{ recovered: boolean; reason: string }>;
 }

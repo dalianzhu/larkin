@@ -14,7 +14,17 @@ const BUN_RUNNER_SEAM_ALLOWLIST = [
   "test/integration/platform/process-idempotency.test.mjs",
   "test/integration/platform/process-ownership.test.mjs",
   "test/unit/agent/agent-state-store.test.mjs",
+  "test/unit/app/local-control.test.mjs",
+  "test/unit/app/runtime-agent-config-async.test.mjs",
   "test/unit/app/runtime-agent-interface-v2-live-safety.test.mjs",
+].sort();
+
+// npm install/invocation glue runs under Node (the only runtime npm guarantees), which
+// lets npm users avoid installing Bun. This is the deliberate exception to the otherwise
+// Bun-first surface: Node shebangs are still forbidden everywhere outside this list.
+const NODE_GLUE_ALLOWLIST = [
+  "scripts/npm/install-binary.mjs",
+  "scripts/npm/larkin-bin-shim.mjs",
 ].sort();
 
 function currentFiles() {
@@ -34,7 +44,7 @@ function currentFiles() {
   return files.filter((file) => file !== SELF);
 }
 
-test("current repository surfaces are Bun-only and native-binary-only", () => {
+test("current repository surfaces are Bun-first, npm, and native-binary-only", () => {
   const forbiddenPaths = [
     "scripts/package.mjs",
     "test/integration/package/installed-tarball-cli.integration.test.mjs",
@@ -49,8 +59,6 @@ test("current repository surfaces are Bun-only and native-binary-only", () => {
     ["Node shebang", /#!\/usr\/bin\/env node/],
     ["Node fixture path", /\/opt\/node/],
     ["Node-only executable naming", /nodeExecutable/],
-    ["npm-compatible distribution", /npm-compatible|\bpack:dist\b|installed-tarball/i],
-    ["npm or pnpm command", /(^|\s)(?:npm|pnpm)(?:\s|$)/m],
   ];
   const violations = [];
   const runnerSeamFiles = [];
@@ -61,9 +69,15 @@ test("current repository surfaces are Bun-only and native-binary-only", () => {
     const text = fs.readFileSync(path.join(ROOT, relative), "utf8");
     if (text.includes("LARKIN_BUN_TEST_RUNNER")) runnerSeamFiles.push(relative);
     for (const [label, pattern] of forbiddenContent) {
+      if (label === "Node shebang" && NODE_GLUE_ALLOWLIST.includes(relative)) continue;
       if (pattern.test(text)) violations.push(`${relative}: ${label}`);
     }
   }
   assert.deepEqual(runnerSeamFiles.sort(), BUN_RUNNER_SEAM_ALLOWLIST, "Bun test-runner process seam escaped its narrow allowlist");
+  assert.deepEqual(
+    NODE_GLUE_ALLOWLIST.filter((file) => !fs.existsSync(path.join(ROOT, file))),
+    [],
+    "npm glue allowlist must reference existing files",
+  );
   assert.deepEqual(violations, [], `Bun-only inventory violations:\n${violations.join("\n")}`);
 });

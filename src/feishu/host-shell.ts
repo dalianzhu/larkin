@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import * as channelSdk from "@larksuite/channel";
+import { SpanKind } from "@opentelemetry/api";
 import { currentProcessMetadata } from "../platform/process-inspect.cjs";
 import { reconcileAgentWorkspace } from "../platform/workspace-service.js";
 import { createAgentStateStore, type AgentStateStore } from "../agent/agent-state-store.js";
@@ -24,17 +25,26 @@ import { HostInteractionOrchestrator } from "./interaction-orchestrator.js";
 import { slug10, targetFor, type FeishuInboundEvent } from "./message-policy.js";
 import type { RuntimeHost, RuntimeHostEvent } from "../runtime/runtime-host.js";
 import { providerAuthenticationFailureReadiness, RuntimePrerequisiteError } from "../runtime/runtime-readiness.js";
-import { verifyCallbackProbe } from "../platform/callback-capability.js";
+import { readDocumentCommentSubscription, verifyCallbackProbe, type EffectiveDocumentCommentSubscription } from "../platform/callback-capability.js";
 import { loadConfig, resolveMentionPolicy } from "../platform/config.js";
 import { processCommandToken } from "../app/internal-command.js";
 import { managedOfficialLarkCli } from "../app/agent-lark-cli-workspace.js";
 import { isChannelReconnecting } from "../app/agent-readiness.js";
+import {
+  documentCommentMessageId,
+  documentCommentNoticeType,
+  projectDocumentCommentEnvelope,
+  resolveDocumentCommentContext,
+} from "./document-comment.js";
+import type { CommentEvent, CommentTarget, FetchedComment } from "@larksuite/channel";
+import type { TelemetryRuntime } from "../platform/telemetry-tracing.js";
 
 interface ConfiguredAgent {
   agentId: string;
   name: string;
   runtime: string;
   model: string;
+  piDistribution?: "external" | "builtin";
   effort?: string | null;
   displayName?: string | null;
   description?: string | null;
@@ -51,6 +61,24 @@ interface ConfiguredAgent {
 }
 
 interface AgentState { agentId?: string; sessions: Record<string, string> }
+interface PendingDocumentComment {
+  messageId: string;
+  fileToken: string;
+  fileType: string;
+  commentId: string;
+  replyId?: string;
+  operatorOpenId: string;
+  timestamp: number;
+  noticeType: string;
+  subscriptionMode: "none" | "subscribed";
+  subscriptionStatus: "safe-default" | "requested-unverified" | "platform-verified";
+  subscriptionSource: "legacy-default" | "setup-default" | "setup-opt-in" | "platform-status";
+  subscriptionDimension: "application" | null;
+  mentionedBot: boolean;
+  queuedAt: string;
+}
+interface PendingDocumentCommentState { version: 3; items: Record<string, PendingDocumentComment> }
+const PENDING_DOCUMENT_COMMENT_LIMIT = 256;
 interface AgentStateRecord { store: AgentStateStore; state: AgentState }
 interface HostFrame {
   type?: string;
@@ -69,6 +97,10 @@ interface LarkChannel {
   updateCard(messageId: string, card: object): Promise<void>;
   rawClient?: { request(input: { url: string; method: string }): Promise<unknown> } | null;
   botIdentity?: { openId?: string; name?: string | null } | null;
+  comments: {
+    resolveTarget(fileToken: string, fileType: string): Promise<CommentTarget | null>;
+    fetch(target: CommentTarget, commentId: string): Promise<FetchedComment | null>;
+  };
 }
 interface ChannelPackage { createLarkChannel(options: Record<string, unknown>): LarkChannel }
 
@@ -97,6 +129,26 @@ export interface HostShell {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function classifyDocumentCommentReadFailure(error: unknown): {
+  category: "permission_missing" | "document_access_denied" | "read_failure_unknown";
+  reason: string;
+} {
+  const root = isRecord(error) ? error : null;
+  const response = isRecord(root?.response) ? root.response : null;
+  const data = isRecord(response?.data) ? response.data : null;
+  const nested = isRecord(root?.error) ? root.error : null;
+  const code = data?.code ?? nested?.code ?? root?.code;
+  const subtype = data?.subtype ?? nested?.subtype ?? root?.subtype;
+  const missingScopes = data?.missing_scopes ?? nested?.missing_scopes ?? root?.missing_scopes;
+  if (code === 99991672 || subtype === "app_scope_not_applied" || (Array.isArray(missingScopes) && missingScopes.length > 0)) {
+    return { category: "permission_missing", reason: "required_scope_missing" };
+  }
+  if (code === "permission_denied" || response?.status === 403 || root?.status === 403) {
+    return { category: "document_access_denied", reason: "bot_document_access_denied" };
+  }
+  return { category: "read_failure_unknown", reason: "provider_read_failed_unknown" };
 }
 
 function memberPayloadData(value: unknown): Record<string, unknown> | null {
@@ -131,7 +183,7 @@ export function memberNamesFromPayloads(payloads: readonly unknown[]): Record<st
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function agentConfigSignature(agent: ConfiguredAgent): string {
   return JSON.stringify({
-    agentId: agent.agentId, runtime: agent.runtime, model: agent.model, effort: agent.effort ?? null,
+    agentId: agent.agentId, runtime: agent.runtime, model: agent.model, piDistribution: agent.piDistribution ?? null, effort: agent.effort ?? null,
     feishuAppId: agent.feishuAppId, feishuProfile: agent.feishuProfile,
     larkConfigDir: agent.larkConfigDir, feishuDomain: agent.feishuDomain,
     feishuAppSecret: agent.feishuAppSecret, workspaceDir: agent.workspaceDir, stateDir: agent.stateDir,
@@ -190,6 +242,7 @@ export function createHostShell({
   stateStoreForImpl = createAgentStateStore,
   logImpl = (...parts: unknown[]): void => { process.stderr.write(`[host] ${parts.join(" ")}\n`); },
   onOrderedShutdownComplete,
+  telemetry,
 }: {
   env?: NodeJS.ProcessEnv;
   runtimeHost: RuntimeHost;
@@ -202,6 +255,7 @@ export function createHostShell({
   stateStoreForImpl?: typeof createAgentStateStore;
   logImpl?: (...parts: unknown[]) => void;
   onOrderedShutdownComplete?: (exitCode: number) => void;
+  telemetry?: TelemetryRuntime;
 }): HostShell {
   const eventCommand = env.LARKIN_FEISHU_EVENT_CMD || "";
   const eventFile = env.LARKIN_FEISHU_EVENT_FILE || "";
@@ -348,32 +402,40 @@ export function createHostShell({
     const eventKey = `${agent.agentId}:${event.event_id || event.message_id || ""}`;
     if (event.event_id && (seenEventIds.has(eventKey) || inFlightEventIds.has(eventKey))) return;
     if (agent.botOpenId && event.sender_id === agent.botOpenId) { log(`agent=${agent.name} 跳过自己发的消息`); return; }
+    const telemetryMessageId = String(event.message_id || event.event_id || eventKey);
+    if (wake) telemetry?.beginMessage(agent.agentId, telemetryMessageId);
     if (event.event_id) inFlightEventIds.add(eventKey);
     try {
-      const [names, signature] = await Promise.all([
-        senderIdentity.ensureChatNames(agent, event.chat_id, 3_000),
-        event._sender_is_bot ? Promise.resolve(null) : senderIdentity.ensureSenderSignature(agent, event.sender_id, 3_000),
-      ]);
-      const envelope = envelopeProjector.projectInbound(agent, event, { anchorReply: wake, names, signature }) as unknown as Record<string, unknown>;
-      envelope.target = targetKeyOfInboxEnvelope({ ...envelope, chat_id: event.chat_id, thread_id: event.thread_id });
-      if (wake) envelope.wake = true;
-      const inboxEnvelope = projectInboxEnvelope(envelope, {
-        chat_id: event.chat_id,
-        thread_id: event.thread_id,
-        ...(event.create_time !== undefined ? { create_time: String(event.create_time) } : {}),
-        sender_id: event.sender_id,
-        content: String(envelope.content ?? event.content ?? ""),
-      });
-      try { stateStore(agent).appendNdjson("inbox", inboxEnvelope); }
-      catch (error) { throw new Error(`inbox 写失败: ${errorMessage(error)}`); }
-      // An event becomes permanently seen only after its canonical Inbox append
-      // is durable. Failures remain eligible for same-process redelivery.
-      if (event.event_id) seenEventIds.add(eventKey);
-      hostState.appendConversation(agent, {
-        direction: "in", from: envelope.sender_name, senderType: envelope.sender_type,
-        target: targetFor(event).target, wake, text: event.content, messageId: envelope.message_id,
-        at: envelope.timestamp || new Date().toISOString(),
-      });
+      const receive = async (): Promise<Record<string, unknown>> => {
+        const [names, signature] = await Promise.all([
+          senderIdentity.ensureChatNames(agent, event.chat_id, 3_000),
+          event._sender_is_bot ? Promise.resolve(null) : senderIdentity.ensureSenderSignature(agent, event.sender_id, 3_000),
+        ]);
+        const envelope = envelopeProjector.projectInbound(agent, event, { anchorReply: wake, names, signature }) as unknown as Record<string, unknown>;
+        envelope.target = targetKeyOfInboxEnvelope({ ...envelope, chat_id: event.chat_id, thread_id: event.thread_id });
+        if (wake) envelope.wake = true;
+        const inboxEnvelope = projectInboxEnvelope(envelope, {
+          chat_id: event.chat_id,
+          thread_id: event.thread_id,
+          ...(event.create_time !== undefined ? { create_time: String(event.create_time) } : {}),
+          sender_id: event.sender_id,
+          content: String(envelope.content ?? event.content ?? ""),
+        });
+        try { stateStore(agent).appendNdjson("inbox", inboxEnvelope); }
+        catch (error) { throw new Error(`inbox 写失败: ${errorMessage(error)}`); }
+        // An event becomes permanently seen only after its canonical Inbox append
+        // is durable. Failures remain eligible for same-process redelivery.
+        if (event.event_id) seenEventIds.add(eventKey);
+        hostState.appendConversation(agent, {
+          direction: "in", from: envelope.sender_name, senderType: envelope.sender_type,
+          target: targetFor(event).target, wake, text: event.content, messageId: envelope.message_id,
+          at: envelope.timestamp || new Date().toISOString(),
+        });
+        return envelope;
+      };
+      const envelope = wake && telemetry
+        ? await telemetry.phase(telemetryMessageId, "feishu.receive", SpanKind.CONSUMER, receive)
+        : await receive();
       if (!wake) return;
       const receipt = await runtimeHost.deliver(agent.agentId, envelope);
       if (receipt.status === "accepted" || receipt.status === "duplicate" || receipt.status === "deferred") {
@@ -383,10 +445,11 @@ export function createHostShell({
           excerpt: safeConversationExcerpt(event.content, 180),
           at: new Date().toISOString(),
         }, 30);
-        if (envelope.sender_type === "human") processingEyes.add(agent, String(envelope.message_id || ""));
+        if (envelope.sender_type === "human" || envelope.sender_type === "agent") processingEyes.add(agent, String(envelope.message_id || ""));
         if (receipt.status === "deferred") log(`Runtime 暂缓投递，消息保留在 inbox seq=${envelope.seq}: ${receipt.reason}`);
       }
     } catch (error) {
+      if (wake) telemetry?.delivery(agent.agentId, telemetryMessageId, "error");
       log(`onFeishuMessage 异常 agent=${agent.name}: ${error instanceof Error ? error.stack || error.message : String(error)}`);
       hostState.recordStatusError(agent, `onFeishuMessage: ${errorMessage(error)}`);
     } finally {
@@ -401,10 +464,265 @@ export function createHostShell({
     channelFor: (agent) => interactionChannels.get(agent.agentId),
     log,
   });
+  const emptyPendingDocumentComments = (): PendingDocumentCommentState => ({ version: 3, items: {} });
+  const validPendingDocumentComment = (value: unknown): value is PendingDocumentComment => {
+    if (!isRecord(value)) return false;
+    const validSubscription = (value.subscriptionMode === "subscribed"
+      && value.subscriptionStatus === "platform-verified"
+      && value.subscriptionSource === "platform-status"
+      && value.subscriptionDimension === "application")
+      || (value.subscriptionMode === "none" && value.subscriptionStatus === "safe-default"
+        && (value.subscriptionSource === "legacy-default" || value.subscriptionSource === "setup-default")
+        && value.subscriptionDimension === null)
+      || (value.subscriptionMode === "none" && value.subscriptionStatus === "requested-unverified"
+        && value.subscriptionSource === "setup-opt-in"
+        && value.subscriptionDimension === "application");
+    return typeof value.messageId === "string" && /^doc_comment_[0-9a-f]{32}$/.test(value.messageId)
+      && typeof value.fileToken === "string" && /^[A-Za-z0-9_-]+$/.test(value.fileToken)
+      && typeof value.fileType === "string" && ["doc", "docx", "sheet", "file"].includes(value.fileType)
+      && typeof value.commentId === "string" && /^[A-Za-z0-9_-]+$/.test(value.commentId)
+      && (value.replyId === undefined || (typeof value.replyId === "string" && /^[A-Za-z0-9_-]+$/.test(value.replyId)))
+      && typeof value.operatorOpenId === "string" && !!value.operatorOpenId
+      && Number.isSafeInteger(value.timestamp) && Number(value.timestamp) > 0
+      && typeof value.noticeType === "string" && !!value.noticeType
+      && validSubscription
+      && typeof value.mentionedBot === "boolean"
+      && (value.subscriptionMode !== "none" || value.mentionedBot === true)
+      && typeof value.queuedAt === "string" && Number.isFinite(Date.parse(value.queuedAt));
+  };
+  const normalizePendingDocumentComments = (value: unknown): PendingDocumentCommentState => {
+    const normalized = emptyPendingDocumentComments();
+    const raw = isRecord(value) && isRecord(value.items) ? value.items : null;
+    if (!raw) return normalized;
+    for (const [messageId, candidate] of Object.entries(raw)) {
+      if (Object.keys(normalized.items).length >= PENDING_DOCUMENT_COMMENT_LIMIT) break;
+      if (validPendingDocumentComment(candidate) && candidate.messageId === messageId) normalized.items[messageId] = candidate;
+      // Older rows whose acceptance depended on an IM mention policy cannot
+      // prove the new subscription boundary. Drop them during the bounded v3 upgrade
+      // of guessing authorization or allowing stale rows to consume capacity.
+    }
+    return normalized;
+  };
+  const withPendingDocumentComments = <R>(
+    agent: ConfiguredAgent,
+    operation: (state: PendingDocumentCommentState) => R,
+  ): R => stateStore(agent).mutateJson<Record<string, unknown>, R>(
+    "documentComments",
+    emptyPendingDocumentComments() as unknown as Record<string, unknown>,
+    (raw) => {
+      const normalized = normalizePendingDocumentComments(raw);
+      for (const key of Object.keys(raw)) delete raw[key];
+      Object.assign(raw, normalized);
+      return operation(raw as unknown as PendingDocumentCommentState);
+    },
+  );
+  const pendingRecord = (
+    agent: ConfiguredAgent,
+    event: CommentEvent,
+    subscription: EffectiveDocumentCommentSubscription,
+  ): PendingDocumentComment => ({
+    messageId: documentCommentMessageId(agent.agentId, event),
+    fileToken: event.fileToken,
+    fileType: event.fileType,
+    commentId: event.commentId,
+    ...(event.replyId ? { replyId: event.replyId } : {}),
+    operatorOpenId: event.operator.openId,
+    timestamp: event.timestamp,
+    noticeType: documentCommentNoticeType(event),
+    subscriptionMode: subscription.mode,
+    subscriptionStatus: subscription.status,
+    subscriptionSource: subscription.source,
+    subscriptionDimension: subscription.dimension,
+    mentionedBot: event.mentionedBot,
+    queuedAt: new Date().toISOString(),
+  });
+  const pendingEvent = (record: PendingDocumentComment): CommentEvent => ({
+    fileToken: record.fileToken,
+    fileType: record.fileType,
+    commentId: record.commentId,
+    ...(record.replyId ? { replyId: record.replyId } : {}),
+    operator: { openId: record.operatorOpenId },
+    mentionedBot: record.mentionedBot,
+    timestamp: record.timestamp,
+    raw: { notice_type: record.noticeType },
+  });
+  const pendingDocumentComment = (agent: ConfiguredAgent, messageId: string): PendingDocumentComment | null =>
+    withPendingDocumentComments(agent, (state) => state.items[messageId] ?? null);
+  const persistPendingDocumentComment = (agent: ConfiguredAgent, record: PendingDocumentComment): PendingDocumentComment =>
+    withPendingDocumentComments(agent, (state) => {
+      const existing = state.items[record.messageId];
+      if (existing) return existing;
+      if (Object.keys(state.items).length >= PENDING_DOCUMENT_COMMENT_LIMIT) {
+        throw Object.assign(new Error("document comment pending capacity exhausted"), { code: "PENDING_DOCUMENT_COMMENT_CAPACITY" });
+      }
+      state.items[record.messageId] = record;
+      return record;
+    });
+  const removePendingDocumentComment = (agent: ConfiguredAgent, messageId: string): void => {
+    withPendingDocumentComments(agent, (state) => {
+      delete state.items[messageId];
+    });
+  };
+  const readPendingDocumentComments = (agent: ConfiguredAgent): PendingDocumentComment[] =>
+    withPendingDocumentComments(agent, (state) => Object.values(state.items));
+  const recordDocumentCommentFailure = (agent: ConfiguredAgent, category: string, reason: string): void => {
+    hostState.updateStatus(agent, {
+      documentCommentLastErrorAt: new Date().toISOString(),
+      documentCommentLastError: reason,
+      documentCommentLastErrorCategory: category,
+    });
+  };
+  const processPendingDocumentCommentOnce = async (
+    agent: ConfiguredAgent, record: PendingDocumentComment, channel: LarkChannel,
+  ): Promise<void> => {
+    const event = pendingEvent(record);
+    let context;
+    try {
+      const resolve = () => resolveDocumentCommentContext(channel.comments, event);
+      context = await (telemetry?.phase(record.messageId, "document.comment.resolve", SpanKind.CLIENT, resolve) ?? resolve());
+    } catch (error) {
+      const diagnostic = classifyDocumentCommentReadFailure(error);
+      recordDocumentCommentFailure(agent, diagnostic.category, diagnostic.reason);
+      throw new Error("评论正文读取失败（检查 scope、发布状态与 Bot 文档访问权）");
+    }
+    if (!context) {
+      removePendingDocumentComment(agent, record.messageId);
+      recordDocumentCommentFailure(agent, "comment_unavailable_or_empty", "comment_unavailable_or_empty");
+      log(`document comment 已终止处理 agent=${agent.name} reason=comment_unavailable_or_empty`);
+      return;
+    }
+    const envelope = projectDocumentCommentEnvelope({
+      agentId: agent.agentId,
+      event,
+      context,
+      subscription: {
+        mode: record.subscriptionMode,
+        status: record.subscriptionStatus,
+        source: record.subscriptionSource,
+        dimension: record.subscriptionDimension,
+        mentionedBot: record.mentionedBot,
+      },
+    });
+    let preparation;
+    try {
+      const persistInbox = async () => stateStore(agent).prepareInboxDelivery(envelope);
+      preparation = await (telemetry?.phase(record.messageId, "document.comment.inbox", SpanKind.PRODUCER, persistInbox) ?? persistInbox());
+    }
+    catch {
+      recordDocumentCommentFailure(agent, "inbox_write_failure", "canonical_inbox_write_failed");
+      throw new Error("document comment canonical Inbox 写入失败");
+    }
+    if (!["appended", "present"].includes(preparation)) {
+      removePendingDocumentComment(agent, record.messageId);
+      telemetry?.filterMessage(record.messageId, "duplicate");
+      log(`document comment 重复已去重 agent=${agent.name} state=${preparation}`);
+      return;
+    }
+    // Canonical Inbox/delivery state is now the recovery authority.
+    removePendingDocumentComment(agent, record.messageId);
+    const receipt = await runtimeHost.deliver(agent.agentId, envelope);
+    if (receipt.status === "error") throw new Error("document comment Runtime 投递失败（canonical Inbox 已保留）");
+    hostState.updateStatus(agent, {
+      documentCommentLastAcceptedAt: new Date().toISOString(),
+      documentCommentLastError: null,
+      documentCommentLastErrorAt: null,
+      documentCommentLastErrorCategory: null,
+    });
+    log(`document comment ${preparation === "appended" ? "已入箱" : "补投"} agent=${agent.name} mode=${context.isWhole ? "top-level" : "in-thread"} delivery=${receipt.status}`);
+  };
+  const processingDocumentComments = new Map<string, Promise<void>>();
+  const processPendingDocumentComment = (
+    agent: ConfiguredAgent, record: PendingDocumentComment, channel: LarkChannel,
+  ): Promise<void> => {
+    const key = `${agent.agentId}:${record.messageId}`;
+    const active = processingDocumentComments.get(key);
+    if (active) return active;
+    const processing = processPendingDocumentCommentOnce(agent, record, channel)
+      .finally(() => processingDocumentComments.delete(key));
+    processingDocumentComments.set(key, processing);
+    return processing;
+  };
+  const replayingDocumentComments = new Map<string, Promise<void>>();
+  const replayPendingDocumentComments = (agent: ConfiguredAgent, channel: LarkChannel): Promise<void> => {
+    const active = replayingDocumentComments.get(agent.agentId);
+    if (active) return active;
+    const replay = (async () => {
+      for (const record of readPendingDocumentComments(agent)) {
+        try {
+          telemetry?.beginMessage(agent.agentId, record.messageId, "document_comment");
+          const replayOne = () => processPendingDocumentComment(agent, record, channel);
+          await (telemetry?.phase(record.messageId, "document.comment.replay", SpanKind.CONSUMER, replayOne) ?? replayOne());
+        }
+        catch { log(`document comment 待处理记录仍需恢复 agent=${agent.name} reason=processing_failed`); }
+      }
+    })().finally(() => replayingDocumentComments.delete(agent.agentId));
+    replayingDocumentComments.set(agent.agentId, replay);
+    return replay;
+  };
+  const onDocumentComment = async (agent: ConfiguredAgent, event: CommentEvent, channel: LarkChannel): Promise<void> => {
+    const messageId = documentCommentMessageId(agent.agentId, event);
+    telemetry?.beginMessage(agent.agentId, messageId, "document_comment");
+    const receive = async () => undefined;
+    await (telemetry?.phase(messageId, "document.comment.receive", SpanKind.CONSUMER, receive) ?? receive());
+    const existing = pendingDocumentComment(agent, messageId);
+    if (existing) {
+      const replayOne = () => processPendingDocumentComment(agent, existing, channel);
+      await (telemetry?.phase(messageId, "document.comment.replay", SpanKind.CONSUMER, replayOne) ?? replayOne());
+      return;
+    }
+    const gate = async (): Promise<{ subscription: EffectiveDocumentCommentSubscription; rejected?: "subscription_unverified" | "self_or_missing_operator" | "unsupported_file_type" }> => {
+      let subscription: EffectiveDocumentCommentSubscription;
+      try { subscription = readDocumentCommentSubscription(larkinHome, agent.feishuProfile); }
+      catch {
+        subscription = { mode: "none", status: "safe-default", source: "legacy-default", dimension: null };
+        log(`document comment subscription 状态不可读，使用安全默认 agent=${agent.name}`);
+      }
+      if (subscription.mode !== "subscribed" && !event.mentionedBot) return { subscription, rejected: "subscription_unverified" };
+      if (!event.operator.openId || event.operator.openId === agent.botOpenId || event.operator.openId === channel.botIdentity?.openId) {
+        return { subscription, rejected: "self_or_missing_operator" };
+      }
+      if (!["doc", "docx", "sheet", "file"].includes(event.fileType)) return { subscription, rejected: "unsupported_file_type" };
+      return { subscription };
+    };
+    const gated = await (telemetry?.phase(messageId, "document.comment.gate", SpanKind.INTERNAL, gate) ?? gate());
+    const subscription = gated.subscription;
+    if (gated.rejected === "subscription_unverified") {
+      telemetry?.filterMessage(messageId, gated.rejected);
+      log(`document comment 未 @Bot 且无已验证订阅，忽略 agent=${agent.name} status=${subscription.status} source=${subscription.source}`);
+      return;
+    }
+    if (gated.rejected === "self_or_missing_operator") {
+      telemetry?.filterMessage(messageId, gated.rejected);
+      log(`document comment 自身或缺少操作者，忽略 agent=${agent.name}`);
+      return;
+    }
+    if (gated.rejected === "unsupported_file_type") {
+      telemetry?.filterMessage(messageId, gated.rejected);
+      recordDocumentCommentFailure(agent, "comment_unavailable_or_empty", "unsupported_file_type");
+      log(`document comment 文件类型不支持，忽略 agent=${agent.name}`);
+      return;
+    }
+    const record = pendingRecord(agent, event, subscription);
+    let durableRecord: PendingDocumentComment;
+    try {
+      const persistPending = async () => persistPendingDocumentComment(agent, record);
+      durableRecord = await (telemetry?.phase(messageId, "document.comment.pending", SpanKind.PRODUCER, persistPending) ?? persistPending());
+    } catch (error) {
+      if ((error as { code?: unknown }).code === "PENDING_DOCUMENT_COMMENT_CAPACITY") {
+        recordDocumentCommentFailure(agent, "pending_capacity_exhausted", "pending_capacity_exhausted");
+        throw new Error("document comment pending capacity exhausted；现有待处理记录已原样保留");
+      }
+      recordDocumentCommentFailure(agent, "pending_state_failure", "pending_record_write_failed");
+      throw new Error("document comment pending recovery record 写入失败");
+    }
+    await processPendingDocumentComment(agent, durableRecord, channel);
+  };
   const channelBusiness = new HostChannelBusiness({
     state: hostState,
     stateStore,
     onMessage: onFeishuMessage,
+    onComment: (agent, event, channel) => onDocumentComment(agent as ConfiguredAgent, event, channel as LarkChannel),
+    onReconnected: (agent, channel) => replayPendingDocumentComments(agent as ConfiguredAgent, channel as LarkChannel),
     mentionPolicy: (agentId, chatId) => {
       try { return resolveMentionPolicy(loadConfig(env).config, agentId, chatId).effective; }
       catch (error) {
@@ -442,6 +760,9 @@ export function createHostShell({
       domain: agent.feishuDomain || "https://open.feishu.cn",
       source: "larkin",
       policy: { dmMode: "open", requireMention: false, respondToMentionAll: true },
+      // issue #88：关闭 SDK 的防抖批量合并（默认 600ms），逐条投递，
+      // 保证 messageId/threadId/发送者与内容、提及永远同源（见 #66）。
+      batch: { text: { delayMs: 0 } },
       handshakeTimeoutMs: 15_000,
       keepalive: {
         enabled: true,
@@ -454,11 +775,11 @@ export function createHostShell({
       includeRawEvent: true,
     });
     interactionChannels.set(agent.agentId, channel);
-    channel.on(channelBusiness.handlers(agent));
+    channel.on(channelBusiness.handlers(agent, channel));
     channelBusiness.registerReadReceipts(agent, channel.dispatcher);
     channel.connect().then(() => {
       channelBusiness.registerCardActions(agent, channel.dispatcher);
-      return channelBusiness.connected(agent, channel, callbacks.onFatal);
+      return channelBusiness.connected(agent, channel, callbacks.onFatal).then(() => replayPendingDocumentComments(agent, channel));
     })
       .catch((error: unknown) => { log(`channel.connect 失败 agent=${agent.name}`); callbacks.onConnectFail?.(error); });
     return channel;
@@ -546,14 +867,20 @@ export function createHostShell({
         domain: agent.feishuDomain || "https://open.feishu.cn",
         source: "larkin",
         policy: { dmMode: "open", requireMention: false, respondToMentionAll: true },
+        // issue #88：关闭 SDK 的防抖批量合并（默认 600ms），逐条投递，
+        // 保证 messageId/threadId/发送者与内容、提及永远同源（见 #66）。
+        batch: { text: { delayMs: 0 } },
         handshakeTimeoutMs: 15_000,
         keepalive: { enabled: true, intervalMs: 15_000 },
+        includeRawEvent: true,
       });
-      const handlers = channelBusiness.handlers(agent);
+      const handlers = channelBusiness.handlers(agent, channel);
       let active = activateImmediately;
       const queuedMessages: Parameters<typeof handlers.message>[0][] = [];
+      const queuedComments: Parameters<typeof handlers.comment>[0][] = [];
       channel.on({ ...handlers,
         message: (message) => { if (active) handlers.message(message); else queuedMessages.push(message); },
+        comment: async (comment) => { if (active) await handlers.comment(comment); else queuedComments.push(comment); },
         cardAction: (event) => active ? handlers.cardAction(event)
           : Promise.resolve({ toast: { type: "info", content: "Agent 配置切换中，请稍后重试。" } }),
       });
@@ -562,6 +889,7 @@ export function createHostShell({
         await channel.connect();
         if (!channel.botIdentity?.openId) throw new Error(`Agent ${agent.agentId} channel 已连接但 bot identity 不可用`);
         await channelBusiness.connected(agent, channel);
+        await replayPendingDocumentComments(agent, channel);
         let activated = false;
         const activate = (): void => {
           if (activated) return;
@@ -569,6 +897,7 @@ export function createHostShell({
           active = true;
           channelBusiness.registerCardActions(agent, channel.dispatcher);
           for (const message of queuedMessages.splice(0)) handlers.message(message);
+          for (const comment of queuedComments.splice(0)) void handlers.comment(comment);
         };
         if (activateImmediately) activate();
         return { channel, activate };

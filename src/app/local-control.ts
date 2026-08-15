@@ -7,6 +7,7 @@ import path from "node:path";
 import { readProcessState } from "../platform/process-state.js";
 import { currentProcessMetadata } from "../platform/process-inspect.cjs";
 import { processCommandToken } from "./internal-command.js";
+import { isWindows, notGroupOrWorldAccessible, secureWindowsDirectoryAcl } from "../platform/secure-metadata.js";
 
 export interface AgentUpsertRequest { operationId: string; agentId: string; authorization: string }
 export type AgentUpsertOperation = Pick<AgentUpsertRequest, "operationId" | "agentId">;
@@ -41,6 +42,9 @@ type AgentControlPayload = Omit<AgentUpsertRequest, "authorization">
 
 interface ProcessBinding { pid: number; processStartToken: string }
 interface SocketBinding { device: string; inode: string; owner: string; changeTimeNs: string }
+// Windows 上 socket 无法 lstat（EACCES），用全数字占位 binding 使 authority 校验通过；
+// 该平台的安全边界是 socket root 目录的 ACL，而非 inode 身份比对。
+const WINDOWS_SOCKET_BINDING: SocketBinding = { device: "0", inode: "0", owner: "0", changeTimeNs: "0" };
 interface ControlAuthority {
   version: 2;
   token: string;
@@ -62,6 +66,7 @@ const MAX_EXTERNAL_CONTENT_BYTES = 32_768;
 const UNIX_SOCKET_PATH_MAX_BYTES = process.platform === "darwin" ? 103 : 107;
 
 function socketPathsFit(root: string): boolean {
+  if (isWindows) return true; // Windows named-pipe socket paths use a much larger limit
   return ["supervisor.sock", "daemon.sock"].every((name) =>
     Buffer.byteLength(path.join(root, name)) <= UNIX_SOCKET_PATH_MAX_BYTES);
 }
@@ -72,16 +77,23 @@ function controlSocketRoot(larkinHome: string): string {
   const leaf = `lk-${owner}-${identity}`;
   const preferred = path.join(path.resolve(os.tmpdir()), leaf);
   if (socketPathsFit(preferred)) return preferred;
+  if (isWindows) throw new Error("无法生成满足 Windows socket 路径限制的 control root");
   const fallback = path.join("/tmp", leaf);
   if (socketPathsFit(fallback)) return fallback;
   throw new Error("无法生成满足 Unix socket 长度限制的 control root");
 }
 
 function assertSecureSocketDirectory(root: string): string {
+  if (isWindows) {
+    // Windows：socket 本身无法 lstat（EACCES），安全边界是目录 ACL。
+    // 每次启动重新收紧为「当前用户 + SYSTEM」并回读校验。
+    secureWindowsDirectoryAcl(root, { label: "control socket root" });
+    return root;
+  }
   const stat = fs.lstatSync(root);
   if (!stat.isDirectory() || stat.isSymbolicLink()
       || (typeof process.getuid === "function" && stat.uid !== process.getuid())
-      || (stat.mode & 0o077) !== 0) throw new Error("control socket root 不安全");
+      || !notGroupOrWorldAccessible(stat)) throw new Error("control socket root 不安全");
   return root;
 }
 
@@ -107,7 +119,7 @@ function assertSecureRoot(root: string): void {
   const stat = fs.lstatSync(root);
   if (!stat.isDirectory() || stat.isSymbolicLink()
       || (typeof process.getuid === "function" && stat.uid !== process.getuid())
-      || (stat.mode & 0o077) !== 0) throw new Error("Larkin config root 必须由当前用户拥有且不可被其他用户访问");
+      || !notGroupOrWorldAccessible(stat)) throw new Error("Larkin config root 必须由当前用户拥有且不可被其他用户访问");
 }
 
 function removeLegacyResetLedger(larkinHome: string): void {
@@ -119,7 +131,7 @@ function removeLegacyResetLedger(larkinHome: string): void {
     throw error;
   }
   if (!stat.isFile() || stat.isSymbolicLink()
-      || (typeof process.getuid === "function" && stat.uid !== process.getuid()) || (stat.mode & 0o077) !== 0) {
+      || (typeof process.getuid === "function" && stat.uid !== process.getuid()) || !notGroupOrWorldAccessible(stat)) {
     throw new Error("legacy daemon control operation ledger 不安全");
   }
   fs.unlinkSync(file);
@@ -178,7 +190,7 @@ function secureAuthority(larkinHome: string): ControlAuthority {
   const stat = fs.lstatSync(file);
   if (!stat.isFile() || stat.isSymbolicLink()
       || (typeof process.getuid === "function" && stat.uid !== process.getuid())
-      || (stat.mode & 0o077) !== 0) throw new Error("daemon control authority 不安全");
+      || !notGroupOrWorldAccessible(stat)) throw new Error("daemon control authority 不安全");
   const value = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<ControlAuthority>;
   const validBinding = (binding: ProcessBinding | undefined): binding is ProcessBinding =>
     !!binding && Number.isSafeInteger(binding.pid) && binding.pid > 0
@@ -202,6 +214,33 @@ function secureAuthority(larkinHome: string): ControlAuthority {
     throw new Error("daemon control authority 无效");
   }
   return value as ControlAuthority;
+}
+
+// The authority file is the single trust anchor between supervisor and daemon.
+// If it goes missing while the supervisor stays up (e.g. a crashed restart
+// cycle deleted it), the daemon re-establishes it from the supervisor's process
+// state instead of dying at startup and crash-looping. Only a missing file is
+// healed; a token mismatch stays fail-closed.
+function secureAuthorityOrRecover(larkinHome: string, authorityToken: string): ControlAuthority {
+  try {
+    return secureAuthority(larkinHome);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    // The real trust anchor is the supervisor identity: recovery only proceeds
+    // when supervisor-status.json describes a live, token-carrying supervisor
+    // process, and the token written here is the one that supervisor injected
+    // into this daemon. The sameSecret check after recovery is a tautology for
+    // the missing-file case; the supervisor's own control-server start re-verifies
+    // the file against its token, so a forged file still fails closed there.
+    const supervisor = readProcessState(larkinHome).supervisor;
+    if (supervisor.state !== "owned" || !supervisor.pid || !supervisor.processStartToken) throw error;
+    initializeControlAuthority(
+      larkinHome,
+      { pid: Number(supervisor.pid), processStartToken: supervisor.processStartToken },
+      authorityToken,
+    );
+    return secureAuthority(larkinHome);
+  }
 }
 
 function sameSecret(left: string, right: string): boolean {
@@ -265,6 +304,12 @@ function assertSupervisorAuthority(larkinHome: string, expectedToken?: string): 
 }
 
 function prepareSocket(socket: string): void {
+  if (isWindows) {
+    // Windows：socket 路径无法 lstat（EACCES）；尽力清除陈旧占用，失败即忽略，
+    // 由 listen 的独占语义兜底（见 listenPrivate 的 win32 分支）。
+    try { fs.unlinkSync(socket); } catch { /* ignore */ }
+    return;
+  }
   try {
     const stat = fs.lstatSync(socket);
     if (!stat.isSocket() || stat.isSymbolicLink()
@@ -289,6 +334,14 @@ async function closePrivateServer(
   socket: string,
   identity: SocketBinding | null,
 ): Promise<void> {
+  if (isWindows) {
+    // Windows：socket 无 lstat 身份可比对，直接关服并清理目录（残留由 ENOTEMPTY 忽略）。
+    if (server.listening) {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+    cleanupSocketRoot(path.dirname(socket));
+    return;
+  }
   let shield: string | null = null;
   let closeError: unknown;
   try {
@@ -329,6 +382,22 @@ async function closePrivateServer(
 }
 
 async function listenPrivate(server: net.Server, socket: string): Promise<SocketBinding> {
+  if (isWindows) {
+    // Windows：bun 的 unix socket 可正常 listen/connect/chmod/close，但 lstatSync(socket)
+    // 抛 EACCES（socket 不是普通文件系统节点）。因此跳过 lstat 身份比对，安全边界
+    // 由 assertSecureSocketDirectory 收紧的目录 ACL 承担。
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(socket, () => { server.off("error", reject); resolve(); });
+      });
+      try { fs.chmodSync(socket, 0o600); } catch { /* Windows chmod best-effort */ }
+      return WINDOWS_SOCKET_BINDING;
+    } catch (error) {
+      await closePrivateServer(server, socket, WINDOWS_SOCKET_BINDING);
+      throw error;
+    }
+  }
   let identity: SocketBinding | null = null;
   try {
     await new Promise<void>((resolve, reject) => {
@@ -356,12 +425,16 @@ async function listenPrivate(server: net.Server, socket: string): Promise<Socket
   }
 }
 
-export function initializeControlAuthority(larkinHome: string, supervisor: ProcessBinding): string {
+function writeControlAuthority(larkinHome: string, authority: ControlAuthority): void {
+  atomicWritePrivateJson(controlAuthorityPath(larkinHome), authority);
+}
+
+export function initializeControlAuthority(larkinHome: string, supervisor: ProcessBinding, explicitToken?: string): string {
   fs.mkdirSync(larkinHome, { recursive: true, mode: 0o700 });
   assertSecureRoot(larkinHome);
   const socketRoot = ensureSecureSocketRoot(larkinHome);
-  const token = crypto.randomBytes(32).toString("base64url");
-  atomicWritePrivateJson(controlAuthorityPath(larkinHome), {
+  const token = explicitToken ?? crypto.randomBytes(32).toString("base64url");
+  writeControlAuthority(larkinHome, {
     version: 2,
     token,
     socketRoot,
@@ -497,7 +570,7 @@ export function createAgentControlServer({
       fs.mkdirSync(larkinHome, { recursive: true, mode: 0o700 });
       assertSecureRoot(larkinHome);
       removeLegacyResetLedger(larkinHome);
-      const authority = secureAuthority(larkinHome);
+      const authority = secureAuthorityOrRecover(larkinHome, authorityToken);
       if (!sameSecret(authority.token, authorityToken)) throw new Error("daemon control authorization 不匹配");
       const supervisor = readProcessState(larkinHome).supervisor;
       if (supervisor.state !== "owned" || !bindingMatches(authority.supervisor, supervisor)) {
@@ -675,7 +748,7 @@ async function sendSupervisorRecovery(larkinHome: string, operationId: string, t
   const stat = fs.lstatSync(socket);
   if (!stat.isSocket() || stat.isSymbolicLink()
       || (typeof process.getuid === "function" && stat.uid !== process.getuid())
-      || (stat.mode & 0o077) !== 0) throw new Error("supervisor control socket 不安全");
+      || !notGroupOrWorldAccessible(stat)) throw new Error("supervisor control socket 不安全");
   return await new Promise<DashboardRecoveryResponse>((resolve, reject) => {
     const client = net.createConnection(socket);
     const timer = setTimeout(() => { client.destroy(); reject(new Error("dashboard recovery control timeout")); }, timeoutMs);
@@ -738,7 +811,7 @@ async function requestAgentControl<T>({
   const stat = fs.lstatSync(socket);
   if (!stat.isSocket() || stat.isSymbolicLink()
       || (typeof process.getuid === "function" && stat.uid !== process.getuid())
-      || (stat.mode & 0o077) !== 0) throw new Error("daemon control socket 不安全");
+      || !notGroupOrWorldAccessible(stat)) throw new Error("daemon control socket 不安全");
   return await new Promise<T>((resolve, reject) => {
     const client = net.createConnection(socket);
     const timer = setTimeout(() => { client.destroy(); reject(new Error("agent control timeout")); }, timeoutMs);

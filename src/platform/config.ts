@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { TargetRootLayout, resolveConfigDir as resolveRootConfigDir } from "./root-layout.js";
+import { exactMode, fsyncDirectoryOf } from "./secure-metadata.js";
 import { CURRENT_RUNTIME_MODELS, type RuntimeModels } from "../runtime/runtime-model-catalog.js";
 import processInspect from "./process-inspect.cjs";
 
@@ -15,6 +16,7 @@ export type MentionPolicyOverride = MentionPolicy | "inherit";
 export interface StoredAgent {
   runtime: string;
   model: string;
+  piDistribution?: "external" | "builtin";
   effort?: string;
   mentionPolicy?: MentionPolicy;
   chatMentionPolicies?: Record<string, MentionPolicy>;
@@ -71,13 +73,13 @@ interface ConfigApplyFile { version: 1; persistedRevision: string; agents: Recor
 const TOP_FIELDS_V3 = new Set(["version", "serverId", "activeAgent", "agents"]);
 const TOP_FIELDS_V4 = new Set(["version", "serverId", "mentionPolicy", "activeAgent", "agents"]);
 const AGENT_FIELDS_V3 = new Set(["runtime", "model", "effort", "noMentionChats", "createdAt"]);
-const AGENT_FIELDS_V4 = new Set(["runtime", "model", "effort", "mentionPolicy", "chatMentionPolicies", "createdAt"]);
+const AGENT_FIELDS_V4 = new Set(["runtime", "model", "piDistribution", "effort", "mentionPolicy", "chatMentionPolicies", "createdAt"]);
 const APP_ID = /^cli_[A-Za-z0-9]+$/;
 const CHAT_ID = /^oc_[A-Za-z0-9_-]+$/;
 const PI_EFFORTS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const CODEX_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const CLAUDE_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
-const PI_MODEL = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._:@+-]+$/;
+const PI_MODEL = /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._:@+-]+)?$/;
 const CODEX_MODEL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const CLAUDE_MODEL = /^[A-Za-z0-9][A-Za-z0-9._\[\]-]{0,127}$/;
 const CONFIG_LIMIT_BYTES = 1024 * 1024;
@@ -158,6 +160,11 @@ function validateStoredAgent(key: string, agent: unknown, version: 3 | 4): asser
   if (!loadRuntimeModels()[agent.runtime]) throw new Error(`Agent ${key}.runtime 未知：${agent.runtime}`);
   if (typeof agent.model !== "string" || !agent.model) throw new Error(`Agent ${key}.model 必须是非空字符串`);
   assertModel(agent.runtime, agent.model);
+  if (Object.hasOwn(agent, "piDistribution")) {
+    if (agent.runtime !== "pi" || (agent.piDistribution !== "external" && agent.piDistribution !== "builtin")) {
+      throw new Error(`Agent ${key}.piDistribution 只允许 Pi runtime 使用 external/builtin`);
+    }
+  }
   if (Object.hasOwn(agent, "effort") && (typeof agent.effort !== "string" || !agent.effort)) throw new Error(`Agent ${key}.effort 必须是非空字符串`);
   if (agent.model === "default" && Object.hasOwn(agent, "effort")) throw new Error(`Agent ${key}.model=default 时不能保存 effort`);
   if (typeof agent.effort === "string") {
@@ -191,6 +198,7 @@ function hydratedStoredAgent(key: string, agent: Obj, version: 3 | 4): StoredAge
   return {
     runtime: agent.runtime as string,
     model: agent.model as string,
+    ...(agent.piDistribution === "external" || agent.piDistribution === "builtin" ? { piDistribution: agent.piDistribution } : {}),
     ...(typeof agent.effort === "string" ? { effort: agent.effort } : {}),
     ...(version === 4 && (agent.mentionPolicy === "require" || agent.mentionPolicy === "free") ? { mentionPolicy: agent.mentionPolicy } : {}),
     ...(Object.keys(chatMentionPolicies).length ? { chatMentionPolicies, noMentionChats: Object.entries(chatMentionPolicies).filter(([, policy]) => policy === "free").map(([chatId]) => chatId) } : {}),
@@ -203,6 +211,7 @@ export function hydrateAgent(key: string, agent: StoredAgent & { noMentionChats?
   return {
     name: key, agentId: key, feishuAppId: key, feishuProfile: key,
     runtime: agent.runtime, model: agent.model,
+    ...(agent.piDistribution ? { piDistribution: agent.piDistribution } : {}),
     workspaceDir: layout.workspaceDir(key), stateDir: layout.agentStateDir(key),
     larkConfigDir: path.join(layout.agentStateDir(key), "lark-cli-config"),
     ...(agent.effort ? { effort: agent.effort } : {}),
@@ -242,7 +251,7 @@ export function normalizeConfig(raw: unknown, configDir: string, { mint }: { min
 export function assertPrivateConfigMetadata(metadata: { regularFile: boolean; uid: number; mode: number }, label = "配置文件"): void {
   if (!metadata.regularFile) throw new Error(`${label} 必须是普通文件`);
   if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) throw new Error(`${label} owner 不是当前用户`);
-  if ((metadata.mode & 0o777) !== 0o600) throw new Error(`${label} 权限必须是 0600`);
+  if (!exactMode(metadata, 0o600)) throw new Error(`${label} 权限必须是 0600`);
 }
 
 function readPrivateFile(file: string, root: string, limit: number, label: string): Buffer | null {
@@ -298,6 +307,7 @@ export function toStored(config: HydratedConfig): { version: 4; serverId: string
   const out = { version: 4 as const, serverId: config.serverId, mentionPolicy: config.mentionPolicy, activeAgent: config.activeAgent, agents: {} as Record<string, StoredAgent> };
   for (const [key, agent] of Object.entries(config.agents || {})) {
     const stored: StoredAgent = { runtime: agent.runtime, model: agent.model };
+    if (agent.piDistribution) stored.piDistribution = agent.piDistribution;
     if (typeof agent.effort === "string" && agent.effort) stored.effort = agent.effort;
     if (agent.mentionPolicy) stored.mentionPolicy = agent.mentionPolicy;
     if (agent.chatMentionPolicies && Object.keys(agent.chatMentionPolicies).length) stored.chatMentionPolicies = { ...agent.chatMentionPolicies };
@@ -316,6 +326,17 @@ export function resolveMentionPolicy(config: HydratedConfig, agentId: string, ch
   return { effective: config.mentionPolicy, source: "global" };
 }
 
+/** Resolve non-chat event policy. Deliberately has no chat-id input and never reads per-chat overrides. */
+export function resolveAgentGlobalMentionPolicy(config: HydratedConfig, agentId: string): {
+  effective: MentionPolicy;
+  source: "agent" | "global";
+} {
+  const agent = config.agents[agentId];
+  if (!agent) throw new Error(`Agent 不存在：${agentId}`);
+  if (agent.mentionPolicy) return { effective: agent.mentionPolicy, source: "agent" };
+  return { effective: config.mentionPolicy, source: "global" };
+}
+
 function revision(bytes: Buffer | string): string {
   return `sha256:${crypto.createHash("sha256").update(bytes).digest("hex")}`;
 }
@@ -325,7 +346,7 @@ function agentSignature(config: HydratedConfig, agentId: string): string {
   if (!agent) throw new Error(`Agent 不存在：${agentId}`);
   const chats = Object.fromEntries(Object.entries(agent.chatMentionPolicies || {}).sort(([left], [right]) => left.localeCompare(right)));
   return revision(JSON.stringify({
-    runtime: agent.runtime, model: agent.model, effort: agent.effort ?? null,
+    runtime: agent.runtime, model: agent.model, piDistribution: agent.piDistribution ?? null, effort: agent.effort ?? null,
     globalMentionPolicy: config.mentionPolicy, agentMentionPolicy: agent.mentionPolicy ?? null, chatMentionPolicies: chats,
   }));
 }
@@ -553,8 +574,7 @@ function atomicWriteConfig(file: string, value: unknown): Buffer {
   try {
     fs.renameSync(temporary, file);
     fs.chmodSync(file, 0o600);
-    const dirFd = fs.openSync(path.dirname(file), "r");
-    try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
+    fsyncDirectoryOf(file);
   } catch (error) { try { fs.unlinkSync(temporary); } catch { /* best effort */ } throw error; }
   return bytes;
 }

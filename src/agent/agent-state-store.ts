@@ -3,14 +3,15 @@ import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { TargetRootLayout, type AgentStatePaths } from "../platform/root-layout.js";
 import { acquireProcessLock, inspectProcess } from "../platform/process-state.js";
+import { isWindows } from "../platform/secure-metadata.js";
 import { targetKeyOfInboxEnvelope, type InboxEnvelope } from "./inbox-projection.js";
 
 export type JsonStateKey = "agentState" | "status" | "map" | "replyctx" | "botIdentity" |
-  "senderProfiles" | "readReceipts" | "pendingReact" | "runtimeDeliveries" | "inboxState" | "freshnessState" | "reminders" | "interactions" | "externalEnqueue";
+  "senderProfiles" | "readReceipts" | "pendingReact" | "runtimeDeliveries" | "inboxState" | "freshnessState" | "documentComments" | "reminders" | "interactions" | "externalEnqueue";
 export type NdjsonStateKey = "conversation" | "inbox";
 
 const JSON_KEYS: ReadonlySet<string> = new Set([
-  "agentState", "status", "map", "replyctx", "botIdentity", "senderProfiles", "readReceipts", "pendingReact", "runtimeDeliveries", "inboxState", "freshnessState", "reminders", "interactions", "externalEnqueue",
+  "agentState", "status", "map", "replyctx", "botIdentity", "senderProfiles", "readReceipts", "pendingReact", "runtimeDeliveries", "inboxState", "freshnessState", "documentComments", "reminders", "interactions", "externalEnqueue",
 ]);
 const NDJSON_KEYS: ReadonlySet<string> = new Set(["conversation", "inbox"]);
 const INBOX_LOCK_TIMEOUT_MS = 2_000;
@@ -264,7 +265,8 @@ export class AgentStateStore {
     try {
       fd = fs.openSync(ownerFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
       const stat = fs.fstatSync(fd);
-      if (!stat.isFile() || (typeof process.getuid === "function" && stat.uid !== process.getuid()) || (stat.mode & 0o077) !== 0) {
+      if (!stat.isFile() || (typeof process.getuid === "function" && stat.uid !== process.getuid())
+          || (!isWindows && (stat.mode & 0o077) !== 0)) {
         throw new Error(`Inbox lock owner 文件不安全：${ownerFile}`);
       }
       const value = JSON.parse(fs.readFileSync(fd, "utf8")) as unknown;
@@ -602,6 +604,7 @@ export class AgentStateStore {
     if (typeof messageId !== "string" || !messageId) throw new Error("Inbox envelope requires message_id");
     const file = this.file("inbox");
     return this.withInboxLock(file, () => {
+      if (this.inboxState().messages[messageId]) return false;
       if (this.readNdjson<Record<string, unknown>>("inbox").some((row) => row.message_id === messageId)) return false;
       this.appendInboxUnlocked(value);
       return true;

@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { agentCliPromptCapabilities } from "../agent/agent-cli-capabilities.js";
+import { SpanKind } from "@opentelemetry/api";
 import type { ContextPromptBuilder } from "../agent/context-prompt.js";
 import type {
   NormalizedRuntimeEvent, RuntimeAdapter, RuntimeInput, RuntimeInputResult, RuntimeSession,
@@ -14,10 +15,12 @@ import {
 } from "./runtime-readiness.js";
 import { resolveOfficialLarkCli } from "../app/official-lark-cli.js";
 import { assertAgentWorkspaceBound, managedLarkCliEnv } from "../app/agent-lark-cli-workspace.js";
+import type { TelemetryRuntime } from "../platform/telemetry-tracing.js";
 
 export interface AgentRuntimeConfig {
   agentId: string; name: string; displayName?: string | null; description?: string | null;
   runtime: string; model: string; effort?: string | null; workspaceDir: string;
+  piDistribution?: "external" | "builtin";
   stateDir?: string; sessionId?: string | null;
   larkConfigDir?: string;
   feishuAppId?: string;
@@ -165,23 +168,29 @@ export function createRuntimeHost(options: {
   stateStoreFor?(agentId: string): DeliveryStateStore;
   assertOfficialCliReady?(config: AgentRuntimeConfig, env: NodeJS.ProcessEnv): void | Promise<void>;
   retryPolicy?: { baseDelayMs?: number; maxDelayMs?: number; maxAttempts?: number; stableWindowMs?: number };
+  telemetry?: TelemetryRuntime;
 }): RuntimeHost {
   const managed = new Map<string, ManagedAgent>();
   const listeners = new Set<(event: RuntimeHostEvent) => void>();
   const log = options.log ?? (() => {});
+  const telemetry = options.telemetry;
   const retryPolicy = {
     baseDelayMs: options.retryPolicy?.baseDelayMs ?? 250,
     maxDelayMs: options.retryPolicy?.maxDelayMs ?? 10_000,
     maxAttempts: options.retryPolicy?.maxAttempts ?? 6,
     stableWindowMs: options.retryPolicy?.stableWindowMs ?? 30_000,
   };
-  const emit = (event: RuntimeHostEvent): void => { for (const listener of listeners) listener(event); };
+  const emit = (event: RuntimeHostEvent): void => {
+    if (event.type === "delivery") telemetry?.delivery(event.agentId, event.messageId, event.status);
+    for (const listener of listeners) listener(event);
+  };
   const runtimeEnv = (config: AgentRuntimeConfig, generation?: string): NodeJS.ProcessEnv => {
     const base: NodeJS.ProcessEnv = {
       LARKIN_AGENT_ID: config.agentId,
     ...(generation ? { LARKIN_RUNTIME_OBSERVATION_GENERATION: generation } : {}),
     LARKIN_CONFIG_DIR: process.env.LARKIN_CONFIG_DIR,
     LARKIN_HOME: process.env.LARKIN_HOME,
+    ...(config.piDistribution ? { LARKIN_PI_DISTRIBUTION: config.piDistribution } : {}),
     ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
     ...(process.env.SHELL ? { SHELL: process.env.SHELL } : {}),
     ...(process.env.ZDOTDIR ? { ZDOTDIR: process.env.ZDOTDIR } : {}),
@@ -490,6 +499,9 @@ export function createRuntimeHost(options: {
 
   const observe = (agent: ManagedAgent, session: RuntimeSession, event: NormalizedRuntimeEvent): void => {
     if (agent.session !== session) return; // Ignore late output from a replaced child.
+    // Keep the trace parent published until authoritative Inbox reconciliation
+    // has observed any direct CLI poll completed by this turn.
+    if (event.type !== "turn-end") telemetry?.runtimeEvent(agent.config.agentId, event);
     emit({ type: "runtime", agentId: agent.config.agentId, event });
     if (event.type === "session-init") {
       agent.config.sessionId = event.sessionId;
@@ -510,6 +522,7 @@ export function createRuntimeHost(options: {
       agent.busy = false;
       emit({ type: "activity", agentId: agent.config.agentId, activity: "idle", activityKind: "idle", detailKind: "turn_ended" });
       reconcileAcceptedAtTurnEnd(agent);
+      telemetry?.runtimeEvent(agent.config.agentId, event);
       if (recoveredAuthentication) {
         agent.authFailureActive = false;
         const prior = agent.readiness;
@@ -569,7 +582,8 @@ export function createRuntimeHost(options: {
     if (agent.starting) return agent.starting;
     const probeEnv = runtimeEnv(agent.config);
     await assertOfficialCliReady(agent.config, probeEnv);
-    const readiness = agent.adapter.probe ? await agent.adapter.probe({ workspaceDir: agent.config.workspaceDir,
+    const readiness = agent.adapter.probe ? await agent.adapter.probe({ agentId: agent.config.agentId,
+      workspaceDir: agent.config.workspaceDir, stateDir: agent.config.stateDir,
       env: { LARKIN_PI_COMMAND: process.env.LARKIN_PI_COMMAND, LARKIN_CODEX_COMMAND: process.env.LARKIN_CODEX_COMMAND,
         LARKIN_CLAUDE_COMMAND: process.env.LARKIN_CLAUDE_COMMAND, ...probeEnv } })
       : { runtime: agent.adapter.id, state: "ready" as const };
@@ -619,7 +633,7 @@ export function createRuntimeHost(options: {
       const adapter = options.adapterFor(config.runtime);
       const env = runtimeEnv(config);
       await assertOfficialCliReady(config, env);
-      return adapter.probe ? adapter.probe({ workspaceDir: config.workspaceDir,
+      return adapter.probe ? adapter.probe({ agentId: config.agentId, workspaceDir: config.workspaceDir, stateDir: config.stateDir,
         env: { LARKIN_PI_COMMAND: process.env.LARKIN_PI_COMMAND, LARKIN_CODEX_COMMAND: process.env.LARKIN_CODEX_COMMAND,
           LARKIN_CLAUDE_COMMAND: process.env.LARKIN_CLAUDE_COMMAND, ...env } })
         : { runtime: adapter.id, state: "ready" };
@@ -633,7 +647,7 @@ export function createRuntimeHost(options: {
       const adapter = options.adapterFor(config.runtime);
       const stageEnv = runtimeEnv(config, `${crypto.randomUUID()}:staged`);
       await assertOfficialCliReady(config, stageEnv);
-      const readiness = adapter.probe ? await adapter.probe({ workspaceDir: config.workspaceDir,
+      const readiness = adapter.probe ? await adapter.probe({ agentId: config.agentId, workspaceDir: config.workspaceDir, stateDir: config.stateDir,
         env: { LARKIN_PI_COMMAND: process.env.LARKIN_PI_COMMAND, LARKIN_CODEX_COMMAND: process.env.LARKIN_CODEX_COMMAND,
           LARKIN_CLAUDE_COMMAND: process.env.LARKIN_CLAUDE_COMMAND, ...stageEnv } })
         : { runtime: adapter.id, state: "ready" as const };
@@ -713,7 +727,8 @@ export function createRuntimeHost(options: {
       const oldSessionId = oldSession.sessionId;
       const probeEnv = runtimeEnv(agent.config, `${agent.launchId}:reset`);
       await assertOfficialCliReady(agent.config, probeEnv);
-      const readiness = agent.adapter.probe ? await agent.adapter.probe({ workspaceDir: agent.config.workspaceDir,
+      const readiness = agent.adapter.probe ? await agent.adapter.probe({ agentId: agent.config.agentId,
+        workspaceDir: agent.config.workspaceDir, stateDir: agent.config.stateDir,
         env: { LARKIN_PI_COMMAND: process.env.LARKIN_PI_COMMAND, LARKIN_CODEX_COMMAND: process.env.LARKIN_CODEX_COMMAND,
           LARKIN_CLAUDE_COMMAND: process.env.LARKIN_CLAUDE_COMMAND, ...probeEnv } })
         : { runtime: agent.adapter.id, state: "ready" as const };
@@ -772,8 +787,11 @@ export function createRuntimeHost(options: {
       let activeCount = 0;
       let recoveringCount = 0;
       const startupFailures: string[] = [];
-      for (const config of configs) {
-        if (managed.has(config.agentId)) { activeCount += 1; continue; }
+      // Agents start concurrently: each Agent's runtime session is independent,
+      // and serial startup multiplied every per-Agent handshake (login-shell
+      // probe + runtime RPC discovery) by the Agent count.
+      const startups = configs.map(async (config) => {
+        if (managed.has(config.agentId)) { activeCount += 1; return; }
         const stateStore = options.stateStoreFor?.(config.agentId);
         const persisted = stateStore
           ? stateStore.withInboxTransaction(() => {
@@ -817,15 +835,17 @@ export function createRuntimeHost(options: {
             ...(error instanceof RuntimePrerequisiteError ? { readiness: error.readiness } : {}) });
         }
         agent.poller = setInterval(() => reconcileExternalConsumption(agent), 250); agent.poller.unref?.();
-      }
+      });
+      await Promise.all(startups);
       if (configs.length > 0 && activeCount === 0 && recoveringCount === 0) {
         throw new Error(`No runtime Agent started: ${startupFailures.join("; ")}`);
       }
     },
     async deliver(agentId, envelope): Promise<DeliveryReceipt> {
-      const agent = managed.get(agentId); if (!agent) throw new Error(`unknown runtime Agent: ${agentId}`);
-      reconcileExternalConsumption(agent);
       const messageId = String(envelope.message_id || envelope.seq || crypto.randomUUID());
+      const agent = managed.get(agentId);
+      if (!agent) { telemetry?.delivery(agentId, messageId, "error"); throw new Error(`unknown runtime Agent: ${agentId}`); }
+      reconcileExternalConsumption(agent);
       const existingId = agent.byMessage.get(messageId);
       if (existingId) {
         const existing = agent.records.get(existingId);
@@ -834,15 +854,19 @@ export function createRuntimeHost(options: {
           delete existing.reason;
           delete existing.retryable;
           setRecord(agent, existing, "pending");
-          const receipt = await submit(agent, existing, agent.busy || agent.submitting);
+          const receipt = await (telemetry?.phase(messageId, "runtime.deliver", SpanKind.PRODUCER,
+            () => submit(agent, existing, agent.busy || agent.submitting)) ?? submit(agent, existing, agent.busy || agent.submitting));
+          telemetry?.delivery(agentId, messageId, receipt.status);
           reconcileAbsentCanonical(agent, agent.records.get(existingId) ?? existing);
           return receipt;
         }
         if (existing) reconcileAbsentCanonical(agent, existing);
+        telemetry?.delivery(agentId, messageId, "duplicate");
         return { status: "duplicate", deliveryId: existingId };
       }
       if ([...agent.records.values()].filter((record) => isActiveDelivery(record.status)).length >= MAX_DELIVERIES) {
         const deliveryId = `overflow-${crypto.createHash("sha256").update(messageId).digest("hex").slice(0, 24)}`;
+        telemetry?.delivery(agentId, messageId, "deferred");
         return { status: "deferred", deliveryId, reason: `runtime delivery backlog limit ${MAX_DELIVERIES} reached` };
       }
       const deliveryId = crypto.randomUUID();
@@ -855,9 +879,12 @@ export function createRuntimeHost(options: {
       agent.records.set(deliveryId, record); agent.byMessage.set(messageId, deliveryId); persist(agent);
       if (agent.disabledReason) {
         reconcileAbsentCanonical(agent, record);
+        telemetry?.delivery(agentId, messageId, "deferred");
         return { status: "deferred", deliveryId, reason: agent.disabledReason };
       }
-      const receipt = await submit(agent, record, busy);
+      const receipt = await (telemetry?.phase(messageId, "runtime.deliver", SpanKind.PRODUCER,
+        () => submit(agent, record, busy)) ?? submit(agent, record, busy));
+      telemetry?.delivery(agentId, messageId, receipt.status);
       reconcileAbsentCanonical(agent, agent.records.get(deliveryId) ?? record);
       return receipt;
     },

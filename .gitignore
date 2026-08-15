@@ -4,4 +4,10 @@ node_modules/
 .DS_Store
 /dist/
 /artifacts/
+/larkin-bin/
 recovered-src/
+
+# 曾经误提交过的私有路径，防止再次进入发布源
+/.agents/
+/fork/
+/packages/larkin-shell/

@@ -19,6 +19,7 @@ export interface AgentStatePaths {
   runtimeDeliveries: string;
   inboxState: string;
   freshnessState: string;
+  documentComments: string;
   interactions: string;
   externalEnqueue: string;
   conversation: string;
@@ -92,6 +93,7 @@ export class TargetRootLayout {
       runtimeDeliveries: path.join(root, "runtime-deliveries.json"),
       inboxState: path.join(root, "inbox-state.json"),
       freshnessState: path.join(root, "freshness-state.json"),
+      documentComments: path.join(root, "document-comments.json"),
       interactions: path.join(root, "interactions.json"),
       externalEnqueue: path.join(root, "external-enqueue.json"),
       conversation: path.join(root, "conversation.ndjson"),

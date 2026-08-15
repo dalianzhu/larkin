@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import { spawnSync } from "node:child_process";
+import { SpanKind } from "@opentelemetry/api";
 import * as fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
@@ -16,6 +17,8 @@ import { AGENT_CLI_CAPABILITIES } from "../agent/agent-cli-capabilities.js";
 import { CONFIG_CLI_USAGE, CONFIG_CLI_VALUES } from "../agent/config-cli-contract.js";
 import { internalCommandSpec } from "./internal-command.js";
 import { packageVersion } from "../platform/build-info.js";
+import { loadTelemetryConfig } from "../platform/telemetry-config.js";
+import { telemetrySingleton, type TelemetryRuntime } from "../platform/telemetry-tracing.js";
 import {
   feishuImFreshnessAdapter, feishuImTarget, mergeFeishuImCursor, serializeFeishuImTarget,
   type FeishuImCursor, type FeishuImMessage,
@@ -36,6 +39,7 @@ export interface AgentCliDependencies {
   }>;
   spawn?: typeof spawnSync;
   stateStore?: AgentStateStore;
+  telemetry?: TelemetryRuntime;
   now?(): number;
   timeZone?(): string;
   requestAgentUpsert?(input: { larkinHome: string; agentId: string }): Promise<{ ok: boolean; error?: string }>;
@@ -129,7 +133,7 @@ function query(requestPath: string, name: string): string | null {
 
 function migrationError(group: string, subcommand?: string): string | null {
   if (group === "message") {
-    return "message 已移除：只读查看收件箱用 `larkin inbox check`，领取完整消息用 `larkin inbox poll`；飞书发送、回复和查询请使用 `larkin im +messages-send`、`+messages-reply`、`+chat-messages-list` 或 `+messages-mget`。";
+    return "message 已移除：只读查看收件箱用 `larkin inbox check`，领取完整消息用 `larkin inbox poll`；飞书（Lark）发送、回复和查询请使用 `larkin im +messages-send`、`+messages-reply`、`+chat-messages-list` 或 `+messages-mget`。";
   }
   if (group === "channel") {
     return "channel 已移除：群聊操作请使用 `larkin im +chat-list`、`+chat-search`、`chats get`、`+chat-create`、`+chat-update` 或 `chat.members get/create/delete`。";
@@ -137,8 +141,8 @@ function migrationError(group: string, subcommand?: string): string | null {
   if (group === "attachment") {
     return "attachment 已移除：发送附件请使用 `larkin im +messages-send --file/--image/--video/--audio`；下载请使用 `larkin im +messages-resources-download`。";
   }
-  if (group === "server") return "server 已移除；飞书群与消息信息请通过 `larkin im ...` 查询。";
-  if (group === "im") return "请通过 `larkin im ...` 使用飞书命令；Runtime 会自动绑定当前 Bot identity，并在写入前执行 freshness gate。可运行 `larkin im --help` 查看帮助。";
+  if (group === "server") return "server 已移除；飞书（Lark）群与消息信息请通过 `larkin im ...` 查询。";
+  if (group === "im") return "请通过 `larkin im ...` 使用飞书（Lark）命令；Runtime 会自动绑定当前 Bot identity，并在写入前执行 freshness gate。可运行 `larkin im --help` 查看帮助。";
   if (group === "profile" && subcommand !== "show") {
     return "profile 只保留只读的 `larkin profile show`；身份和凭证由 `larkin setup` 管理，不支持 update。";
   }
@@ -147,7 +151,7 @@ function migrationError(group: string, subcommand?: string): string | null {
 
 function help(): JsonObject {
   return {
-    usage: "larkin <inbox|reminder|interaction|profile|config> ...",
+    usage: "larkin <inbox|comment|reminder|interaction|profile|config> ...",
     capabilities: AGENT_CLI_CAPABILITIES,
   };
 }
@@ -466,35 +470,46 @@ export function runAgentCli(
         emitJson(io, projectInboxCheck(stateStore.readNdjson<InboxEnvelope>("inbox"), target));
         return 0;
       }
-      const rawLimit = options.values.get("--limit");
-      const limit = rawLimit === undefined ? undefined : Number(rawLimit);
-      const polled = stateStore.pollInbox<InboxEnvelope>({ ...(target ? { target } : {}), ...(limit !== undefined ? { limit } : {}) });
-      const providerMessages = new Map<string, FeishuImMessage[]>();
-      for (const envelope of polled.envelopes) {
-        if (typeof envelope.message_id !== "string" || typeof envelope.create_time !== "string") continue;
-        const localTarget = typeof envelope.target === "string" ? envelope.target
-          : (typeof envelope.chat_id === "string" && envelope.chat_id
-            ? (typeof envelope.thread_id === "string" && envelope.thread_id
-              ? `thread:${envelope.chat_id}:${envelope.thread_id}` : `chat:${envelope.chat_id}`)
-            : null);
-        if (!localTarget) continue;
-        const key = serializeFeishuImTarget(feishuImTarget(localTarget));
-        const rows = providerMessages.get(key) ?? [];
-        rows.push(envelope as FeishuImMessage);
-        providerMessages.set(key, rows);
-      }
-      for (const [key, messages] of providerMessages) {
-        const cursor = feishuImFreshnessAdapter.cursor({ messages });
-        if (cursor) stateStore.mergeFreshnessCursor<FeishuImCursor>(key, cursor, mergeFeishuImCursor,
-          env.LARKIN_RUNTIME_OBSERVATION_GENERATION || "external");
-      }
-      const projected = projectInboxEvents(polled.envelopes);
-      const hasMore = polled.pendingCount > 0;
-      emitJson(io, { version: 2, delivery: "direct_ack", at_most_once: true, ...projected,
-        pending_count: polled.pendingCount, has_more: hasMore,
-        ...(hasMore ? { next_action: "Continue polling the same Inbox scope until has_more is false." } : {}),
-        seen_through_seq: polled.seenThroughSeq, consumed_delivery_ids: polled.consumedDeliveryIds });
-      return 0;
+      const poll = (): number => {
+        const rawLimit = options.values.get("--limit");
+        const limit = rawLimit === undefined ? undefined : Number(rawLimit);
+        const polled = stateStore.pollInbox<InboxEnvelope>({ ...(target ? { target } : {}), ...(limit !== undefined ? { limit } : {}) });
+        const providerMessages = new Map<string, FeishuImMessage[]>();
+        for (const envelope of polled.envelopes) {
+          if (typeof envelope.message_id !== "string" || typeof envelope.create_time !== "string") continue;
+          const localTarget = typeof envelope.target === "string" ? envelope.target
+            : (typeof envelope.chat_id === "string" && envelope.chat_id
+              ? (typeof envelope.thread_id === "string" && envelope.thread_id
+                ? `thread:${envelope.chat_id}:${envelope.thread_id}` : `chat:${envelope.chat_id}`)
+              : null);
+          if (!localTarget) continue;
+          const key = serializeFeishuImTarget(feishuImTarget(localTarget));
+          const rows = providerMessages.get(key) ?? [];
+          rows.push(envelope as FeishuImMessage);
+          providerMessages.set(key, rows);
+        }
+        for (const [key, messages] of providerMessages) {
+          const cursor = feishuImFreshnessAdapter.cursor({ messages });
+          if (cursor) stateStore.mergeFreshnessCursor<FeishuImCursor>(key, cursor, mergeFeishuImCursor,
+            env.LARKIN_RUNTIME_OBSERVATION_GENERATION || "external");
+        }
+        const projected = projectInboxEvents(polled.envelopes);
+        const hasMore = polled.pendingCount > 0;
+        emitJson(io, { version: 2, delivery: "direct_ack", at_most_once: true, ...projected,
+          pending_count: polled.pendingCount, has_more: hasMore,
+          ...(hasMore ? { next_action: "Continue polling the same Inbox scope until has_more is false." } : {}),
+          seen_through_seq: polled.seenThroughSeq, consumed_delivery_ids: polled.consumedDeliveryIds });
+        return 0;
+      };
+      let telemetry = dependencies.telemetry;
+      try { telemetry ??= telemetrySingleton(loadTelemetryConfig(env), {
+        serviceVersion: packageVersion(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")),
+      }); } catch { /* telemetry must not alter Inbox behavior */ }
+      if (!telemetry) return poll();
+      const observed = telemetry.externalPhase(agent.agentId, stateStore.paths.root, "inbox.consume", SpanKind.CONSUMER, poll, "agent_cli");
+      return observed && typeof (observed as Promise<number>).then === "function"
+        ? Promise.resolve(observed).catch((error) => { io.stderr(`larkin: ${(error as Error).message}\n`); return 2; })
+        : observed;
     }
     if (group === "reminder") {
       const result = reminderRequest([subcommand || "", ...rest], stateStore, agent.agentId, dependencies);

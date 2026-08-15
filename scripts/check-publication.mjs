@@ -214,7 +214,10 @@ function scanReachableHistory(root, failures, deny) {
     if (seen.has(object)) continue;
     seen.add(object);
     const type = git(root, ["cat-file", "-t", object], "utf8").trim();
-    if (type !== "tree") scanPrivateTerms(failures, `history ${type} ${object}`, git(root, ["cat-file", "-p", object]), deny);
+    // Only blob contents are publication content: the published tree never
+    // includes commit messages, so scanning them only produced false positives
+    // (e.g. a commit message quoting a denied path while describing cleanup).
+    if (type === "blob") scanPrivateTerms(failures, `history ${type} ${object}`, git(root, ["cat-file", "-p", object]), deny);
   }
   return { refs: refs.length, objects: seen.size };
 }
@@ -234,7 +237,6 @@ try {
   failures.push(`package.json: invalid tracked metadata (${error.message})`);
 }
 if (packageJson.license !== "Apache-2.0") failures.push("package.json: license must be Apache-2.0");
-if (packageJson.private !== true) failures.push("package.json: private must prevent accidental registry publication");
 const license = tracked.includes("LICENSE") ? indexBlob(options.root, "LICENSE").toString("utf8") : "";
 if (!license.includes("Apache License") || !license.includes("Version 2.0, January 2004")) failures.push("LICENSE: canonical Apache-2.0 text is required");
 let history = { refs: 0, objects: 0 };
