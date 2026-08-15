@@ -38,6 +38,8 @@ test("public pi-auth status is non-sensitive and logout preserves unrelated prov
     assert.deepEqual(payload.credentials.map(({ providerId, credentialType, stored }) => ({ providerId, credentialType, stored })), [
       { providerId: "anthropic", credentialType: "oauth", stored: true },
       { providerId: "deepseek", credentialType: "api_key", stored: true },
+      { providerId: "opencode", credentialType: "api_key", stored: false },
+      { providerId: "opencode-go", credentialType: "api_key", stored: false },
     ]);
     assert.doesNotMatch(status.stdout + status.stderr, new RegExp(`${deepseekKey}|${oauthAccess}|oauth-refresh-secret`));
     assert.equal(fs.existsSync(marker), false, "status must not execute !command API keys");
