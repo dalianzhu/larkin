@@ -4,7 +4,7 @@ import path from "node:path";
 import { isWindows, secureWindowsDirectoryAcl } from "../platform/secure-metadata.js";
 
 export type PiDistribution = "external" | "builtin";
-export const BUNDLED_PI_VERSION = "0.83.0";
+export const BUNDLED_PI_VERSION = "0.84.2";
 export type PiProviderPresetId = "deepseek" | "kimi" | "minimax" | "zhipu" | "openai" | "anthropic"
   | "gemini" | "groq" | "cerebras" | "xai" | "fireworks" | "together" | "mistral"
   | "openrouter" | "kimi-coding" | "qwen-cn" | "opencode-go" | "ant-ling" | "nvidia"
@@ -250,7 +250,7 @@ export function configureBuiltinPiProviderModel(configDir: string, agentId: stri
         baseUrl: selection.baseUrl,
         api: selection.api,
         models: [{
-          id: modelId, name: modelId, reasoning: false, input: ["text"], contextWindow: 131_072, maxTokens: 16_384,
+          id: modelId, name: modelId, reasoning: false, input: ["text"], contextWindow: 272_000, maxTokens: 16_384,
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         }],
       },
@@ -287,7 +287,7 @@ export function stageBuiltinPiProvider(configDir: string, agentId: string,
           name: selection.model.slice(`${selection.provider}/`.length),
           reasoning: false,
           input: ["text"],
-          contextWindow: 131_072,
+          contextWindow: 272_000,
           maxTokens: 16_384,
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         }],

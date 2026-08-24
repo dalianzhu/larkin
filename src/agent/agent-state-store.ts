@@ -4,7 +4,8 @@ import * as path from "node:path";
 import { TargetRootLayout, type AgentStatePaths } from "../platform/root-layout.js";
 import { acquireProcessLock, inspectProcess } from "../platform/process-state.js";
 import { isWindows } from "../platform/secure-metadata.js";
-import { targetKeyOfInboxEnvelope, type InboxEnvelope } from "./inbox-projection.js";
+import { isCanonicalInboxTarget, isUserDeliveryTarget, RUNTIME_REMINDER_TARGET, targetKeyOfInboxEnvelope, type InboxEnvelope } from "./inbox-projection.js";
+import { buildStrictProviderErrorInput, classifyStrictProviderError } from "../runtime/provider-error-classifier.js";
 
 export type JsonStateKey = "agentState" | "status" | "map" | "replyctx" | "botIdentity" |
   "senderProfiles" | "readReceipts" | "pendingReact" | "runtimeDeliveries" | "inboxState" | "freshnessState" | "documentComments" | "reminders" | "interactions" | "externalEnqueue";
@@ -117,10 +118,37 @@ interface InboxSendIntent {
   draft_id?: string;
 }
 
+interface InboxSourceState {
+  target: string;
+  message_id: string;
+  seq: number;
+  kind?: string;
+}
+
+interface InboxReminderState {
+  reminder_id: string;
+  delivery_target: string;
+  /** Unique Runtime wake occurrence; recurring firings share reminder_id. */
+  message_id: string;
+  seq: number;
+  /** Original user-facing routing anchor pinned by this occurrence. */
+  delivery_anchor?: string;
+  /** Provider write committed, but the reminder audit may still be pending. */
+  delivery_committed?: boolean;
+  delivery_message_id?: string;
+}
+
 interface InboxStateFile {
   version: 2;
   targets: Record<string, InboxTargetState>;
-  messages: Record<string, { target: string; seq: number }>;
+  messages: Record<string, { target: string; seq: number; kind?: string }>;
+  /** Pinned reminder anchors survive the bounded messages index. */
+  delivery_anchors?: Record<string, { target: string }>;
+  last_source?: InboxSourceState;
+  /** Consumed reminder contexts for the guarded outbound hook; not an IM ledger. */
+  reminder_contexts?: InboxReminderState[];
+  /** Legacy single-slot reminder context, accepted only during migration. */
+  last_reminder?: InboxReminderState;
   drafts: Record<string, InboxDraft>;
   intents: Record<string, InboxSendIntent>;
 }
@@ -153,8 +181,54 @@ function normalizeInboxState(value: unknown): InboxStateFile {
   if (raw.messages && typeof raw.messages === "object" && !Array.isArray(raw.messages)) {
     for (const [messageId, candidate] of Object.entries(raw.messages)) {
       if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
-      const row = candidate as { target?: unknown; seq?: unknown };
-      if (typeof row.target === "string" && row.target && validSequence(row.seq)) state.messages[messageId] = { target: row.target, seq: row.seq };
+      const row = candidate as { target?: unknown; seq?: unknown; kind?: unknown };
+      if (typeof row.target === "string" && row.target && validSequence(row.seq)) state.messages[messageId] = {
+        target: row.target, seq: row.seq, ...(typeof row.kind === "string" && row.kind ? { kind: row.kind } : {}),
+      };
+    }
+  }
+  const rawAnchors = (raw as { delivery_anchors?: unknown }).delivery_anchors;
+  if (rawAnchors && typeof rawAnchors === "object" && !Array.isArray(rawAnchors)) {
+    for (const [messageId, candidate] of Object.entries(rawAnchors)) {
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+      const target = (candidate as { target?: unknown }).target;
+      if (typeof target === "string" && isUserDeliveryTarget(target)) {
+        state.delivery_anchors ??= {};
+        state.delivery_anchors[messageId] = { target };
+      }
+    }
+  }
+  const rawReminderContexts = (raw as { reminder_contexts?: unknown }).reminder_contexts;
+  const reminderContexts: InboxReminderState[] = [];
+  const candidates = Array.isArray(rawReminderContexts) ? rawReminderContexts
+    : [(raw as { last_reminder?: unknown }).last_reminder];
+  for (const rawReminder of candidates) {
+    if (!rawReminder || typeof rawReminder !== "object" || Array.isArray(rawReminder)) continue;
+    const row = rawReminder as Partial<InboxReminderState>;
+    if (typeof row.delivery_target === "string" && isUserDeliveryTarget(row.delivery_target)
+      && typeof row.reminder_id === "string" && !!row.reminder_id
+      && typeof row.message_id === "string" && /^rem_[A-Za-z0-9_-]+$/.test(row.message_id) && validSequence(row.seq)
+      && (!row.delivery_anchor || (typeof row.delivery_anchor === "string"
+        && (row.delivery_target.startsWith("document-comment:")
+          ? /^doc_comment_[A-Za-z0-9_-]+$/.test(row.delivery_anchor)
+          : /^om_[A-Za-z0-9_-]+$/.test(row.delivery_anchor))))
+      && !reminderContexts.some((candidate) => candidate.message_id === row.message_id)) {
+      reminderContexts.push({ reminder_id: row.reminder_id, delivery_target: row.delivery_target, message_id: row.message_id, seq: row.seq,
+        ...(typeof row.delivery_anchor === "string" ? { delivery_anchor: row.delivery_anchor } : {}),
+        ...(row.delivery_committed === true ? { delivery_committed: true } : {}),
+        ...(typeof row.delivery_message_id === "string" && row.delivery_message_id ? { delivery_message_id: row.delivery_message_id } : {}) });
+    }
+  }
+  if (reminderContexts.length) state.reminder_contexts = reminderContexts;
+  const source = raw.last_source;
+  if (source && typeof source === "object" && !Array.isArray(source)) {
+    const row = source as Partial<InboxSourceState>;
+    if (typeof row.target === "string" && isUserDeliveryTarget(row.target)
+      && typeof row.message_id === "string"
+      && (/^om_[A-Za-z0-9_-]+$/.test(row.message_id) || (row.target.startsWith("document-comment:") && /^doc_comment_[A-Za-z0-9_-]+$/.test(row.message_id)))
+      && validSequence(row.seq)) {
+      state.last_source = { target: row.target, message_id: row.message_id, seq: row.seq,
+        ...(typeof row.kind === "string" && row.kind ? { kind: row.kind } : {}) };
     }
   }
   if (raw.drafts && typeof raw.drafts === "object" && !Array.isArray(raw.drafts)) {
@@ -234,6 +308,32 @@ function validInboxLockOwner(value: unknown): value is InboxLockOwner {
 }
 
 export type InboxDeliveryPreparation = "appended" | "present" | "active" | "terminal_error" | "consumed";
+
+export interface ContextOverflowRearmResult {
+  rearmedCount: number;
+  remainingPendingCount: number;
+}
+
+export type ContextOverflowRecoveryCode = "inbox_empty" | "canonical_inbox_malformed" | "duplicate_message_id"
+  | "delivery_missing" | "delivery_not_terminal" | "delivery_not_context_window" | "delivery_duplicate"
+  | "delivery_identity_invalid" | "duplicate_input_id";
+
+export class ContextOverflowRecoveryError extends Error {
+  constructor(readonly code: ContextOverflowRecoveryCode, message: string) {
+    super(message);
+    this.name = "ContextOverflowRecoveryError";
+  }
+}
+
+export type CanonicalInboxAppendResult =
+  | { status: "appended" | "duplicate_pending"; envelope: InboxEnvelope }
+  | { status: "duplicate_consumed"; envelope: null };
+
+export type InboxDeliverySourceResolution =
+  | { status: "pending"; target: string; envelope: InboxEnvelope }
+  | { status: "consumed"; target: string }
+  | { status: "missing"; code: "canonical_inbox_row_missing" }
+  | { status: "invalid"; code: "canonical_inbox_malformed" | "duplicate_message_id" | "inbox_state_conflict" };
 
 export class AgentStateStore {
   readonly paths: AgentStatePaths;
@@ -444,6 +544,10 @@ export class AgentStateStore {
     return normalizeInboxState(this.readJson<unknown>("inboxState", emptyInboxState()));
   }
 
+  private hasPendingReminderDeliveryAnchor(anchor: string): boolean {
+    return this.readNdjson<InboxEnvelope>("inbox").some((row) => row.kind === "reminder" && row.deliveryAnchor === anchor);
+  }
+
   readFreshnessCursor<T>(target: string, generation = "external"): T | null {
     const state = this.readJson<{ version?: unknown; cursors?: unknown }>("freshnessState", { version: 1, cursors: {} });
     if (state.version !== 1 || !state.cursors || typeof state.cursors !== "object" || Array.isArray(state.cursors)) return null;
@@ -466,16 +570,52 @@ export class AgentStateStore {
     });
   }
 
+  private rememberInboxSource(state: InboxStateFile, input: InboxEnvelope, target: string, targetSeq: number): void {
+    const messageId = input.message_id;
+    if (target === RUNTIME_REMINDER_TARGET && input.kind === "reminder"
+      && typeof input.reminderId === "string" && !!input.reminderId
+      && typeof input.deliveryTarget === "string" && isUserDeliveryTarget(input.deliveryTarget)
+      && typeof messageId === "string" && /^rem_[A-Za-z0-9_-]+$/.test(messageId)) {
+      const contexts = state.reminder_contexts ?? [];
+      if (!contexts.some((candidate) => candidate.message_id === messageId)) {
+        const deliveryAnchor = typeof input.deliveryAnchor === "string"
+          && (input.deliveryTarget.startsWith("document-comment:")
+            ? /^doc_comment_[A-Za-z0-9_-]+$/.test(input.deliveryAnchor)
+            : /^om_[A-Za-z0-9_-]+$/.test(input.deliveryAnchor))
+          ? input.deliveryAnchor : undefined;
+        contexts.push({ reminder_id: input.reminderId, delivery_target: input.deliveryTarget, message_id: messageId, seq: targetSeq,
+          ...(deliveryAnchor ? { delivery_anchor: deliveryAnchor } : {}) });
+      }
+      state.reminder_contexts = contexts;
+      delete state.last_reminder;
+      delete state.last_source;
+      return;
+    }
+    const validAnchor = typeof messageId === "string"
+      && (/^om_[A-Za-z0-9_-]+$/.test(messageId) || (target.startsWith("document-comment:") && /^doc_comment_[A-Za-z0-9_-]+$/.test(messageId)));
+    if (!isUserDeliveryTarget(target)) {
+      delete state.last_source;
+      return;
+    }
+    if (!validAnchor) {
+      delete state.last_source;
+      return;
+    }
+    state.last_source = { target, message_id: messageId, seq: targetSeq,
+      ...(typeof input.kind === "string" && input.kind ? { kind: input.kind } : {}) };
+  }
+
   private normalizeInboxEnvelope(value: unknown, state: InboxStateFile): InboxEnvelope {
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Inbox envelope must be an object");
     const input = value as InboxEnvelope;
-    const target = typeof input.target === "string" && input.target ? input.target : targetKeyOfInboxEnvelope(input);
+    const target = targetKeyOfInboxEnvelope(input);
     const current = state.targets[target] ?? { latest_received_seq: 0, model_seen_seq: 0 };
     const requested = validSequence(input.target_seq) ? input.target_seq : 0;
     const targetSeq = requested > current.latest_received_seq ? requested : current.latest_received_seq + 1;
     state.targets[target] = { ...current, latest_received_seq: targetSeq };
     if (typeof input.message_id === "string" && input.message_id) {
-      state.messages[input.message_id] = { target, seq: targetSeq };
+      state.messages[input.message_id] = { target, seq: targetSeq,
+        ...(typeof input.kind === "string" && input.kind ? { kind: input.kind } : {}) };
       const messageIds = Object.keys(state.messages);
       for (const stale of messageIds.slice(0, Math.max(0, messageIds.length - 2_048))) delete state.messages[stale];
     }
@@ -483,15 +623,17 @@ export class AgentStateStore {
   }
 
   private reconcileInboxRows(rows: InboxEnvelope[], state: InboxStateFile): InboxEnvelope[] {
-    return rows.map((row) => {
-      const target = typeof row.target === "string" && row.target ? row.target : targetKeyOfInboxEnvelope(row);
+    const targets = rows.map((row) => targetKeyOfInboxEnvelope(row));
+    return rows.map((row, index) => {
+      const target = targets[index]!;
       const existing = typeof row.message_id === "string" ? state.messages[row.message_id] : undefined;
       const current = state.targets[target] ?? { latest_received_seq: 0, model_seen_seq: 0 };
       const targetSeq = validSequence(row.target_seq) ? row.target_seq
         : existing?.target === target ? existing.seq : current.latest_received_seq + 1;
       current.latest_received_seq = Math.max(current.latest_received_seq, targetSeq);
       state.targets[target] = current;
-      if (typeof row.message_id === "string" && row.message_id) state.messages[row.message_id] = { target, seq: targetSeq };
+      if (typeof row.message_id === "string" && row.message_id) state.messages[row.message_id] = { target, seq: targetSeq,
+        ...(typeof row.kind === "string" && row.kind ? { kind: row.kind } : {}) };
       return { ...row, envelope_version: 2, target, target_seq: targetSeq };
     });
   }
@@ -597,18 +739,250 @@ export class AgentStateStore {
     else append();
   }
 
-  /** Append a canonical Inbox envelope once by stable message_id under the shared cross-process lock. */
-  appendInboxOnce(value: unknown): boolean {
+  /**
+   * Append one canonical Inbox envelope and return the exact normalized object
+   * serialized to disk. Stable message_id dedupe and locator coherence share the
+   * same lock as poll, so HostShell can deliver that very object without a
+   * persistence/delivery split.
+   */
+  appendCanonicalInboxOnce(value: unknown): CanonicalInboxAppendResult {
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Inbox envelope must be an object");
-    const messageId = (value as Record<string, unknown>).message_id;
+    const input = value as InboxEnvelope;
+    const messageId = input.message_id;
     if (typeof messageId !== "string" || !messageId) throw new Error("Inbox envelope requires message_id");
+    const incomingTarget = targetKeyOfInboxEnvelope(input);
     const file = this.file("inbox");
     return this.withInboxLock(file, () => {
-      if (this.inboxState().messages[messageId]) return false;
-      if (this.readNdjson<Record<string, unknown>>("inbox").some((row) => row.message_id === messageId)) return false;
-      this.appendInboxUnlocked(value);
-      return true;
+      const state = this.inboxState();
+      const matching = this.readNdjson<InboxEnvelope>("inbox").filter((row) => row.message_id === messageId);
+      if (matching.length > 1) throw new Error("Inbox duplicate message_id has multiple pending canonical rows");
+      if (matching.length === 1) {
+        const existing = matching[0]!;
+        if (targetKeyOfInboxEnvelope(existing) !== incomingTarget) {
+          throw new Error("Inbox duplicate message_id conflicts with its canonical target");
+        }
+        if (existing.target_seq !== undefined && !validSequence(existing.target_seq)) {
+          throw new Error("Inbox duplicate message_id has a malformed canonical sequence");
+        }
+        const known = state.messages[messageId];
+        if (known) {
+          if (known.target !== incomingTarget) throw new Error("Inbox message state conflicts with its canonical target");
+          if (validSequence(existing.target_seq) && existing.target_seq !== known.seq) {
+            throw new Error("Inbox message state conflicts with its canonical sequence");
+          }
+          const targetState = state.targets[known.target];
+          if (targetState && targetState.model_seen_seq >= known.seq) {
+            throw new Error("Inbox pending row conflicts with consumed model-seen state");
+          }
+        }
+        return { status: "duplicate_pending", envelope: existing };
+      }
+      const known = state.messages[messageId];
+      if (known) {
+        if (known.target !== incomingTarget) throw new Error("Inbox duplicate message_id conflicts with consumed canonical target");
+        const targetState = state.targets[known.target];
+        if (!targetState || targetState.model_seen_seq < known.seq) {
+          throw new Error("Inbox state references a missing unconsumed canonical row");
+        }
+        return { status: "duplicate_consumed", envelope: null };
+      }
+      return { status: "appended", envelope: this.appendInboxUnlocked(input) };
     });
+  }
+
+  /** Append a canonical Inbox envelope once by stable message_id under the shared cross-process lock. */
+  appendInboxOnce(value: unknown): boolean {
+    return this.appendCanonicalInboxOnce(value).status === "appended";
+  }
+
+  /**
+   * Resolve one Runtime delivery solely from canonical Inbox row/state. This is
+   * the single replay resolver used for startup migration and every retry; it
+   * never derives a DM/generic fallback from stale RuntimeInput text.
+   */
+  resolveInboxDeliverySource(messageId: string): InboxDeliverySourceResolution {
+    if (!messageId) return { status: "missing", code: "canonical_inbox_row_missing" };
+    return this.withInboxLock(this.file("inbox"), () => {
+      let rows: InboxEnvelope[];
+      try { rows = this.readNdjson<InboxEnvelope>("inbox"); }
+      catch { return { status: "invalid", code: "canonical_inbox_malformed" }; }
+      const matching = rows.filter((row) => row?.message_id === messageId);
+      if (matching.length > 1) return { status: "invalid", code: "duplicate_message_id" };
+      const state = this.inboxState();
+      const known = state.messages[messageId];
+      if (matching.length === 1) {
+        const envelope = matching[0]!;
+        let target: string;
+        try { target = targetKeyOfInboxEnvelope(envelope); }
+        catch { return { status: "invalid", code: "canonical_inbox_malformed" }; }
+        if (envelope.target_seq !== undefined && !validSequence(envelope.target_seq)) {
+          return { status: "invalid", code: "canonical_inbox_malformed" };
+        }
+        if (known) {
+          const targetState = state.targets[known.target];
+          if (known.target !== target || !validSequence(known.seq)
+            || (validSequence(envelope.target_seq) && envelope.target_seq !== known.seq)
+            || Boolean(targetState && targetState.model_seen_seq >= known.seq)) {
+            return { status: "invalid", code: "inbox_state_conflict" };
+          }
+        }
+        return { status: "pending", target, envelope };
+      }
+      if (!known) return { status: "missing", code: "canonical_inbox_row_missing" };
+      if (!isCanonicalInboxTarget(known.target) || !validSequence(known.seq)) {
+        return { status: "invalid", code: "inbox_state_conflict" };
+      }
+      const targetState = state.targets[known.target];
+      if (targetState && targetState.model_seen_seq >= known.seq) return { status: "consumed", target: known.target };
+      return { status: "missing", code: "canonical_inbox_row_missing" };
+    });
+  }
+
+  /**
+   * Re-arm only the durable deliveries proven to be the context-window incident.
+   * The Inbox bytes are intentionally untouched. An optional synchronous commit
+   * hook lets RuntimeHost swap its in-memory generation while this same lock is
+   * still held. If the hook fails, the ledger is restored before the lock is
+   * released. The callback also receives a guarded rollback for post-callback
+   * commit failures before retry scheduling begins.
+   */
+  rearmContextOverflow(onCommit?: (messageIds: readonly string[], rollback: () => void) => void, expected?: {
+    messageId?: string; deliveryId?: string; inputId?: string;
+  }): ContextOverflowRearmResult {
+    let lockActive = true;
+    try { return this.withInboxTransaction(() => {
+      let rows: InboxEnvelope[];
+      try { rows = this.readNdjson<InboxEnvelope>("inbox"); }
+      catch { throw new ContextOverflowRecoveryError("canonical_inbox_malformed", "canonical Inbox is malformed"); }
+      if (rows.length === 0) throw new ContextOverflowRecoveryError("inbox_empty", "canonical Inbox backlog is empty");
+      const messageIds = new Set<string>();
+      for (const row of rows) {
+        try { targetKeyOfInboxEnvelope(row); }
+        catch { throw new ContextOverflowRecoveryError("canonical_inbox_malformed", "canonical Inbox contains a malformed row"); }
+        if (typeof row.message_id !== "string" || !row.message_id) {
+          throw new ContextOverflowRecoveryError("canonical_inbox_malformed", "canonical Inbox row has no message identity");
+        }
+        if (messageIds.has(row.message_id)) throw new ContextOverflowRecoveryError("duplicate_message_id", "canonical Inbox contains duplicate message identities");
+        messageIds.add(row.message_id);
+      }
+      const ledger = this.readJson<RuntimeDeliveryStore>("runtimeDeliveries", { version: 1, records: [] });
+      if (!Array.isArray(ledger.records)) throw new ContextOverflowRecoveryError("canonical_inbox_malformed", "Runtime delivery ledger is malformed");
+      const ledgerRecords = ledger.records as unknown[];
+      const matches = new Map<string, RuntimeDeliveryRecord>();
+      const deliveryIds = new Set<string>();
+      const inputIds = new Set<string>();
+      for (const candidate of ledger.records) {
+        if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+        const record = candidate as RuntimeDeliveryRecord;
+        if (typeof record.messageId !== "string" || !messageIds.has(record.messageId)) continue;
+        if (typeof record.deliveryId !== "string" || !record.deliveryId) throw new ContextOverflowRecoveryError("delivery_missing", "a matching Runtime delivery record has no delivery identity");
+        if (!record.input || typeof record.input !== "object" || Array.isArray(record.input)) {
+          throw new ContextOverflowRecoveryError("delivery_identity_invalid", "a matching Runtime delivery record has no Runtime input identity");
+        }
+        const input = record.input as Record<string, unknown>;
+        if (typeof input.inputId !== "string" || !input.inputId.trim()
+            || typeof input.deliveryId !== "string" || input.deliveryId !== record.deliveryId) {
+          throw new ContextOverflowRecoveryError("delivery_identity_invalid", "a matching Runtime delivery record has malformed input identity");
+        }
+        if (matches.has(record.messageId)) throw new ContextOverflowRecoveryError("delivery_duplicate", "a canonical Inbox row maps to multiple delivery records");
+        if (deliveryIds.has(record.deliveryId)) throw new ContextOverflowRecoveryError("delivery_duplicate", "matching Runtime delivery records share a delivery identity");
+        if (inputIds.has(input.inputId)) throw new ContextOverflowRecoveryError("duplicate_input_id", "matching Runtime delivery records share an input identity");
+        deliveryIds.add(record.deliveryId);
+        inputIds.add(input.inputId);
+        matches.set(record.messageId, record);
+      }
+      if (expected?.messageId && !messageIds.has(expected.messageId)) {
+        throw new ContextOverflowRecoveryError("delivery_missing", "the expected context-overflow message is not in canonical Inbox");
+      }
+      if (expected?.messageId) {
+        const expectedRecord = matches.get(expected.messageId);
+        if (!expectedRecord || (expected.deliveryId && expectedRecord.deliveryId !== expected.deliveryId)
+            || (expected.inputId && (expectedRecord.input as Record<string, unknown>).inputId !== expected.inputId)) {
+          throw new ContextOverflowRecoveryError("delivery_identity_invalid", "the expected context-overflow delivery identity changed");
+        }
+      }
+      for (const messageId of messageIds) {
+        const record = matches.get(messageId);
+        if (!record) throw new ContextOverflowRecoveryError("delivery_missing", "a canonical Inbox row has no Runtime delivery record");
+        if (record.status !== "error" || record.retryable === true) {
+          throw new ContextOverflowRecoveryError("delivery_not_terminal", "a canonical Inbox row is not backed by a non-retryable terminal Runtime error");
+        }
+        const reasonCategory = classifyStrictProviderError(buildStrictProviderErrorInput({
+          reason: record.reason, errorCategory: record.errorCategory,
+        }));
+        if (record.retryable !== false || reasonCategory !== "context_window"
+            || (record.errorCategory !== undefined && record.errorCategory !== "context_window")) {
+          throw new ContextOverflowRecoveryError("delivery_not_context_window", "a Runtime delivery error is not classified as context_window");
+        }
+      }
+      for (const candidate of ledgerRecords) {
+        if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+        const record = candidate as RuntimeDeliveryRecord;
+        if (typeof record.deliveryId === "string" && deliveryIds.has(record.deliveryId)
+            && (typeof record.messageId !== "string" || !messageIds.has(record.messageId))) {
+          throw new ContextOverflowRecoveryError("delivery_duplicate", "a matching delivery identity is also used by an unrelated Runtime delivery record");
+        }
+      }
+      const updatedAt = new Date().toISOString();
+      const records = ledgerRecords.map((candidate) => {
+        if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return candidate;
+        const record = candidate as RuntimeDeliveryRecord;
+        if (typeof record.messageId !== "string" || !messageIds.has(record.messageId)) return candidate;
+        return { ...record, status: "pending", retryable: true, updatedAt };
+      });
+      const committedLedger = { ...ledger, records };
+      let restored = false;
+      const restoreUnlocked = (): void => {
+        if (restored) return;
+        const current = this.readJson<RuntimeDeliveryStore>("runtimeDeliveries", { version: 1, records: [] });
+        if (!Array.isArray(current.records)) throw new Error("Runtime delivery rollback found a malformed ledger");
+        const originalMatching = ledgerRecords.filter((candidate) => {
+          if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+          const record = candidate as RuntimeDeliveryRecord;
+          return typeof record.messageId === "string" && messageIds.has(record.messageId);
+        });
+        const originalDeliveryIds = new Set(originalMatching.flatMap((candidate) => {
+          const deliveryId = (candidate as RuntimeDeliveryRecord).deliveryId;
+          return typeof deliveryId === "string" ? [deliveryId] : [];
+        }));
+        const currentMatching = current.records.filter((candidate) => {
+          if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+          const record = candidate as RuntimeDeliveryRecord;
+          return (typeof record.deliveryId === "string" && originalDeliveryIds.has(record.deliveryId))
+            || (typeof record.messageId === "string" && messageIds.has(record.messageId));
+        });
+        const matchingRestored = currentMatching.length === originalMatching.length
+          && currentMatching.every((candidate, index) => JSON.stringify(candidate) === JSON.stringify(originalMatching[index]));
+        if (!matchingRestored) {
+          const unrelated = current.records.filter((candidate) => {
+            if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return true;
+            const record = candidate as RuntimeDeliveryRecord;
+            return !((typeof record.deliveryId === "string" && originalDeliveryIds.has(record.deliveryId))
+              || (typeof record.messageId === "string" && messageIds.has(record.messageId)));
+          });
+          const restoredRecords = [...unrelated];
+          for (const candidate of originalMatching) {
+            const originalIndex = ledgerRecords.indexOf(candidate);
+            restoredRecords.splice(Math.min(originalIndex, restoredRecords.length), 0, candidate);
+          }
+          this.writeJson("runtimeDeliveries", { ...current, records: restoredRecords });
+        }
+        restored = true;
+      };
+      const rollback = (): void => {
+        if (lockActive) restoreUnlocked();
+        else this.withInboxTransaction(restoreUnlocked);
+      };
+      try {
+        this.writeJson("runtimeDeliveries", committedLedger);
+        onCommit?.([...messageIds], rollback);
+      } catch (error) {
+        try { rollback(); }
+        catch { throw new Error("context-window recovery ledger rollback failed"); }
+        throw error;
+      }
+      return { rearmedCount: messageIds.size, remainingPendingCount: rows.length };
+    }); } finally { lockActive = false; }
   }
 
   /**
@@ -620,6 +994,7 @@ export class AgentStateStore {
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Inbox envelope must be an object");
     const messageId = (value as Record<string, unknown>).message_id;
     if (typeof messageId !== "string" || !messageId) throw new Error("Inbox envelope requires message_id");
+    targetKeyOfInboxEnvelope(value as InboxEnvelope);
     const file = this.file("inbox");
     return this.withInboxLock(file, () => {
       const ledger = this.readJson<RuntimeDeliveryStore>("runtimeDeliveries", { version: 1, records: [] });
@@ -657,6 +1032,9 @@ export class AgentStateStore {
    * this transaction is active waits and becomes part of the next batch.
    */
   pollInbox<T extends InboxEnvelope = InboxEnvelope>(options: InboxPollOptions = {}): InboxPollResult<T> {
+    if (options.target && !isCanonicalInboxTarget(options.target)) {
+      throw new Error(`Invalid canonical Inbox poll target ${JSON.stringify(options.target)}`);
+    }
     const file = this.file("inbox");
     return this.withInboxLock(file, () => {
       let rawRows: T[];
@@ -670,13 +1048,13 @@ export class AgentStateStore {
       const envelopes: T[] = [];
       const remaining: T[] = [];
       for (const row of rows) {
-        const selectedTarget = typeof row.target === "string" ? row.target : targetKeyOfInboxEnvelope(row);
+        const selectedTarget = targetKeyOfInboxEnvelope(row);
         if (envelopes.length < limit && (!options.target || options.target === selectedTarget)) envelopes.push(row);
         else remaining.push(row);
       }
       const pendingCount = remaining.reduce((count, row) => {
         if (!options.target) return count + 1;
-        const rowTarget = typeof row.target === "string" ? row.target : targetKeyOfInboxEnvelope(row);
+        const rowTarget = targetKeyOfInboxEnvelope(row);
         return count + (rowTarget === options.target ? 1 : 0);
       }, 0);
       if (!envelopes.length) return { envelopes, consumedDeliveryIds: [], seenThroughSeq: null, pendingCount };
@@ -703,16 +1081,37 @@ export class AgentStateStore {
       }
       let seenThroughSeq: number | null = null;
       for (const envelope of envelopes) {
-        const target = String(envelope.target || targetKeyOfInboxEnvelope(envelope));
+        const target = targetKeyOfInboxEnvelope(envelope);
         const targetSeq = Number(envelope.target_seq);
         const targetState = state.targets[target] ?? { latest_received_seq: targetSeq, model_seen_seq: 0 };
         if (validSequence(targetSeq)) {
           targetState.latest_received_seq = Math.max(targetState.latest_received_seq, targetSeq);
           targetState.model_seen_seq = Math.max(targetState.model_seen_seq, targetSeq);
           seenThroughSeq = seenThroughSeq === null ? targetSeq : Math.max(seenThroughSeq, targetSeq);
+          this.rememberInboxSource(state, envelope, target, targetSeq);
         }
         state.targets[target] = targetState;
       }
+      // An unscoped poll may consume several user conversations at once. The
+      // last envelope is not an implicit source in that case: doing so would
+      // let a targetless reminder inherit an unrelated later chat. Keep an
+      // implicit source only when every valid user-facing anchor in this batch
+      // names the same delivery target.
+      const userSources = envelopes.flatMap((envelope) => {
+        const target = targetKeyOfInboxEnvelope(envelope);
+        const messageId = envelope.message_id;
+        const targetSeq = Number(envelope.target_seq);
+        const validAnchor = typeof messageId === "string"
+          && (/^om_[A-Za-z0-9_-]+$/.test(messageId)
+            || (target.startsWith("document-comment:") && /^doc_comment_[A-Za-z0-9_-]+$/.test(messageId)));
+        return isUserDeliveryTarget(target) && validSequence(targetSeq) && validAnchor
+          ? [{ target, message_id: messageId, seq: targetSeq,
+            ...(typeof envelope.kind === "string" && envelope.kind ? { kind: envelope.kind } : {}) }]
+          : [];
+      });
+      const userTargets = new Set(userSources.map((source) => source.target));
+      if (userSources.length && userTargets.size === 1) state.last_source = userSources.at(-1);
+      else delete state.last_source;
       this.replaceInboxUnlocked(remaining);
       this.writeJson("inboxState", state);
       return { envelopes, consumedDeliveryIds, seenThroughSeq, pendingCount };
@@ -723,13 +1122,139 @@ export class AgentStateStore {
     return this.pollInbox<T>(hooks).envelopes;
   }
 
+  /** Pin a fired reminder's user-facing anchor outside the bounded message index. */
+  bindInboxDeliveryAnchor(messageId: string, target: string): void {
+    if (typeof messageId !== "string" || !messageId) throw new Error("Inbox delivery anchor requires message_id");
+    const validAnchor = target.startsWith("document-comment:")
+      ? /^doc_comment_[A-Za-z0-9_-]+$/.test(messageId)
+      : /^om_[A-Za-z0-9_-]+$/.test(messageId);
+    if (!validAnchor) throw new Error(`Invalid Inbox delivery anchor ${JSON.stringify(messageId)} for target ${JSON.stringify(target)}`);
+    const canonicalTarget = targetKeyOfInboxEnvelope({
+      message_id: messageId, target,
+      ...(target.startsWith("document-comment:") ? { kind: "document_comment" } : {}),
+    });
+    const file = this.file("inbox");
+    this.withInboxLock(file, () => {
+      const state = this.inboxState();
+      state.delivery_anchors ??= {};
+      state.delivery_anchors[messageId] = { target: canonicalTarget };
+      this.writeJson("inboxState", state);
+    });
+  }
+
+  /** Roll back a delivery anchor that was pinned before an Inbox append failed. */
+  unbindInboxDeliveryAnchor(messageId: string, target?: string): void {
+    this.withInboxLock(this.file("inbox"), () => {
+      const state = this.inboxState();
+      const pinned = state.delivery_anchors?.[messageId];
+      if (!pinned || (target && pinned.target !== target)) return;
+      delete state.delivery_anchors?.[messageId];
+      if (state.delivery_anchors && Object.keys(state.delivery_anchors).length === 0) delete state.delivery_anchors;
+      this.writeJson("inboxState", state);
+    });
+  }
+
   resolveInboxMessageTarget(messageId: string): string | null {
     return this.withInboxLock(this.file("inbox"), () => {
       const state = this.inboxState();
-      const known = state.messages[messageId]?.target;
-      if (known) return known;
+      const pinned = state.delivery_anchors?.[messageId];
+      if (pinned) return targetKeyOfInboxEnvelope({ message_id: messageId, target: pinned.target,
+        ...(pinned.target.startsWith("document-comment:") ? { kind: "document_comment" } : {}) });
+      const known = state.messages[messageId];
+      if (known) return targetKeyOfInboxEnvelope({ message_id: messageId, target: known.target,
+        ...(known.kind ? { kind: known.kind } : {}) });
       const row = this.readNdjson<InboxEnvelope>("inbox").find((candidate) => candidate.message_id === messageId);
-      return row ? (typeof row.target === "string" ? row.target : targetKeyOfInboxEnvelope(row)) : null;
+      return row ? targetKeyOfInboxEnvelope(row) : null;
+    });
+  }
+
+  /** Return the most recently observed user Inbox source with a safe reply/send anchor. */
+  resolveCurrentInboxSource(): { deliveryTarget: string; deliveryAnchor: string } | null {
+    return this.withInboxLock(this.file("inbox"), () => {
+      const source = this.inboxState().last_source;
+      return source ? { deliveryTarget: source.target, deliveryAnchor: source.message_id } : null;
+    });
+  }
+
+  /** Expire the in-turn source capability at the Runtime turn boundary. */
+  clearCurrentInboxSource(): void {
+    this.withInboxLock(this.file("inbox"), () => {
+      const state = this.inboxState();
+      if (!state.last_source) return;
+      delete state.last_source;
+      this.writeJson("inboxState", state);
+    });
+  }
+
+  /** Return every consumed reminder context for the guarded outbound audit hook. */
+  resolveCurrentReminders(): Array<{ reminderId: string; deliveryTarget: string; deliveryAnchor: string; deliveryCommitted?: boolean; deliveryMessageId?: string }> {
+    return this.withInboxLock(this.file("inbox"), () => (this.inboxState().reminder_contexts ?? []).map((reminder) => ({
+      reminderId: reminder.reminder_id, deliveryTarget: reminder.delivery_target, deliveryAnchor: reminder.message_id,
+      ...(reminder.delivery_committed ? { deliveryCommitted: true } : {}),
+      ...(reminder.delivery_message_id ? { deliveryMessageId: reminder.delivery_message_id } : {}),
+    })));
+  }
+
+  /** Mark a provider write as committed when its reminder audit could not persist. */
+  markCurrentReminderDeliveryCommitted(reminderId: string, occurrenceId: string, messageId?: string): void {
+    this.withInboxLock(this.file("inbox"), () => {
+      const state = this.inboxState();
+      const context = state.reminder_contexts?.find((reminder) => reminder.reminder_id === reminderId && reminder.message_id === occurrenceId);
+      if (!context) return;
+      context.delivery_committed = true;
+      if (messageId) context.delivery_message_id = messageId;
+      this.writeJson("inboxState", state);
+    });
+  }
+
+  /** Return the oldest consumed reminder context for legacy callers. */
+  resolveCurrentReminder(): { reminderId: string; deliveryTarget: string; deliveryAnchor: string; deliveryCommitted?: boolean; deliveryMessageId?: string } | null {
+    return this.resolveCurrentReminders()[0] ?? null;
+  }
+
+  /** Clear one consumed reminder occurrence after its first committed user-facing outbound. */
+  clearCurrentReminder(reminderId: string, occurrenceId?: string): void {
+    this.withInboxLock(this.file("inbox"), () => {
+      const state = this.inboxState();
+      const original = state.reminder_contexts ?? [];
+      const index = original.findIndex((reminder) => reminder.reminder_id === reminderId
+        && (!occurrenceId || reminder.message_id === occurrenceId));
+      if (index < 0) {
+        if (!state.last_reminder || state.last_reminder.reminder_id !== reminderId
+          || (occurrenceId && state.last_reminder.message_id !== occurrenceId)) return;
+        delete state.last_reminder;
+        this.writeJson("inboxState", state);
+        return;
+      }
+      const cleared = original[index];
+      const contexts = original.filter((_reminder, candidateIndex) => candidateIndex !== index);
+      if (contexts.length) state.reminder_contexts = contexts;
+      else delete state.reminder_contexts;
+      delete state.last_reminder;
+      if (cleared.delivery_anchor && !contexts.some((reminder) => reminder.delivery_anchor === cleared.delivery_anchor)
+        && !this.hasPendingReminderDeliveryAnchor(cleared.delivery_anchor)) {
+        delete state.delivery_anchors?.[cleared.delivery_anchor];
+        if (state.delivery_anchors && Object.keys(state.delivery_anchors).length === 0) delete state.delivery_anchors;
+      }
+      this.writeJson("inboxState", state);
+    });
+  }
+
+  /** Expire all consumed reminder contexts and their temporary routing anchors at turn end. */
+  clearCurrentReminders(): void {
+    this.withInboxLock(this.file("inbox"), () => {
+      const state = this.inboxState();
+      const contexts = state.reminder_contexts ?? [];
+      if (!contexts.length && !state.last_reminder) return;
+      for (const context of contexts) {
+        if (context.delivery_anchor && !this.hasPendingReminderDeliveryAnchor(context.delivery_anchor)) {
+          delete state.delivery_anchors?.[context.delivery_anchor];
+        }
+      }
+      if (state.delivery_anchors && Object.keys(state.delivery_anchors).length === 0) delete state.delivery_anchors;
+      delete state.reminder_contexts;
+      delete state.last_reminder;
+      this.writeJson("inboxState", state);
     });
   }
 

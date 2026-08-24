@@ -22,7 +22,7 @@ test.skipIf(!enabled)("Bun source dependency keeps one Runtime-bound larkin bin 
     const consumer = path.join(temp, "consumer");
     fs.mkdirSync(sourceRepo);
     fs.mkdirSync(consumer);
-    for (const relative of ["src", "assets", "scripts", "README.md", "package.json", "bun.lock"]) {
+    for (const relative of ["src", "assets", "scripts", "patches", "README.md", "package.json", "bun.lock"]) {
       fs.cpSync(path.join(ROOT, relative), path.join(sourceRepo, relative), { recursive: true });
     }
     checked("git", ["init", "--quiet", sourceRepo], {}, "git init source fixture");
@@ -50,7 +50,7 @@ test.skipIf(!enabled)("Bun source dependency keeps one Runtime-bound larkin bin 
       PATH: `${path.join(npmPrefix, "bin")}${path.delimiter}${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH || ""}`,
     };
     fs.writeFileSync(path.join(isolatedHome, ".bash_profile"), `export PATH=${JSON.stringify(path.join(npmPrefix, "bin"))}:${JSON.stringify(path.dirname(process.execPath))}:/usr/local/bin:/usr/bin:/bin\n`, { mode: 0o600 });
-    checked("npm", ["install", "--global", "@larksuite/cli@1.0.79"], { env: isolatedEnv, timeout: 120_000 }, "install host official CLI into isolated prefix");
+    checked("npm", ["install", "--global", "@larksuite/cli@1.0.80"], { env: isolatedEnv, timeout: 120_000 }, "install host official CLI into isolated prefix");
     checked(process.execPath, ["install", "--frozen-lockfile", "--ignore-scripts"], {
       cwd: sourceRepo,
       env: isolatedEnv,

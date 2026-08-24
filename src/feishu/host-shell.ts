@@ -23,13 +23,13 @@ import { HostReminderOrchestrator } from "../agent/host-reminder-orchestrator.js
 import { HostChannelBusiness } from "./host-channel-business.js";
 import { HostInteractionOrchestrator } from "./interaction-orchestrator.js";
 import { slug10, targetFor, type FeishuInboundEvent } from "./message-policy.js";
-import type { RuntimeHost, RuntimeHostEvent } from "../runtime/runtime-host.js";
+import type { RuntimeHost, RuntimeHostEvent, RuntimeSessionRecoveryResult } from "../runtime/runtime-host.js";
 import { providerAuthenticationFailureReadiness, RuntimePrerequisiteError } from "../runtime/runtime-readiness.js";
 import { readDocumentCommentSubscription, verifyCallbackProbe, type EffectiveDocumentCommentSubscription } from "../platform/callback-capability.js";
 import { loadConfig, resolveMentionPolicy } from "../platform/config.js";
 import { processCommandToken } from "../app/internal-command.js";
 import { managedOfficialLarkCli } from "../app/agent-lark-cli-workspace.js";
-import { isChannelReconnecting } from "../app/agent-readiness.js";
+import { isChannelReconnecting, isRuntimeReadinessCurrent } from "../app/agent-readiness.js";
 import {
   documentCommentMessageId,
   documentCommentNoticeType,
@@ -38,6 +38,7 @@ import {
 } from "./document-comment.js";
 import type { CommentEvent, CommentTarget, FetchedComment } from "@larksuite/channel";
 import type { TelemetryRuntime } from "../platform/telemetry-tracing.js";
+import { isOpenPlatformHost, requireOpenDomain } from "./platform-hosts.js";
 
 interface ConfiguredAgent {
   agentId: string;
@@ -121,6 +122,13 @@ export interface HostShell {
     resetCommitted: boolean; generationChanged: boolean; sessionChanged: boolean; turns: number;
     runtimeReady: boolean; channelConnected: boolean; reconnecting: boolean; pendingCount: number;
     readyForFreshScenario: boolean; inboundObserved: false;
+    code?: string; error?: string;
+  }>;
+  recoverSession(agentId: string, reason: "context-overflow", waitReadyMs?: number): Promise<{
+    recoveryCommitted: boolean; generationChanged: boolean; sessionChanged: boolean; turns: number;
+    runtimeReady: boolean; channelConnected: boolean; reconnecting: boolean; pendingCount: number;
+    rearmedCount: number; replayStatus: "scheduled" | "pending" | "consumed" | "not_started";
+    remainingPendingCount: number; readyForFreshScenario: boolean; inboundObserved: false;
     code?: string; error?: string;
   }>;
   start(): Promise<void>;
@@ -216,7 +224,7 @@ function loadAgents(
       }
     }
     if (!testEventSource && (typeof candidate.feishuAppSecret !== "string" || !candidate.feishuAppSecret.trim()
-      || !["https://open.feishu.cn", "https://open.larksuite.com"].includes(String(candidate.feishuDomain)))) {
+      || !isOpenPlatformHost(candidate.feishuDomain))) {
       throw new Error(`LARKIN_AGENTS_CONFIG Agent ${id} 缺少有效 channel 凭证/domain`);
     }
     const expectedWorkspace = path.join(larkinHome, "agents", id);
@@ -286,6 +294,24 @@ export function createHostShell({
     return store;
   };
   const hostState = new HostStateProjection(stateStore, log);
+  const markRuntimeTransition = (agent: ConfiguredAgent, reason: string): void => {
+    hostState.updateStatus(agent, {
+      runtimeReadiness: { runtime: agent.runtime, state: "unavailable", reason, nextAction: "Wait for the current daemon epoch to publish Runtime readiness.", observedAt: new Date().toISOString() },
+    });
+  };
+  const recordInboundDeliveryFailure = (
+    agent: ConfiguredAgent,
+    code: "non_retryable_receipt" | "runtime_delivery_exception" | "runtime_delivery_event",
+  ): void => {
+    const at = new Date().toISOString();
+    const reason = "Inbound Runtime delivery failed non-retryably; durable Inbox/ledger state is retained for recovery.";
+    const nextAction = "Inspect the delivery/status error, correct the Runtime or canonical Inbox state, then restart to replay safely.";
+    hostState.updateStatus(agent, {
+      inboundDeliveryHealth: { state: "error", code, at, reason, nextAction },
+      runtimeReadiness: { runtime: agent.runtime, state: "incompatible", reason, nextAction },
+    });
+    hostState.recordStatusError(agent, `${reason} ${nextAction} code=${code}`);
+  };
   const agentStates = new Map<string, AgentStateRecord>();
   const saveAgentState = (record: AgentStateRecord): void => {
     try { record.store.writeJson("agentState", record.state); }
@@ -403,55 +429,71 @@ export function createHostShell({
     if (event.event_id && (seenEventIds.has(eventKey) || inFlightEventIds.has(eventKey))) return;
     if (agent.botOpenId && event.sender_id === agent.botOpenId) { log(`agent=${agent.name} 跳过自己发的消息`); return; }
     const telemetryMessageId = String(event.message_id || event.event_id || eventKey);
+    let canonicalInboxDurable = false;
     if (wake) telemetry?.beginMessage(agent.agentId, telemetryMessageId);
     if (event.event_id) inFlightEventIds.add(eventKey);
     try {
-      const receive = async (): Promise<Record<string, unknown>> => {
+      const receive = async (): Promise<Record<string, unknown> | null> => {
         const [names, signature] = await Promise.all([
           senderIdentity.ensureChatNames(agent, event.chat_id, 3_000),
           event._sender_is_bot ? Promise.resolve(null) : senderIdentity.ensureSenderSignature(agent, event.sender_id, 3_000),
         ]);
-        const envelope = envelopeProjector.projectInbound(agent, event, { anchorReply: wake, names, signature }) as unknown as Record<string, unknown>;
-        envelope.target = targetKeyOfInboxEnvelope({ ...envelope, chat_id: event.chat_id, thread_id: event.thread_id });
-        if (wake) envelope.wake = true;
-        const inboxEnvelope = projectInboxEnvelope(envelope, {
+        const projected = envelopeProjector.projectInbound(agent, event, { anchorReply: wake, names, signature }) as unknown as Record<string, unknown>;
+        projected.target = targetKeyOfInboxEnvelope({ ...projected, chat_id: event.chat_id, thread_id: event.thread_id });
+        if (wake) projected.wake = true;
+        const candidate = projectInboxEnvelope(projected, {
           chat_id: event.chat_id,
           thread_id: event.thread_id,
           ...(event.create_time !== undefined ? { create_time: String(event.create_time) } : {}),
           sender_id: event.sender_id,
-          content: String(envelope.content ?? event.content ?? ""),
+          content: String(projected.content ?? event.content ?? ""),
         });
-        try { stateStore(agent).appendNdjson("inbox", inboxEnvelope); }
+        let append: ReturnType<AgentStateStore["appendCanonicalInboxOnce"]>;
+        try { append = stateStore(agent).appendCanonicalInboxOnce(candidate); }
         catch (error) { throw new Error(`inbox 写失败: ${errorMessage(error)}`); }
-        // An event becomes permanently seen only after its canonical Inbox append
-        // is durable. Failures remain eligible for same-process redelivery.
+        canonicalInboxDurable = true;
+        // An event becomes permanently transport-seen only after the canonical
+        // append/dedupe decision is durable. Agent model-seen state is untouched.
         if (event.event_id) seenEventIds.add(eventKey);
-        hostState.appendConversation(agent, {
-          direction: "in", from: envelope.sender_name, senderType: envelope.sender_type,
-          target: targetFor(event).target, wake, text: event.content, messageId: envelope.message_id,
-          at: envelope.timestamp || new Date().toISOString(),
+        if (append.status === "duplicate_consumed") return null;
+        const inboxEnvelope = append.envelope;
+        if (append.status === "appended") hostState.appendConversation(agent, {
+          direction: "in", from: inboxEnvelope.sender_name, senderType: inboxEnvelope.sender_type,
+          target: String(inboxEnvelope.target || targetFor(event).target), wake, text: event.content, messageId: inboxEnvelope.message_id,
+          at: inboxEnvelope.timestamp || new Date().toISOString(),
         });
-        return envelope;
+        return inboxEnvelope as Record<string, unknown>;
       };
-      const envelope = wake && telemetry
+      const inboxEnvelope = wake && telemetry
         ? await telemetry.phase(telemetryMessageId, "feishu.receive", SpanKind.CONSUMER, receive)
         : await receive();
-      if (!wake) return;
-      const receipt = await runtimeHost.deliver(agent.agentId, envelope);
-      if (receipt.status === "accepted" || receipt.status === "duplicate" || receipt.status === "deferred") {
+      if (!wake || !inboxEnvelope) return;
+      const receipt = await runtimeHost.deliver(agent.agentId, inboxEnvelope);
+      if (receipt.status === "error") {
+        recordInboundDeliveryFailure(agent, "non_retryable_receipt");
         hostState.appendStatusLog(agent, "deliverLog", {
-          from: envelope.sender_name,
-          target: targetFor(event).target,
-          excerpt: safeConversationExcerpt(event.content, 180),
-          at: new Date().toISOString(),
-        }, 30);
-        if (envelope.sender_type === "human" || envelope.sender_type === "agent") processingEyes.add(agent, String(envelope.message_id || ""));
-        if (receipt.status === "deferred") log(`Runtime 暂缓投递，消息保留在 inbox seq=${envelope.seq}: ${receipt.reason}`);
+          at: new Date().toISOString(), status: "error",
+          reason: "non-retryable Runtime delivery error; durable recovery state retained",
+        }, 80);
+        return;
       }
+      hostState.appendStatusLog(agent, "deliverLog", {
+        from: inboxEnvelope.sender_name,
+        target: String(inboxEnvelope.target || targetFor(event).target),
+        excerpt: safeConversationExcerpt(event.content, 180),
+        at: new Date().toISOString(),
+      }, 30);
+      if (inboxEnvelope.sender_type === "human" || inboxEnvelope.sender_type === "agent") processingEyes.add(agent, String(inboxEnvelope.message_id || ""));
+      if (receipt.status === "deferred") log(`Runtime 暂缓投递，消息保留在 inbox seq=${inboxEnvelope.seq}: ${receipt.reason}`);
     } catch (error) {
       if (wake) telemetry?.delivery(agent.agentId, telemetryMessageId, "error");
-      log(`onFeishuMessage 异常 agent=${agent.name}: ${error instanceof Error ? error.stack || error.message : String(error)}`);
-      hostState.recordStatusError(agent, `onFeishuMessage: ${errorMessage(error)}`);
+      if (canonicalInboxDurable) {
+        log(`onFeishuMessage Runtime delivery failed agent=${agent.name}; canonical Inbox retained`);
+        recordInboundDeliveryFailure(agent, "runtime_delivery_exception");
+      } else {
+        log(`onFeishuMessage 异常 agent=${agent.name}: ${error instanceof Error ? error.stack || error.message : String(error)}`);
+        hostState.recordStatusError(agent, `onFeishuMessage: ${errorMessage(error)}`);
+      }
     } finally {
       if (event.event_id) inFlightEventIds.delete(eventKey);
     }
@@ -757,7 +799,7 @@ export function createHostShell({
     const channel = createLarkChannel({
       appId: agent.feishuAppId,
       appSecret: agent.feishuAppSecret,
-      domain: agent.feishuDomain || "https://open.feishu.cn",
+      domain: requireOpenDomain(agent.feishuDomain),
       source: "larkin",
       policy: { dmMode: "open", requireMention: false, respondToMentionAll: true },
       // issue #88：关闭 SDK 的防抖批量合并（默认 600ms），逐条投递，
@@ -864,7 +906,7 @@ export function createHostShell({
       const channel = createLarkChannel({
         appId: agent.feishuAppId,
         appSecret: agent.feishuAppSecret,
-        domain: agent.feishuDomain || "https://open.feishu.cn",
+        domain: requireOpenDomain(agent.feishuDomain),
         source: "larkin",
         policy: { dmMode: "open", requireMention: false, respondToMentionAll: true },
         // issue #88：关闭 SDK 的防抖批量合并（默认 600ms），逐条投递，
@@ -1119,6 +1161,9 @@ export function createHostShell({
           }, 80);
           hostState.updateStatus(agent, { droughtReconnectAt, droughtReconnectAbandonedAt: null });
           reconnectFns.get(agent.agentId)?.();
+          void runtimeHost.scanPendingInboxUpdates?.(agent.agentId)?.catch((error) => {
+            log(`drought reconnect inbox scan failed agent=${agent.name}: ${errorMessage(error)}`);
+          });
         }).catch((error) => {
           maintenance.inFlight = false;
           if (shuttingDown || fataling) return;
@@ -1185,16 +1230,18 @@ export function createHostShell({
     if (!agent) return;
     if (message.type === "agent-status") {
       log("agent:status", message.agentId, message.status);
+      const observedAt = new Date().toISOString();
       if (message.status === "error" || message.status === "inactive") hostState.updateStatus(agent, {
-        runtimeReadiness: message.readiness?.state && message.readiness.state !== "ready" ? message.readiness : {
+        runtimeReadiness: message.readiness?.state && message.readiness.state !== "ready" ? { ...message.readiness, observedAt } : {
           runtime: agent.runtime,
           state: message.status === "error" ? "incompatible" : "missing",
           reason: message.status === "error" ? message.error || "Runtime entered an error state" : "Runtime is inactive",
+          observedAt,
         },
       });
-      else if (message.readiness) hostState.updateStatus(agent, { runtimeReadiness: message.readiness });
+      else if (message.readiness) hostState.updateStatus(agent, { runtimeReadiness: { ...message.readiness, observedAt } });
       else if (message.status === "active") hostState.updateStatus(agent, { runtimeReadiness: {
-        runtime: agent.runtime, state: "ready",
+        runtime: agent.runtime, state: "ready", observedAt,
       } });
       if (message.status === "active") {
         const redeliveryTimer = setTimeout(() => {
@@ -1219,16 +1266,21 @@ export function createHostShell({
       return;
     }
     if (message.type === "delivery") {
+      if (message.status === "error") recordInboundDeliveryFailure(agent, "runtime_delivery_event");
       hostState.appendStatusLog(agent, "deliverLog", {
         at: new Date().toISOString(), deliveryId: message.deliveryId, messageId: message.messageId,
-        status: message.status, ...(message.reason ? { reason: safeConversationExcerpt(message.reason, 120) } : {}),
+        status: message.status,
+        ...(message.status === "error"
+          ? { reason: "non-retryable Runtime delivery error; durable recovery state retained" }
+          : (message.reason ? { reason: safeConversationExcerpt(message.reason, 120) } : {})),
       }, 80);
       return;
     }
     if (message.type === "session") {
       const record = agentStates.get(agent.agentId);
       if (record && record.state.sessions[message.runtime] !== message.sessionId) {
-        record.state.sessions[message.runtime] = message.sessionId;
+        if (message.sessionId) record.state.sessions[message.runtime] = message.sessionId;
+        else delete record.state.sessions[message.runtime];
         saveAgentState(record);
         log(`持久化 agent=${agent.name} runtime=${message.runtime} sessionId=${message.sessionId}`);
       }
@@ -1243,7 +1295,8 @@ export function createHostShell({
         const readiness = providerAuthenticationFailureReadiness(agent.runtime as "codex" | "claude" | "pi", message.event.upstream?.provider);
         hostState.recordStatusError(agent, `auth: ${readiness.reason}; ${readiness.nextAction}`);
       } else {
-        hostState.recordStatusError(agent, `${message.event.errorCategory || "provider"}: ${message.event.message}${message.event.nextAction ? `; ${message.event.nextAction}` : ""}`);
+        const category = message.event.errorCategory || "provider";
+        hostState.recordStatusError(agent, `${category}: Runtime input failed ${message.event.retryable ? "retryably" : "non-retryably"}; inspect delivery health and Runtime/provider configuration`);
       }
     }
   };
@@ -1374,8 +1427,13 @@ export function createHostShell({
         const status = hostState.readStatus(agent);
         const turns = status.session && typeof status.session === "object"
           ? Math.max(0, Number((status.session as { turns?: unknown }).turns) || 0) : 0;
-        const runtimeReady = Boolean(status.runtimeReadiness && typeof status.runtimeReadiness === "object"
-          && (status.runtimeReadiness as { state?: unknown }).state === "ready");
+        const sessionStartedAt = status.session && typeof status.session === "object"
+          ? Date.parse(String((status.session as { startedAt?: unknown }).startedAt || "")) : Number.NaN;
+        const sessionCurrent = Number.isFinite(sessionStartedAt) && sessionStartedAt >= Date.parse(daemonStartedAt);
+        const runtimeReady = sessionCurrent && isRuntimeReadinessCurrent(
+          status.runtimeReadiness as { state?: "missing" | "unauthenticated" | "incompatible" | "ready" | "unavailable"; observedAt?: string } | undefined,
+          daemonStartedAt,
+        );
         const pendingCount = stateStore(agent).withInboxTransaction(() => stateStore(agent).readNdjson("inbox").length);
         return { turns, runtimeReady, ...connectionState(status), pendingCount };
       };
@@ -1384,6 +1442,7 @@ export function createHostShell({
         new Error(`Agent ${agentId} channel is not connected`), { code: "channel_unavailable", ...initialProjection });
       if (initialProjection.reconnecting) throw Object.assign(
         new Error(`Agent ${agentId} channel is reconnecting`), { code: "channel_reconnecting", ...initialProjection });
+      markRuntimeTransition(agent, "Runtime session reset in progress");
       let reset;
       try { reset = await runtimeHost.resetSession(agentId); }
       catch (error) {
@@ -1396,10 +1455,16 @@ export function createHostShell({
           else delete record.state.sessions[agent.runtime];
           record.store.writeJson("agentState", record.state);
         }
-        if (!reset.sessionId) hostState.updateStatus(agent, {
-          session: { runtime: agent.runtime, id: null, launchId: null, startedAt: new Date().toISOString(),
-            lastSeenAt: null, lastTurnAt: null, turns: 0 }, runtimeReadiness: { runtime: agent.runtime, state: "ready" },
-        });
+        if (!reset.sessionId) {
+          const observedAt = new Date().toISOString();
+          hostState.updateStatus(agent, {
+            session: { runtime: agent.runtime, id: null, launchId: null, startedAt: observedAt,
+              lastSeenAt: null, lastTurnAt: null, turns: 0 },
+            runtimeReadiness: { runtime: agent.runtime, state: "ready", observedAt },
+          });
+        } else if (reset.runtimeReady) {
+          hostState.updateStatus(agent, { runtimeReadiness: { runtime: agent.runtime, state: "ready", observedAt: new Date().toISOString() } });
+        }
       } catch (error) {
         const projection = readinessProjection();
         return { resetCommitted: true, generationChanged: reset.generationChanged, sessionChanged: reset.sessionChanged,
@@ -1427,9 +1492,80 @@ export function createHostShell({
           : unavailable ? "reset committed but Runtime/channel readiness is unavailable"
             : "reset committed but readiness did not converge before timeout" };
     },
+    async recoverSession(agentId, reason, waitReadyMs = 30_000): Promise<{
+      recoveryCommitted: boolean; generationChanged: boolean; sessionChanged: boolean; turns: number;
+      runtimeReady: boolean; channelConnected: boolean; reconnecting: boolean; pendingCount: number;
+      rearmedCount: number; replayStatus: "scheduled" | "pending" | "consumed" | "not_started";
+      remainingPendingCount: number; readyForFreshScenario: boolean; inboundObserved: false;
+      code?: string; error?: string;
+    }> {
+      const agent = agents.find((candidate) => candidate.agentId === agentId);
+      if (!agent) throw Object.assign(new Error(`未知 Agent: ${agentId}`), { code: "unknown_agent" });
+      if (reason !== "context-overflow") throw Object.assign(new Error("unsupported recovery reason"), { code: "recovery_refused" });
+      if (!runtimeHost.recoverSession) throw Object.assign(new Error("Runtime session recovery 尚未就绪"), { code: "recovery_unavailable" });
+      const connectionState = (status = hostState.readStatus(agent)): { channelConnected: boolean; reconnecting: boolean } => {
+        const connectedAt = Date.parse(String(status.connectedAt || ""));
+        const channelConnected = Number.isFinite(connectedAt) && connectedAt >= Date.parse(daemonStartedAt) - 1000;
+        return { channelConnected, reconnecting: isChannelReconnecting(status) };
+      };
+      const readinessProjection = (): { turns: number; runtimeReady: boolean; channelConnected: boolean; reconnecting: boolean; pendingCount: number } => {
+        const status = hostState.readStatus(agent);
+        const turns = status.session && typeof status.session === "object"
+          ? Math.max(0, Number((status.session as { turns?: unknown }).turns) || 0) : 0;
+        const sessionStartedAt = status.session && typeof status.session === "object"
+          ? Date.parse(String((status.session as { startedAt?: unknown }).startedAt || "")) : Number.NaN;
+        const sessionCurrent = Number.isFinite(sessionStartedAt) && sessionStartedAt >= Date.parse(daemonStartedAt);
+        const runtimeReady = sessionCurrent && isRuntimeReadinessCurrent(
+          status.runtimeReadiness as { state?: "missing" | "unauthenticated" | "incompatible" | "ready" | "unavailable"; observedAt?: string } | undefined,
+          daemonStartedAt,
+        );
+        const pendingCount = stateStore(agent).withInboxTransaction(() => stateStore(agent).readNdjson("inbox").length);
+        return { turns, runtimeReady, ...connectionState(status), pendingCount };
+      };
+      const initialProjection = readinessProjection();
+      if (!initialProjection.channelConnected) throw Object.assign(new Error(`Agent ${agentId} channel is not connected`), { code: "channel_unavailable", ...initialProjection });
+      if (initialProjection.reconnecting) throw Object.assign(new Error(`Agent ${agentId} channel is reconnecting`), { code: "channel_reconnecting", ...initialProjection });
+      let recovery: RuntimeSessionRecoveryResult;
+      try { recovery = await runtimeHost.recoverSession(agentId, reason); }
+      catch (error) {
+        throw Object.assign(error instanceof Error ? error : new Error(String(error)), readinessProjection());
+      }
+      if (recovery.runtimeReady) {
+        hostState.updateStatus(agent, { runtimeReadiness: { runtime: agent.runtime, state: "ready", observedAt: new Date().toISOString() } });
+      }
+      const record = agentStates.get(agentId);
+      try {
+        if (record) {
+          if (recovery.sessionId) record.state.sessions[agent.runtime] = recovery.sessionId;
+          else delete record.state.sessions[agent.runtime];
+          record.store.writeJson("agentState", record.state);
+        }
+      } catch (error) {
+        const projection = readinessProjection();
+        return { recoveryCommitted: true, generationChanged: recovery.generationChanged, sessionChanged: recovery.sessionChanged,
+          ...projection, rearmedCount: recovery.rearmedCount, replayStatus: "pending", remainingPendingCount: projection.pendingCount,
+          readyForFreshScenario: false, inboundObserved: false, code: "state_persistence_failed",
+          error: "recovery committed but Agent session state persistence failed" };
+      }
+      const deadline = Date.now() + Math.max(0, waitReadyMs);
+      let projection = readinessProjection();
+      do {
+        projection = readinessProjection();
+        if (projection.turns === 0 && projection.runtimeReady && projection.channelConnected && !projection.reconnecting) break;
+        if (Date.now() >= deadline) break;
+        await new Promise<void>((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - Date.now()))));
+      } while (true);
+      const replayStatus = projection.pendingCount === 0 ? "consumed" : "pending";
+      const ready = projection.turns === 0 && projection.runtimeReady && projection.channelConnected && !projection.reconnecting;
+      return { recoveryCommitted: true, generationChanged: recovery.generationChanged, sessionChanged: recovery.sessionChanged,
+        ...projection, rearmedCount: recovery.rearmedCount, replayStatus, remainingPendingCount: projection.pendingCount,
+        readyForFreshScenario: ready, inboundObserved: false,
+        ...(!ready ? { code: "recovery_timeout", error: "recovery committed but Runtime/channel readiness did not converge before timeout" } : {}) };
+    },
     async start(): Promise<void> {
       try {
         fs.mkdirSync(larkinHome, { recursive: true });
+        for (const agent of agents) markRuntimeTransition(agent, "Current daemon epoch starting");
         fs.writeFileSync(path.join(larkinHome, "daemon-status.json"), JSON.stringify({
           ...currentProcessMetadata(processCommandToken("daemon", "app/runtime-process.mjs")), pid: process.pid, startedAt: daemonStartedAt,
           agents: agents.map((agent) => agent.agentId),

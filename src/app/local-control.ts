@@ -27,18 +27,30 @@ export interface AgentEnqueueResponse {
   code?: string;
   error?: string;
 }
+export interface SupervisorAgentUpsertResponse {
+  ok: boolean; operationId: string; agentId?: string; code?: string; state?: string; error?: string;
+}
 export interface SessionResetResponse {
   ok: boolean; agentId: string; code?: string; error?: string;
   resetCommitted: boolean; generationChanged: boolean; sessionChanged: boolean; turns: number;
   runtimeReady: boolean; channelConnected: boolean; reconnecting: boolean; pendingCount: number;
   readyForFreshScenario: boolean; inboundObserved: false; readiness?: RuntimeReadiness;
 }
+export interface SessionRecoveryResponse {
+  ok: boolean; agentId: string; code?: string; error?: string;
+  recoveryCommitted: boolean; generationChanged: boolean; sessionChanged: boolean; turns: number;
+  runtimeReady: boolean; channelConnected: boolean; reconnecting: boolean; pendingCount: number;
+  rearmedCount: number; replayStatus: "scheduled" | "pending" | "consumed" | "not_started";
+  remainingPendingCount: number; readyForFreshScenario: boolean; inboundObserved: false; readiness?: RuntimeReadiness;
+}
 interface SessionResetControlRequest { operation: "session-reset"; agentId: string; authorization: string; waitReadyMs?: number }
 interface AgentEnqueueControlRequest extends AgentEnqueueInput { operation: "agent-enqueue"; authorization: string }
-type AgentControlRequest = AgentUpsertRequest | SessionResetControlRequest | AgentEnqueueControlRequest;
+interface SessionRecoveryControlRequest { operation: "session-recover"; agentId: string; authorization: string; reason: "context-overflow"; waitReadyMs?: number }
+type AgentControlRequest = AgentUpsertRequest | SessionResetControlRequest | AgentEnqueueControlRequest | SessionRecoveryControlRequest;
 type AgentControlPayload = Omit<AgentUpsertRequest, "authorization">
   | Omit<SessionResetControlRequest, "authorization">
-  | Omit<AgentEnqueueControlRequest, "authorization">;
+  | Omit<AgentEnqueueControlRequest, "authorization">
+  | Omit<SessionRecoveryControlRequest, "authorization">;
 
 interface ProcessBinding { pid: number; processStartToken: string }
 interface SocketBinding { device: string; inode: string; owner: string; changeTimeNs: string }
@@ -64,6 +76,49 @@ const IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
 const MAX_CONTROL_REQUEST_BYTES = 65_536;
 const MAX_EXTERNAL_CONTENT_BYTES = 32_768;
 const UNIX_SOCKET_PATH_MAX_BYTES = process.platform === "darwin" ? 103 : 107;
+
+function recoveryErrorText(code: string | undefined): string {
+  switch (code) {
+    case "unknown_agent": return "unknown Agent";
+    case "agent_busy": return "Agent is not idle";
+    case "channel_unavailable": return "Runtime channel is unavailable";
+    case "channel_reconnecting": return "Runtime channel is reconnecting";
+    case "runtime_unavailable": return "Runtime readiness is unavailable";
+    case "recovery_unavailable": return "context-overflow recovery is unavailable";
+    case "recovery_staged_not_committed": return "context-overflow recovery was staged but not committed";
+    case "state_persistence_failed": return "context-overflow recovery committed but state persistence failed";
+    case "recovery_timeout": return "context-overflow recovery committed but readiness did not converge";
+    case "recovery_refused": return "context-overflow recovery was refused";
+    default: return "context-overflow recovery failed";
+  }
+}
+
+function sanitizeRecoveryReadiness(value: unknown): RuntimeReadiness | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const candidate = value as Partial<RuntimeReadiness>;
+  if (!["codex", "claude", "pi"].includes(String(candidate.runtime))
+      || !["missing", "unauthenticated", "unavailable", "incompatible", "ready"].includes(String(candidate.state))) return undefined;
+  const runtime = candidate.runtime as RuntimeReadiness["runtime"];
+  const state = candidate.state as RuntimeReadiness["state"];
+  return { runtime, state,
+    ...(state === "ready" ? {} : { reason: `Runtime readiness is ${state}.`, nextAction: "Inspect Runtime/provider configuration, then retry." }) };
+}
+
+function sanitizeSessionRecoveryResponse(response: SessionRecoveryResponse, agentId: string): SessionRecoveryResponse {
+  const code = typeof response.code === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(response.code) ? response.code : undefined;
+  return {
+    ok: response.ok === true, agentId, ...(code ? { code } : {}),
+    ...(code || response.error ? { error: recoveryErrorText(code) } : {}),
+    recoveryCommitted: response.recoveryCommitted === true, generationChanged: response.generationChanged === true,
+    sessionChanged: response.sessionChanged === true, turns: 0, runtimeReady: response.runtimeReady === true,
+    channelConnected: response.channelConnected === true, reconnecting: response.reconnecting === true,
+    pendingCount: Math.max(0, Number(response.pendingCount) || 0), rearmedCount: Math.max(0, Number(response.rearmedCount) || 0),
+    replayStatus: ["scheduled", "pending", "consumed", "not_started"].includes(response.replayStatus) ? response.replayStatus : "not_started",
+    remainingPendingCount: Math.max(0, Number(response.remainingPendingCount) || 0),
+    readyForFreshScenario: response.readyForFreshScenario === true, inboundObserved: false,
+    ...(sanitizeRecoveryReadiness(response.readiness) ? { readiness: sanitizeRecoveryReadiness(response.readiness) } : {}),
+  };
+}
 
 function socketPathsFit(root: string): boolean {
   if (isWindows) return true; // Windows named-pipe socket paths use a much larger limit
@@ -143,9 +198,7 @@ function parseRequest(line: string): AgentControlRequest {
     throw new Error("invalid agent control request");
   }
   if (value.operation === "session-reset") {
-    const waitReadyMs = value.waitReadyMs;
-    if (waitReadyMs !== undefined && (typeof waitReadyMs !== "number" || !Number.isSafeInteger(waitReadyMs)
-        || waitReadyMs < 0 || waitReadyMs > 300_000)) {
+    if (value.waitReadyMs !== undefined && (typeof value.waitReadyMs !== "number" || !Number.isSafeInteger(value.waitReadyMs) || value.waitReadyMs < 0 || value.waitReadyMs > 300_000)) {
       throw new Error("invalid session reset waitReadyMs");
     }
     if (Object.keys(value).some((key) => !["agentId", "authorization", "operation", "waitReadyMs"].includes(key))) {
@@ -163,6 +216,16 @@ function parseRequest(line: string): AgentControlRequest {
       throw new Error("invalid enqueue content");
     }
     return value as unknown as AgentEnqueueControlRequest;
+  }
+  if (value.operation === "session-recover") {
+    if (value.reason !== "context-overflow") throw new Error("session recovery requires reason=context-overflow");
+    if (value.waitReadyMs !== undefined && (typeof value.waitReadyMs !== "number" || !Number.isSafeInteger(value.waitReadyMs) || value.waitReadyMs < 0 || value.waitReadyMs > 300_000)) {
+      throw new Error("invalid session recovery waitReadyMs");
+    }
+    if (Object.keys(value).some((key) => !["agentId", "authorization", "operation", "reason", "waitReadyMs"].includes(key))) {
+      throw new Error("session recovery control request 包含未知字段");
+    }
+    return value as unknown as SessionRecoveryControlRequest;
   }
   if (value.operation !== undefined || !OPERATION_ID.test(String(value.operationId || ""))) {
     throw new Error("invalid agent upsert request");
@@ -461,15 +524,25 @@ export function createSupervisorControlServer({
   larkinHome,
   authorityToken,
   ensureDashboard,
+  onAgentUpserted,
 }: {
   larkinHome: string;
   authorityToken: string;
   ensureDashboard(): Promise<string> | string;
+  onAgentUpserted?(agentId: string): Promise<void> | void;
 }): { start(): Promise<void>; close(): Promise<void> } {
   let socket = "";
   let socketRoot = "";
   let socketIdentity: SocketBinding | null = null;
-  const completed = new Map<string, DashboardRecoveryResponse>();
+  const completed = new Map<string, {
+    operation: string;
+    agentId?: string;
+    response: DashboardRecoveryResponse | SupervisorAgentUpsertResponse;
+  }>();
+  const operationConflict = (operationId: string, agentId?: string): SupervisorAgentUpsertResponse => ({
+    ok: false, operationId, ...(agentId ? { agentId } : {}), code: "operation_conflict",
+    error: "operationId 已绑定其他 Agent 或操作",
+  });
   let server: net.Server | null = null;
   return {
     async start(): Promise<void> {
@@ -488,12 +561,18 @@ export function createSupervisorControlServer({
           const line = input.slice(0, newline);
           input = "";
           void (async () => {
-            let request: { operationId: string; operation: string; authorization: string };
+            let request: { operationId: string; operation: string; authorization: string; agentId?: string };
             try {
               request = JSON.parse(line) as typeof request;
-              if (!OPERATION_ID.test(String(request.operationId || "")) || request.operation !== "ensure-dashboard"
+              const isDashboardRecovery = request.operation === "ensure-dashboard";
+              const isAgentUpsert = request.operation === "agent-upserted";
+              const allowedKeys = isDashboardRecovery
+                ? ["operationId", "operation", "authorization"]
+                : isAgentUpsert ? ["operationId", "operation", "authorization", "agentId"] : [];
+              if (!OPERATION_ID.test(String(request.operationId || "")) || (!isDashboardRecovery && !isAgentUpsert)
                   || !AUTHORIZATION.test(String(request.authorization || ""))
-                  || Object.keys(request).some((key) => !["operationId", "operation", "authorization"].includes(key))) {
+                  || (isAgentUpsert && !AGENT_ID.test(String(request.agentId || "")))
+                  || Object.keys(request).some((key) => !allowedKeys.includes(key))) {
                 throw new Error("invalid supervisor control request");
               }
               const authority = assertSupervisorAuthority(larkinHome, authorityToken);
@@ -503,11 +582,26 @@ export function createSupervisorControlServer({
               return;
             }
             const replay = completed.get(request.operationId);
-            if (replay) { connection.end(`${JSON.stringify(replay)}\n`); return; }
-            let response: DashboardRecoveryResponse;
-            try { response = { ok: true, operationId: request.operationId, state: await ensureDashboard() }; }
+            if (replay) {
+              const sameRequest = replay.operation === request.operation
+                && replay.agentId === request.agentId;
+              const response = sameRequest ? replay.response : operationConflict(request.operationId, request.agentId);
+              connection.end(`${JSON.stringify(response)}\n`);
+              return;
+            }
+            let response: DashboardRecoveryResponse | SupervisorAgentUpsertResponse;
+            try {
+              if (request.operation === "agent-upserted") {
+                await onAgentUpserted?.(request.agentId as string);
+                response = { ok: true, operationId: request.operationId, state: "agent-recorded" };
+              } else {
+                response = { ok: true, operationId: request.operationId, state: await ensureDashboard() };
+              }
+            }
             catch (error) { response = { ok: false, operationId: request.operationId, error: error instanceof Error ? error.message : String(error) }; }
-            completed.set(request.operationId, response);
+            completed.set(request.operationId, {
+              operation: request.operation, agentId: request.agentId, response,
+            });
             while (completed.size > 256) completed.delete(completed.keys().next().value as string);
             connection.end(`${JSON.stringify(response)}\n`);
           })();
@@ -545,6 +639,7 @@ export function createAgentControlServer({
   upsert,
   resetSession,
   enqueue,
+  recoverSession,
   maxRememberedOperations = 256,
 }: {
   larkinHome: string;
@@ -552,6 +647,7 @@ export function createAgentControlServer({
   upsert(request: AgentUpsertOperation): Promise<void>;
   resetSession?(request: { agentId: string; waitReadyMs: number }): Promise<SessionResetResponse>;
   enqueue?(request: AgentEnqueueInput): Promise<AgentEnqueueResponse>;
+  recoverSession?(request: { agentId: string; reason: "context-overflow"; waitReadyMs: number }): Promise<SessionRecoveryResponse>;
   maxRememberedOperations?: number;
 }): { start(): Promise<void>; close(): Promise<void> } {
   let socket = "";
@@ -560,6 +656,7 @@ export function createAgentControlServer({
   const completed = new Map<string, AgentUpsertResponse>();
   const inFlight = new Map<string, { agentId: string; response: Promise<AgentUpsertResponse> }>();
   const resetInFlight = new Map<string, Promise<SessionResetResponse>>();
+  const recoveryInFlight = new Map<string, Promise<SessionRecoveryResponse>>();
   const agentQueues = new Map<string, Promise<unknown>>();
   const upsertConflict = (operationId: string, agentId: string): AgentUpsertResponse => ({
     ok: false, operationId, agentId, code: "operation_conflict", error: "operationId 已绑定其他 Agent 或操作",
@@ -610,7 +707,76 @@ export function createAgentControlServer({
                 agentId: request.agentId, error: "unauthorized control request" })}\n`);
               return;
             }
-            if ("operation" in request && request.operation === "session-reset") {
+            if ("operation" in request) {
+              if (request.operation === "session-recover") {
+                const recoveryRequest = request;
+                let operation = recoveryInFlight.get(recoveryRequest.agentId);
+                if (!operation) {
+                  const executeRecovery = async (): Promise<SessionRecoveryResponse> => {
+                    try {
+                      if (!recoverSession) throw new Error("session recovery control unavailable");
+                      const result = await recoverSession({ agentId: recoveryRequest.agentId, reason: recoveryRequest.reason,
+                        waitReadyMs: recoveryRequest.waitReadyMs ?? 30_000 });
+                      return sanitizeSessionRecoveryResponse(result, recoveryRequest.agentId);
+                    } catch (error) {
+                      const code = typeof (error as { code?: unknown }).code === "string"
+                        ? String((error as { code: string }).code)
+                        : error instanceof RuntimePrerequisiteError && error.readiness.state === "unavailable"
+                          ? "runtime_unavailable" : "recovery_refused";
+                      const projection = error as Partial<Pick<SessionRecoveryResponse,
+                        "turns" | "runtimeReady" | "channelConnected" | "reconnecting" | "pendingCount" | "rearmedCount" | "remainingPendingCount">>;
+                      return { ok: false, agentId: recoveryRequest.agentId, code,
+                        error: recoveryErrorText(code), recoveryCommitted: false,
+                        generationChanged: false, sessionChanged: false, turns: Math.max(0, Number(projection.turns) || 0),
+                        runtimeReady: projection.runtimeReady === true, channelConnected: projection.channelConnected === true,
+                        reconnecting: projection.reconnecting === true, pendingCount: Math.max(0, Number(projection.pendingCount) || 0),
+                        rearmedCount: Math.max(0, Number(projection.rearmedCount) || 0), replayStatus: "not_started",
+                        remainingPendingCount: Math.max(0, Number(projection.remainingPendingCount) || 0),
+                        readyForFreshScenario: false, inboundObserved: false,
+                        ...(error instanceof RuntimePrerequisiteError ? { readiness: sanitizeRecoveryReadiness(error.readiness) } : {}) };
+                    }
+                  };
+                  const prior = agentQueues.get(recoveryRequest.agentId) ?? Promise.resolve();
+                  const executing = prior.catch(() => {}).then(executeRecovery);
+                  let queued: Promise<SessionRecoveryResponse>;
+                  queued = executing.finally(() => {
+                    if (agentQueues.get(recoveryRequest.agentId) === queued) agentQueues.delete(recoveryRequest.agentId);
+                    if (recoveryInFlight.get(recoveryRequest.agentId) === queued) recoveryInFlight.delete(recoveryRequest.agentId);
+                  });
+                  agentQueues.set(recoveryRequest.agentId, queued);
+                  recoveryInFlight.set(recoveryRequest.agentId, queued);
+                  operation = queued;
+                }
+                const response = await operation;
+                connection.end(`${JSON.stringify(response)}\n`);
+                return;
+              }
+              if (request.operation === "agent-enqueue") {
+                const enqueueRequest = request;
+                const executeEnqueue = async (): Promise<AgentEnqueueResponse> => {
+                  try {
+                    if (!enqueue) throw new Error("agent enqueue control unavailable");
+                    return await enqueue({
+                      agentId: enqueueRequest.agentId,
+                      idempotencyKey: enqueueRequest.idempotencyKey,
+                      content: enqueueRequest.content,
+                    });
+                  } catch (error) {
+                    return { ok: false, agentId: enqueueRequest.agentId, status: "error",
+                      code: typeof (error as { code?: unknown }).code === "string" ? String((error as { code: string }).code) : "enqueue_failed",
+                      error: error instanceof Error ? error.message : String(error) };
+                  }
+                };
+                const prior = agentQueues.get(enqueueRequest.agentId) ?? Promise.resolve();
+                const executing = prior.catch(() => {}).then(executeEnqueue);
+                let queued: Promise<AgentEnqueueResponse>;
+                queued = executing.finally(() => {
+                  if (agentQueues.get(enqueueRequest.agentId) === queued) agentQueues.delete(enqueueRequest.agentId);
+                });
+                agentQueues.set(enqueueRequest.agentId, queued);
+                connection.end(`${JSON.stringify(await queued)}\n`);
+                return;
+              }
               const resetRequest = request;
               let operation = resetInFlight.get(resetRequest.agentId);
               if (!operation) {
@@ -648,32 +814,6 @@ export function createAgentControlServer({
               }
               const response = await operation;
               connection.end(`${JSON.stringify(response)}\n`);
-              return;
-            }
-            if ("operation" in request && request.operation === "agent-enqueue") {
-              const enqueueRequest = request;
-              const executeEnqueue = async (): Promise<AgentEnqueueResponse> => {
-                try {
-                  if (!enqueue) throw new Error("agent enqueue control unavailable");
-                  return await enqueue({
-                    agentId: enqueueRequest.agentId,
-                    idempotencyKey: enqueueRequest.idempotencyKey,
-                    content: enqueueRequest.content,
-                  });
-                } catch (error) {
-                  return { ok: false, agentId: enqueueRequest.agentId, status: "error",
-                    code: typeof (error as { code?: unknown }).code === "string" ? String((error as { code: string }).code) : "enqueue_failed",
-                    error: error instanceof Error ? error.message : String(error) };
-                }
-              };
-              const prior = agentQueues.get(enqueueRequest.agentId) ?? Promise.resolve();
-              const executing = prior.catch(() => {}).then(executeEnqueue);
-              let queued: Promise<AgentEnqueueResponse>;
-              queued = executing.finally(() => {
-                if (agentQueues.get(enqueueRequest.agentId) === queued) agentQueues.delete(enqueueRequest.agentId);
-              });
-              agentQueues.set(enqueueRequest.agentId, queued);
-              connection.end(`${JSON.stringify(await queued)}\n`);
               return;
             }
             const upsertRequest = request;
@@ -768,6 +908,49 @@ async function sendSupervisorRecovery(larkinHome: string, operationId: string, t
       catch (error) { reject(error); }
     });
   });
+}
+
+async function sendSupervisorAgentUpsert(larkinHome: string, agentId: string, operationId: string, timeoutMs: number): Promise<SupervisorAgentUpsertResponse> {
+  const authority = assertSupervisorAuthority(larkinHome);
+  assertSecureSocketDirectory(authority.socketRoot);
+  const socket = authority.supervisorSocketPath;
+  const stat = fs.lstatSync(socket);
+  if (!stat.isSocket() || stat.isSymbolicLink()
+      || (typeof process.getuid === "function" && stat.uid !== process.getuid())
+      || !notGroupOrWorldAccessible(stat)) throw new Error("supervisor control socket 不安全");
+  return await new Promise<SupervisorAgentUpsertResponse>((resolve, reject) => {
+    const client = net.createConnection(socket);
+    const timer = setTimeout(() => { client.destroy(); reject(new Error("supervisor agent upsert control timeout")); }, timeoutMs);
+    let input = "";
+    client.setEncoding("utf8");
+    client.once("error", (error) => { clearTimeout(timer); reject(error); });
+    client.once("connect", () => client.write(`${JSON.stringify({
+      operationId, operation: "agent-upserted", agentId, authorization: authority.token,
+    })}\n`));
+    client.on("data", (chunk) => {
+      input += chunk;
+      const newline = input.indexOf("\n");
+      if (newline < 0) return;
+      clearTimeout(timer);
+      client.end();
+      try { resolve(JSON.parse(input.slice(0, newline)) as SupervisorAgentUpsertResponse); }
+      catch (error) { reject(error); }
+    });
+  });
+}
+
+export async function requestSupervisorAgentUpsert({
+  larkinHome,
+  agentId,
+  operationId = crypto.randomUUID(),
+  timeoutMs = 30_000,
+}: {
+  larkinHome: string;
+  agentId: string;
+  operationId?: string;
+  timeoutMs?: number;
+}): Promise<SupervisorAgentUpsertResponse> {
+  return sendSupervisorAgentUpsert(larkinHome, agentId, operationId, timeoutMs);
 }
 
 export async function requestDashboardRecovery({
@@ -866,6 +1049,23 @@ export async function requestAgentEnqueue(input: AgentEnqueueInput & {
       operation: "agent-enqueue", agentId: input.agentId, idempotencyKey: input.idempotencyKey,
       content: input.content,
     },
+  });
+}
+
+export async function requestSessionRecovery({
+  larkinHome,
+  agentId,
+  reason = "context-overflow",
+  waitReadyMs = 30_000,
+}: {
+  larkinHome: string;
+  agentId: string;
+  reason?: "context-overflow";
+  waitReadyMs?: number;
+}): Promise<SessionRecoveryResponse> {
+  return requestAgentControl<SessionRecoveryResponse>({
+    larkinHome, timeoutMs: Math.max(1_000, waitReadyMs + 1_000),
+    request: { operation: "session-recover", agentId, reason, waitReadyMs },
   });
 }
 

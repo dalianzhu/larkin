@@ -64,7 +64,7 @@ test("grant-scopes selects only explicit App ID, explicit --agent App ID, or act
     fs.writeFileSync(preload, `module.exports={
   registerApp:async(opts)=>{require("node:fs").writeFileSync(process.env.REGISTER_MARKER,JSON.stringify(opts));opts.onQRCodeReady({url:"https://mock.invalid/grant",expireIn:60});return {client_id:opts.appId}},
   qrcode:{generate(){}},
-  managedOfficialCli:()=>({command:{command:"/verified/official-lark-cli",argsPrefix:[],version:"1.0.79"},env:{}}),
+  managedOfficialCli:()=>({command:{command:"/verified/official-lark-cli",argsPrefix:[],version:"1.0.80"},env:{}}),
   spawnSync(command,args){require("node:fs").appendFileSync(process.env.SPAWN_MARKER,JSON.stringify({command,args})+"\\n");return {status:0,stdout:"{}",stderr:""}}
 };`);
     const run = (args = [], extra = {}) => spawnSync(process.execPath, [path.join(ROOT, "dist/setup/grant-scopes.mjs"), "--wait-min", "1", ...args], {
@@ -72,7 +72,10 @@ test("grant-scopes selects only explicit App ID, explicit --agent App ID, or act
     });
     let result = run([]);
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(JSON.parse(fs.readFileSync(marker, "utf8")).appId, app);
+    const defaultGrant = JSON.parse(fs.readFileSync(marker, "utf8"));
+    assert.equal(defaultGrant.appId, app);
+    assert.equal(defaultGrant.domain, "accounts.feishu.cn");
+    assert.notEqual(defaultGrant.domain, "lark");
     const updatedCredential = JSON.parse(fs.readFileSync(path.join(root, "bots", `${app}.json`), "utf8"));
     const commentCapability = updatedCredential.capabilities.documentCommentEvent;
     assert.deepEqual({ status: commentCapability.status, event: commentCapability.event, scope: commentCapability.scope }, {
@@ -147,7 +150,7 @@ test("transport derives identity and state only from strict hydrated v3 selectio
 
     const otherInbox = path.join(root, "state", "agents", other, "feishu-inbox.ndjson");
     fs.mkdirSync(path.dirname(otherInbox), { recursive: true });
-    fs.writeFileSync(otherInbox, JSON.stringify({ message_id: "other-event", seq: 1, sender_name: "user", sender_type: "human", channel_type: "dm", channel_name: "user", content: "hello", timestamp: "2026-07-15T00:00:00.000Z", thread_id: null }) + "\n");
+    fs.writeFileSync(otherInbox, JSON.stringify({ message_id: "other-event", target: "chat:c123", seq: 1, sender_name: "user", sender_type: "human", channel_type: "dm", channel_name: "user", content: "hello", timestamp: "2026-07-15T00:00:00.000Z", thread_id: null }) + "\n");
     const otherScript = `const cp=require("node:child_process"),original=cp.spawnSync;cp.spawnSync=function(command){return command==="lark-cli"?{status:1,stdout:"",stderr:"mocked"}:original.apply(this,arguments)}; const {transport}=require(${JSON.stringify(path.join(ROOT, "dist/agent/agent-transport.cjs"))}); (async()=>{const p=await transport.request({method:"GET",path:"/profile"}); const e=await transport.request({method:"GET",path:"/events"}); process.stdout.write(JSON.stringify({profile:p.data,events:e.data.events}));})().catch(e=>{console.error(e);process.exit(1)});`;
     const selectedOther = spawnSync(process.execPath, ["--eval", otherScript], { cwd: ROOT, encoding: "utf8", env: {
       ...process.env, HOME: path.join(temp, "home"), LARKIN_CONFIG_DIR: root, LARKIN_AGENT_ID: other,

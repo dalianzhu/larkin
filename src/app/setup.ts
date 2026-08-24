@@ -16,6 +16,7 @@ import { probeNativeRuntimeReadiness } from "../runtime/runtime-readiness.js";
 import { internalCommandSpec, processCommandToken, type InternalMode } from "./internal-command.js";
 import {
   ensureOfficialLarkCliForSetup,
+  formatOfficialLarkCliConsent,
 } from "./official-lark-cli.js";
 
 const CFG_DIR = process.env.LARKIN_CONFIG_DIR || path.join(os.homedir(), ".larkin");
@@ -84,6 +85,10 @@ Options:
   --base-url <url>                      custom 端点（provider=custom 时必填；也可覆盖 preset 默认端点）
   --model <id>                          模型 ID；默认取 provider 预设。不同 runtime 的模型可用
                                           \`larkin model\` 查看 / 切换
+  --from-cli-profile <name>            可选：复用已有官方 lark-cli profile（需 LARKIN_SETUP_APP_SECRET）
+  --tenant feishu|lark                  授权二维码之前选择品牌。默认 feishu（扫码 /page/launcher）。
+                                          Lark 用 --tenant lark：扫码 /page/cli，完成后凭证回传，
+                                          不要打开 /page/launcher。交互式未指定时会先询问。
 
 setup handles browser authorization, permission grants, credential storage, Agent configuration,
 and target-only hot attach. Each Agent is identified by its bot App ID: selecting the same bot reuses
@@ -129,16 +134,18 @@ export async function main(): Promise<void> {
   const official = await ensureOfficialLarkCliForSetup({
     env: process.env,
     interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY),
-    async confirmInstall(command) {
-      say("[setup 0/5] Larkin 需要未修改的官方 lark-cli 作为 Feishu (Lark) 命令下游。");
-      say(`将执行：${command}`);
+    async confirmInstall(request) {
+      const copy = formatOfficialLarkCliConsent(request);
+      for (const line of copy.lines) say(line);
       const input = readline.createInterface({ input: process.stdin, output: process.stdout });
-      const answer = (await input.question("是否安装？[y/N] ")).trim().toLowerCase();
+      const answer = (await input.question(copy.question)).trim().toLowerCase();
       input.close();
       return answer === "y" || answer === "yes";
     },
   }).catch((error) => die(error instanceof Error ? error.message : String(error)));
-  say(`[setup 0/5] ✓ 官方 lark-cli ${official.command.version}: ${official.command.command}${official.installed ? "（刚刚安装）" : ""}`);
+  const completedAction = official.setupAction === "upgrade" ? "（刚刚升级）"
+    : official.setupAction === "install" ? "（刚刚安装）" : "";
+  say(`[setup 0/5] ✓ 官方 lark-cli ${official.command.version}: ${official.command.command}${completedAction}`);
   say("\nAgent 与飞书（Lark）机器人按 App ID 一一对应：");
   say("  • 网页选择同一个机器人 → 热更新该 Agent，不重启其他 Agent");
   say("  • 网页创建新机器人 → 热挂载新 Agent，状态彼此独立\n");
@@ -150,11 +157,17 @@ export async function main(): Promise<void> {
     if (normalizedRuntime.distribution) registerArgs.push("--pi-distribution", normalizedRuntime.distribution);
   }
   registerArgs.push("--comment-subscription", OPT.commentSubscription);
-  for (const name of ["--provider", "--api-key", "--base-url", "--model"] as const) {
+  if (has("--tenant")) {
+    const tenant = flag("--tenant");
+    if (tenant !== "feishu" && tenant !== "lark") die("--tenant 只支持 feishu 或 lark");
+    registerArgs.push("--tenant", tenant === "lark" ? "lark" : "feishu");
+  }
+  for (const name of ["--provider", "--api-key", "--base-url", "--model", "--from-cli-profile"] as const) {
     const value = flag(name);
     if (value) registerArgs.push(name, value);
   }
   const result = await runForeground("bot-register", registerArgs);
+  delete process.env.LARKIN_SETUP_APP_SECRET;
   if (result.code !== 0) die("机器人授权或 Agent 配置未完成");
 
   let agentId: string | undefined;

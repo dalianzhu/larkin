@@ -35,6 +35,7 @@ const routes: Record<string, Route> = {
   model: ["agent-config", "model"],
   runtime: ["agent-config", "runtime"],
   effort: ["agent-config", "effort"],
+  "pi-distribution": ["agent-config", "pi-distribution"],
   chats: ["agent-config", "chats"],
   config: ["agent-config", "config"],
   session: ["session-cli"],
@@ -54,8 +55,8 @@ if (runtimeAgentAuthority && command === "comment") routes.comment = ["lark-cli"
 const commandHelp: Record<string, string> = {
   start: `Usage: larkin start [--agent <App ID> | --agents <App ID,...>]
 Start one foreground supervisor for the daemon and local dashboard, or reuse it.`,
-  setup: `Usage: larkin setup [--runtime <builtin-pi|external-pi|codex|claude>] [--provider <id> --api-key <key>]
-Run setup to create or connect a bot, configure its Agent, and attach it. Interactive terminals keep the guided flow; Agent-driven (non-TTY) runs default to builtin-pi and need --provider/--api-key (or --runtime external-pi).`,
+  setup: `Usage: larkin setup [--tenant feishu|lark] [--runtime <builtin-pi|external-pi|codex|claude>] [--provider <id> --api-key <key>]
+Run setup to create or connect a bot, configure its Agent, and attach it. Choose Feishu or Lark before the authorization QR (--tenant; default feishu). Interactive terminals keep the guided flow; Agent-driven (non-TTY) runs default to builtin-pi and need --provider/--api-key (or --runtime external-pi).`,
   status: `Usage: larkin status [--json]
 Show Agent configuration, bot identity, credentials, and connection status. Use --json for readiness automation.`,
   agents: `Usage: larkin agents [--json]
@@ -64,6 +65,9 @@ List every configured Agent and its current local status. Use --json for daemon/
 Show or change an Agent model.`,
   runtime: `Usage: larkin runtime [<runtime>] [--agent <App ID>] [--model <model>]
 Show or change an Agent runtime.`,
+  "pi-distribution": `Usage: larkin pi-distribution [show|builtin|external] [--agent <App ID>] [--snapshot <private-file>] [--import-external-profile]
+       larkin pi-distribution rollback --snapshot <private-file>
+Show or change one Pi Agent distribution. builtin requires configured provider state, or explicitly imports the external Pi 0.84.2 profile with --import-external-profile; all changes support config-lock CAS rollback.`,
   effort: `Usage: larkin effort [<level>|clear|default] [--agent <App ID>]
 Show or change an Agent reasoning effort; clear/default restores the Runtime default.`,
   chats: `Usage: larkin chats [--agent <App ID>]
@@ -83,7 +87,8 @@ Examples:
 
 Credentials, internal paths, serverId, activeAgent, and raw config are never exposed here.`,
   session: `Usage: larkin session reset --agent <App ID> --json [--wait-ready <seconds>]
-Atomically replace one idle, zero-backlog Agent Runtime session through authenticated local control.`,
+       larkin session recover --agent <App ID> --reason context-overflow --json [--wait-ready <seconds>]
+Reset replaces one idle, zero-backlog Runtime session. Recover is an explicit operator-only context-window recovery that preserves and replays canonical Inbox deliveries.`,
   agent: `Usage: larkin agent enqueue --agent <App ID> --idempotency-key <key>
        --content-file <path|-> --json
 Idempotently enqueue one external automation message through authenticated local control.`,
@@ -91,7 +96,7 @@ Idempotently enqueue one external automation message through authenticated local
        larkin pi-auth logout <provider> [--agent <App ID>]
 Show non-sensitive official Pi credential metadata or remove one target provider credential.`,
   comment: `Usage: larkin comment reply --message-id <doc_comment_message_id> --text '<reply>' --json
-Reply once, as the Runtime-bound Bot, to the exact cloud-document comment locator supplied by canonical Inbox.`,
+Reply as the Runtime-bound Bot to the exact cloud-document comment locator supplied by canonical Inbox. Retrying the same body is idempotent; a different body appends a follow-up reply to the same comment.`,
   telemetry: `Usage: larkin telemetry <status|export|import|flush>
 Inspect the durable local trace queue, move an offline bundle, or upload queued OTLP traces.`,
 };
@@ -140,6 +145,7 @@ Usage: larkin <command>
   config           Inspect effective config/source, edit mention inheritance, or explicitly apply runtime changes
   session reset    Replace one idle, zero-backlog Agent Runtime session for a fresh scenario
   agent enqueue    Idempotently enqueue an external automation message for one Agent
+  session recover  Explicitly recover a context-overflowed session and replay retained Inbox deliveries
   pi-auth          Show non-sensitive built-in Pi auth status or logout one provider
   comment reply    Reply to the exact cloud-document comment bound by a polled Inbox message
   telemetry        Inspect, export, import, or flush the durable OpenTelemetry trace queue

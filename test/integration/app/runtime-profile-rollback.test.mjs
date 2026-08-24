@@ -51,7 +51,7 @@ function fakeOfficialRunner({ fail = false, invalidWorkspace = false } = {}) {
     }] }, null, 2)}\n`, { mode: 0o600 });
     return { status: 0, signal: null, stdout: JSON.stringify({ ok: true, workspace: "lark-channel", app_id: appId, identity: "bot-only" }), stderr: "", error: undefined };
   };
-  return { calls, resolveOfficialCli: () => ({ command: "/usr/local/bin/lark-cli", argsPrefix: [], version: "1.0.79" }), runOfficialCli };
+  return { calls, resolveOfficialCli: () => ({ command: "/usr/local/bin/lark-cli", argsPrefix: [], version: "1.0.80" }), runOfficialCli };
 }
 
 test("profile sync binds one Bot through the verified official lark-channel workspace without argv/stdin secret", () => {
@@ -77,6 +77,20 @@ test("profile sync binds one Bot through the verified official lark-channel work
     assert.equal(fs.statSync(f.sourceFile).mode & 0o777, 0o600);
     loadAndSyncRuntimeAgent({ ...process.env, LARKIN_CONFIG_DIR: f.root, LARKIN_HOME: f.root }, f.target, runner);
     assert.equal(runner.calls.length, 1, "repeated startup/upsert must validate without another bind/keychain call");
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("stale runtime shim content is refreshed without another bind", () => {
+  const f = fixture("stale-runtime-shim");
+  const runner = fakeOfficialRunner();
+  try {
+    const env = { ...process.env, LARKIN_CONFIG_DIR: f.root, LARKIN_HOME: f.root };
+    loadAndSyncRuntimeAgent(env, f.target, runner);
+    const shim = path.join(f.root, "state", "agents", f.target, "runtime-bin", "larkin");
+    fs.writeFileSync(shim, `#!/bin/sh\nexec /obsolete/larkin "$@"\n`, { mode: 0o700 });
+    loadAndSyncRuntimeAgent(env, f.target, runner);
+    assert.equal(runner.calls.length, 1);
+    assert.ok(fs.readFileSync(shim, "utf8").includes(`exec '${process.execPath}`));
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 

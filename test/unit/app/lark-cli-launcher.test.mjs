@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -20,29 +21,43 @@ function fixture(history = { ok: true, identity: "bot", data: { messages: [] } }
   const output = { stdout: "", stderr: "" };
   const calls = [];
   const historyHolder = { value: history };
+  const membersHolder = { value: {
+    ok: true,
+    identity: "bot",
+    data: { users: [{ member_id: "ou_10937ddc38cfd9fd239591c634fed234" }], truncations: [] },
+  } };
   let writeResult = { status: 7, signal: null, output: [], pid: 1,
     stdout: "native-out\n", stderr: "native-err\n", error: undefined };
   const spawn = (command, args, options) => {
     calls.push({ command, args, options });
-    const isHistory = ["+chat-messages-list", "+threads-messages-list"].includes(args[2])
+    const isHistory = ["+chat-messages-list", "+threads-messages-list", "+messages-mget"].includes(args[2])
       || (args[1] === "api" && args[2] === "GET" && args[3] === "/open-apis/im/v1/messages");
     if (args[2] === "+messages-mget" && lookup) {
       return { status: 0, signal: null, output: [], pid: 1, stdout: JSON.stringify(lookup), stderr: "", error: undefined };
     }
-    return isHistory
-      ? { status: 0, signal: null, output: [], pid: 1, stdout: JSON.stringify(historyHolder.value), stderr: "", error: undefined }
-      : writeResult;
+    if (isHistory) {
+      return { status: 0, signal: null, output: [], pid: 1, stdout: JSON.stringify(historyHolder.value), stderr: "", error: undefined };
+    }
+    if (args[2] === "+chat-members-list") {
+      return { status: 0, signal: null, output: [], pid: 1, stdout: JSON.stringify(membersHolder.value), stderr: "", error: undefined };
+    }
+    return writeResult;
   };
   const run = (argv) => {
     output.stdout = "";
     output.stderr = "";
     const code = launcher.runLarkCli(argv, { LARKIN_CONFIG_DIR: root, LARKIN_AGENT_ID: agentId }, {
       io: { stdout(text) { output.stdout += text; }, stderr(text) { output.stderr += text; } },
-      spawn, nativeCommand: { command: process.execPath, argsPrefix: ["/fixed/@larksuite/cli/scripts/run.js"], version: "1.0.79" }, stateStore: store,
+      spawn, nativeCommand: { command: process.execPath, argsPrefix: ["/fixed/@larksuite/cli/scripts/run.js"], version: "1.0.80" }, stateStore: store,
     });
     return { code, ...output };
   };
-  return { root, store, calls, run, setWriteResult(value) { writeResult = value; }, setHistory(value) { historyHolder.value = value; } };
+  return {
+    root, store, calls, run,
+    setWriteResult(value) { writeResult = value; },
+    setHistory(value) { historyHolder.value = value; },
+    setMembers(value) { membersHolder.value = value; },
+  };
 }
 
 test("launcher classifies protected writes, removed drafts, bypasses, and observational help", () => {
@@ -66,7 +81,7 @@ test("launcher classifies protected writes, removed drafts, bypasses, and observ
   ]).kind, "passthrough", "native help remains observational even for unsupported write flags");
 });
 
-test("document comment reply is bound to a polled Inbox locator, Bot identity, exact route, and local idempotency ledger", () => {
+test("document comment reply uses body-hash delivery identity for same-locator follow-ups", () => {
   const f = fixture();
   try {
     const messageId = `doc_comment_${"a".repeat(32)}`;
@@ -97,12 +112,17 @@ test("document comment reply is bound to a polled Inbox locator, Bot identity, e
     assert.equal(duplicate.code, 0);
     assert.match(duplicate.stdout, /"duplicate":true/);
     assert.equal(f.calls.length, 1, "committed reply must not reach the provider twice");
-    assert.equal(f.run(["comment", "reply", "--message-id", messageId, "--text", "changed", "--json"]).code, 2);
-    assert.equal(f.calls.length, 1);
+    const changed = f.run(["comment", "reply", "--message-id", messageId, "--text", "changed", "--json"]);
+    assert.equal(changed.code, 0, changed.stderr);
+    assert.equal(f.calls.length, 2, "a different body appends a follow-up on the same locator");
+    assert.equal(f.calls[1].args.includes("--idempotency-key"), false);
+    const ledger = f.store.readJson("freshnessState", {}).document_comment_replies;
+    assert.equal(Object.keys(ledger).length, 2);
+    assert.ok(Object.keys(ledger).every((key) => key.startsWith(`${messageId}::`)));
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
-test("whole-document Inbox locators select the explicit top-level fallback and reject guessed messages", () => {
+test("whole-document Inbox locators route same-locator follow-ups through create_v2", () => {
   const f = fixture();
   try {
     const messageId = `doc_comment_${"b".repeat(32)}`;
@@ -120,8 +140,17 @@ test("whole-document Inbox locators select the explicit top-level fallback and r
       reply_elements: [{ type: "text", text: "answer" }],
     });
     assert.equal(native[native.indexOf("--as") + 1], "bot");
+    const followUp = f.run(["comment", "reply", "--message-id", messageId, "--text", "follow-up"]);
+    assert.equal(followUp.code, 0, followUp.stderr);
+    assert.equal(f.calls.length, 2);
+    const followUpNative = f.calls[1].args.slice(1);
+    assert.deepEqual(JSON.parse(followUpNative[followUpNative.indexOf("--data") + 1]), {
+      file_type: "sheet",
+      reply_elements: [{ type: "text", text: "follow-up" }],
+    });
+    assert.equal(followUpNative.includes("--idempotency-key"), false);
     assert.equal(f.run(["comment", "reply", "--message-id", `doc_comment_${"c".repeat(32)}`, "--text", "answer"]).code, 2);
-    assert.equal(f.calls.length, 1);
+    assert.equal(f.calls.length, 2);
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
@@ -141,11 +170,18 @@ test("document comment reply retains ambiguous native outcomes as sending and re
       f.store.pollInbox({ target, limit: 1 });
       f.setWriteResult(result);
       assert.notEqual(f.run(["comment", "reply", "--message-id", messageId, "--text", "answer"]).code, 0);
-      assert.equal(f.store.readJson("freshnessState", {}).document_comment_replies[messageId].status, "sending");
+      const ledger = f.store.readJson("freshnessState", {}).document_comment_replies;
+      assert.equal(Object.values(ledger)[0].status, "sending");
+      assert.ok(Object.keys(ledger)[0].startsWith(`${messageId}::`));
       const retry = f.run(["comment", "reply", "--message-id", messageId, "--text", "answer"]);
       assert.equal(retry.code, 2);
       assert.match(retry.stderr, /结果不明确/);
-      assert.equal(f.calls.length, 1, "ambiguous outcome must never resend");
+      assert.equal(f.calls.length, 1, "ambiguous outcome must never resend same body");
+      const changed = f.run(["comment", "reply", "--message-id", messageId, "--text", "changed"]);
+      assert.equal(changed.code, 2);
+      assert.match(changed.stderr, /请勿改写正文重试/);
+      assert.match(changed.stderr, /检查原评论线程/);
+      assert.equal(f.calls.length, 1, "an unresolved body blocks changed-body retries before the provider");
     } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
   }
 
@@ -159,10 +195,53 @@ test("document comment reply retains ambiguous native outcomes as sending and re
       ok: false, error: { code: 1069302, message: "provider rejected" },
     }), error: undefined });
     assert.equal(rejected.run(["comment", "reply", "--message-id", messageId, "--text", "answer"]).code, 7);
-    assert.equal(rejected.store.readJson("freshnessState", {}).document_comment_replies[messageId].status, "failed");
+    const rejectedLedger = rejected.store.readJson("freshnessState", {}).document_comment_replies;
+    assert.equal(Object.values(rejectedLedger)[0].status, "failed");
     assert.equal(rejected.run(["comment", "reply", "--message-id", messageId, "--text", "answer"]).code, 7);
     assert.equal(rejected.calls.length, 2, "definitive provider rejection may be retried");
+    assert.equal(rejected.run(["comment", "reply", "--message-id", messageId, "--text", "changed"]).code, 7);
+    assert.equal(rejected.calls.length, 3, "a changed body is allowed once all prior identities are terminal");
   } finally { fs.rmSync(rejected.root, { recursive: true, force: true }); }
+});
+
+test("comment reply rejects synthetic idempotency keys without invoking the provider", () => {
+  const f = fixture();
+  try {
+    const messageId = `doc_comment_${"f".repeat(32)}`;
+    const target = "document-comment:docx:doc_tokenF:comment_F:in-thread";
+    f.store.appendInboxOnce({ message_id: messageId, target, kind: "document_comment", content: "question" });
+    f.store.pollInbox({ target, limit: 1 });
+    const result = f.run(["comment", "reply", "--message-id", messageId, "--text", "answer", "--idempotency-key", "legacy-key"]);
+    assert.equal(result.code, 2);
+    assert.match(result.stderr, /不支持参数 --idempotency-key/);
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.store.readJson("freshnessState", {}).document_comment_replies, undefined);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("legacy bare message-id ledger entries migrate by same digest and allow follow-ups", () => {
+  const f = fixture();
+  try {
+    const messageId = `doc_comment_${"7".repeat(32)}`;
+    const target = "document-comment:docx:doc_tokenG:comment_G:in-thread";
+    const text = "legacy answer";
+    f.store.appendInboxOnce({ message_id: messageId, target, kind: "document_comment", content: "question" });
+    f.store.pollInbox({ target, limit: 1 });
+    f.store.writeJson("freshnessState", { version: 1, cursors: {}, document_comment_replies: {
+      [messageId]: { digest: createHash("sha256").update(text).digest("hex"), status: "sent", updated_at: new Date().toISOString() },
+    }});
+    const duplicate = f.run(["comment", "reply", "--message-id", messageId, "--text", text]);
+    assert.equal(duplicate.code, 0, duplicate.stderr);
+    assert.match(duplicate.stdout, /"duplicate":true/);
+    assert.equal(f.calls.length, 0);
+    f.setWriteResult({ status: 0, signal: null, output: [], pid: 1, stdout: "{}\n", stderr: "", error: undefined });
+    const followUp = f.run(["comment", "reply", "--message-id", messageId, "--text", "new answer"]);
+    assert.equal(followUp.code, 0, followUp.stderr);
+    assert.equal(f.calls.length, 1);
+    const ledger = f.store.readJson("freshnessState", {}).document_comment_replies;
+    assert.equal(ledger[messageId].status, "sent");
+    assert.equal(Object.keys(ledger).length, 2);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
 test("guarded writes probe with locked Bot identity before preserving provider write bytes", () => {
@@ -306,7 +385,6 @@ test("forward merge urgent and raw/API write surfaces remain denied before spawn
       ["im", "messages", "reply", "--data", "{}"],
       ["im", "messages", "forward", "--message-id", "om_a"],
       ["im", "messages", "merge_forward", "--message-id", "om_a"],
-      ["im", "messages", "urgent_app", "--message-id", "om_a"],
       ["im", "messages", "urgent_phone", "--message-id", "om_a"],
       ["im", "messages", "urgent_sms", "--message-id", "om_a"],
       ["im", "threads", "forward", "--message-id", "om_a"],
@@ -314,6 +392,314 @@ test("forward merge urgent and raw/API write surfaces remain denied before spawn
     ]) assert.equal(f.run(argv).code, 2, argv.join(" "));
     assert.equal(f.calls.length, 0);
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+function ownBotMessage(overrides = {}) {
+  return {
+    message_id: "om_own_urgent",
+    chat_id: "oc_urgent",
+    create_time: "1786957010773",
+    sender: { id: "cli_nativeLarkA1", id_type: "app_id", sender_type: "app" },
+    ...overrides,
+  };
+}
+
+function urgentArgv(overrides = {}) {
+  return [
+    "im", "messages", "urgent_app",
+    "--message-id", overrides.messageId ?? "om_own_urgent",
+    "--user-id-type", overrides.userIdType ?? "open_id",
+    "--data", overrides.data ?? JSON.stringify({ user_id_list: ["ou_10937ddc38cfd9fd239591c634fed234"] }),
+  ];
+}
+
+function seedUrgentCursor(store, revisionTime = "1786957010773", messageIds = ["om_own_urgent"]) {
+  store.mergeFreshnessCursor("feishu.im/chat/oc_urgent", {
+    schema: 1, revisionTime, messageIds,
+  }, (seen, current) => current ?? seen);
+}
+
+test("protected urgent-app classifies as guarded and keeps invented shortcut denied", () => {
+  assert.equal(launcher.classifyLarkCliCommand(urgentArgv()).kind, "guarded");
+  assert.equal(launcher.classifyLarkCliCommand(urgentArgv()).operation, "urgent-app");
+  assert.equal(launcher.classifyLarkCliCommand(["im", "+messages-urgent-app", "--message-id", "om_own_urgent"]).kind, "denied");
+  assert.equal(launcher.classifyLarkCliCommand(["im", "messages", "urgent_phone", "--message-id", "om_own_urgent"]).kind, "denied");
+  assert.equal(launcher.classifyLarkCliCommand([...urgentArgv(), "--dry-run"]).kind, "passthrough");
+  assert.equal(launcher.classifyLarkCliCommand([...urgentArgv(), "--help"]).kind, "passthrough");
+});
+
+test("protected urgent-app probes freshness then spawns native urgent_app for the bot's own message", () => {
+  const f = fixture({
+    ok: true,
+    identity: "bot",
+    data: { messages: [ownBotMessage()] },
+  });
+  try {
+    seedUrgentCursor(f.store);
+    f.setWriteResult({
+      status: 0, signal: null, output: [], pid: 1,
+      stdout: `${JSON.stringify({ ok: true, identity: "bot", data: { invalid_user_id_list: [] } })}\n`,
+      stderr: "", error: undefined,
+    });
+    const sent = f.run(urgentArgv());
+    assert.equal(sent.code, 0, sent.stderr);
+    const lookup = f.calls.find((call) => call.args[2] === "+messages-mget");
+    assert.ok(lookup, "urgent_app must resolve the native message before freshness");
+    assert.equal(lookup.args[lookup.args.indexOf("--message-ids") + 1], "om_own_urgent");
+    const memberCall = f.calls.find((call) => call.args[2] === "+chat-members-list");
+    assert.ok(memberCall, "urgent-app must probe chat members before write");
+    assert.equal(memberCall.args[memberCall.args.indexOf("--chat-id") + 1], "oc_urgent");
+    assert.equal(memberCall.args[memberCall.args.indexOf("--member-id-type") + 1], "open_id");
+    assert.equal(memberCall.args[memberCall.args.indexOf("--page-limit") + 1], "0");
+    const writeCall = f.calls.find((call) => call.args[2] === "messages" && call.args[3] === "urgent_app");
+    assert.ok(writeCall, "native urgent_app must be spawned after freshness");
+    const write = writeCall.args.slice(1);
+    assert.deepEqual(write.slice(0, 3), ["im", "messages", "urgent_app"]);
+    assert.equal(write.includes("+messages-urgent-app"), false);
+    assert.equal(write.includes("--idempotency-key"), false);
+    assert.equal(write[write.indexOf("--message-id") + 1], "om_own_urgent");
+    assert.equal(write[write.indexOf("--user-id-type") + 1], "open_id");
+    assert.equal(write[write.indexOf("--as") + 1], "bot");
+    assert.deepEqual(JSON.parse(write[write.indexOf("--data") + 1]), {
+      user_id_list: ["ou_10937ddc38cfd9fd239591c634fed234"],
+    });
+    const again = f.run([...urgentArgv(), "--idempotency-key", "forced-urgent-key"]);
+    assert.equal(again.code, 0, again.stderr);
+    const writes = f.calls.filter((call) => call.args[2] === "messages" && call.args[3] === "urgent_app");
+    assert.equal(writes.length, 2);
+    assert.equal(writes[1].args.includes("--idempotency-key"), false);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("protected urgent-app fails closed for foreign, synthetic, malformed, and unseen messages", () => {
+  const f = fixture({
+    ok: true,
+    identity: "bot",
+    data: { messages: [
+      ownBotMessage(),
+      ownBotMessage({ message_id: "om_other", sender: { id: "ou_human", sender_type: "user" } }),
+      ownBotMessage({ message_id: "om_other_app", sender: { id: "cli_otherAppA1", id_type: "app_id", sender_type: "app" } }),
+    ] },
+  });
+  try {
+    seedUrgentCursor(f.store, "1786957010773", ["om_own_urgent", "om_other", "om_other_app"]);
+    for (const argv of [
+      urgentArgv({ messageId: "om_other" }),
+      urgentArgv({ messageId: "om_other_app" }),
+      urgentArgv({ messageId: "rem_not_a_message" }),
+      urgentArgv({ messageId: "om_missing" }),
+      urgentArgv({ userIdType: "user_id" }),
+      urgentArgv({ data: JSON.stringify({ user_id_list: ["not-an-open-id"] }) }),
+      urgentArgv({ data: JSON.stringify({ user_id_list: ["ou_not_in_chat"] }) }),
+      urgentArgv({ data: JSON.stringify({ user_id_list: ["ou_10937ddc38cfd9fd239591c634fed234", "ou_not_in_chat"] }) }),
+      [...urgentArgv(), "--data", JSON.stringify({ user_id_list: ["ou_not_in_chat"] })],
+      [...urgentArgv(), "--user-id-type", "user_id"],
+      ["im", "+messages-urgent-app", "--message-id", "om_own_urgent", "--user-id-type", "open_id", "--data", JSON.stringify({ user_id_list: ["ou_10937ddc38cfd9fd239591c634fed234"] })],
+    ]) {
+      const before = f.calls.length;
+      assert.equal(f.run(argv).code, 2, argv.join(" "));
+      assert.equal(f.calls.slice(before).some((call) => call.args[2] === "urgent_app"), false, argv.join(" "));
+    }
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("protected urgent-app fails closed when member probe is truncated or native returns invalid users", () => {
+  const f = fixture({
+    ok: true,
+    identity: "bot",
+    data: { messages: [ownBotMessage()] },
+  });
+  try {
+    seedUrgentCursor(f.store);
+    f.setMembers({
+      ok: true,
+      identity: "bot",
+      data: { users: [{ member_id: "ou_10937ddc38cfd9fd239591c634fed234" }], has_more: true, truncations: [] },
+    });
+    const incomplete = f.run(urgentArgv());
+    assert.equal(incomplete.code, 2, incomplete.stderr);
+    assert.match(incomplete.stderr, /incomplete/);
+    assert.equal(f.calls.some((call) => call.args[2] === "messages" && call.args[3] === "urgent_app"), false);
+    f.setMembers({
+      ok: true,
+      identity: "bot",
+      data: { users: [{ member_id: "ou_10937ddc38cfd9fd239591c634fed234" }], truncations: ["users"] },
+    });
+    const truncated = f.run(urgentArgv());
+    assert.equal(truncated.code, 2, truncated.stderr);
+    assert.match(truncated.stderr, /truncated/);
+    assert.equal(f.calls.some((call) => call.args[2] === "messages" && call.args[3] === "urgent_app"), false);
+
+    f.setMembers({
+      ok: true,
+      identity: "bot",
+      data: { users: [{ member_id: "ou_10937ddc38cfd9fd239591c634fed234" }], truncations: [] },
+    });
+    f.setWriteResult({
+      status: 0, signal: null, output: [], pid: 1,
+      stdout: `${JSON.stringify({ ok: true, identity: "bot", data: { invalid_user_id_list: ["ou_10937ddc38cfd9fd239591c634fed234"] } })}\n`,
+      stderr: "", error: undefined,
+    });
+    const invalid = f.run(urgentArgv());
+    assert.equal(invalid.code, 2, invalid.stderr);
+    assert.match(invalid.stderr, /invalid_user_id_list/);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("protected urgent-app does not submit after a freshness conflict", () => {
+  const f = fixture({
+    ok: true,
+    identity: "bot",
+    data: { messages: [ownBotMessage({ create_time: "1786957010774" })] },
+  });
+  try {
+    f.store.mergeFreshnessCursor("feishu.im/chat/oc_urgent", {
+      schema: 1, revisionTime: "1786957010773", messageIds: ["om_seen"],
+    }, (seen, current) => current ?? seen, "gen");
+    const conflicted = f.run(urgentArgv());
+    assert.equal(conflicted.code, 3, conflicted.stderr);
+    assert.match(conflicted.stderr, /freshness_conflict/);
+    assert.equal(f.calls.some((call) => call.args[2] === "urgent_app"), false);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("canonical send audit records failure and allows a later successful retry", () => {
+  const f = fixture();
+  try {
+    const reminderId = "reminder-cli-audit";
+    f.store.appendNdjson("inbox", { kind: "reminder", message_id: "rem_cli_audit", target: "runtime:reminder",
+      reminderId, deliveryTarget: "chat:oc_cli_audit", content: "reminder" });
+    f.store.pollInbox({ target: "runtime:reminder", limit: 1 });
+    f.store.writeJson("reminders", { reminders: [{ reminderId, status: "fired", fireAt: "2026-07-16T02:00:00.000Z",
+      events: [{ eventType: "delivery_pending" }] }] });
+    const argv = ["im", "+messages-send", "--chat-id", "oc_cli_audit", "--text", "reminder"];
+    f.setWriteResult({ status: 7, signal: null, output: [], pid: 1, stdout: "", stderr: "provider down", error: undefined });
+    assert.equal(f.run(argv).code, 7);
+    let reminder = JSON.parse(fs.readFileSync(f.store.paths.reminders, "utf8")).reminders[0];
+    assert.equal(reminder.events.at(-1).eventType, "delivery_failed");
+    f.setWriteResult({ status: 0, signal: null, output: [], pid: 1,
+      stdout: JSON.stringify({ ok: true, data: { message_id: "om_cli_audit_success" } }), stderr: "", error: undefined });
+    assert.equal(f.run(argv).code, 0);
+    reminder = JSON.parse(fs.readFileSync(f.store.paths.reminders, "utf8")).reminders[0];
+    assert.equal(reminder.events.at(-1).eventType, "delivery_succeeded");
+    assert.equal(reminder.events.at(-1).metadata.messageId, "om_cli_audit_success");
+    assert.equal(f.store.resolveCurrentReminder(), null);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a recurring reminder provider duplicate is not recorded as success for the later firing", () => {
+  const f = fixture();
+  try {
+    const reminderId = "reminder-recurring-duplicate";
+    const argv = ["im", "+messages-send", "--chat-id", "oc_recurring_duplicate", "--text", "reminder"];
+    f.store.appendNdjson("inbox", { kind: "reminder", message_id: "rem_occurrence_1", target: "runtime:reminder",
+      reminderId, deliveryTarget: "chat:oc_recurring_duplicate", content: "reminder" });
+    f.store.pollInbox({ target: "runtime:reminder", limit: 1 });
+    f.store.writeJson("reminders", { reminders: [{ reminderId, status: "scheduled", repeat: "every:1h",
+      fireAt: "2026-07-16T03:00:00.000Z", events: [{ eventType: "delivery_pending" }] }] });
+    f.setWriteResult({ status: 0, signal: null, output: [], pid: 1,
+      stdout: JSON.stringify({ ok: true, data: { message_id: "om_recurring_first" } }), stderr: "", error: undefined });
+    assert.equal(f.run(argv).code, 0);
+    assert.equal(JSON.parse(fs.readFileSync(f.store.paths.reminders, "utf8")).reminders[0].events.at(-1).eventType, "delivery_succeeded");
+
+    f.store.appendNdjson("inbox", { kind: "reminder", message_id: "rem_occurrence_2", target: "runtime:reminder",
+      reminderId, deliveryTarget: "chat:oc_recurring_duplicate", content: "reminder" });
+    f.store.pollInbox({ target: "runtime:reminder", limit: 1 });
+    const reminders = f.store.readJson("reminders", { reminders: [] });
+    reminders.reminders[0].events = [
+      { eventType: "delivery_pending", metadata: { occurrenceId: "rem_occurrence_1" } },
+      { eventType: "delivery_pending", metadata: { occurrenceId: "rem_occurrence_2" } },
+    ];
+    f.store.writeJson("reminders", reminders);
+    const inboxState = f.store.readJson("inboxState", {});
+    inboxState.reminder_contexts = [
+      { reminder_id: reminderId, delivery_target: "chat:oc_recurring_duplicate", message_id: "rem_occurrence_1", seq: 1 },
+      { reminder_id: reminderId, delivery_target: "chat:oc_recurring_duplicate", message_id: "rem_occurrence_2", seq: 2 },
+    ];
+    f.store.writeJson("inboxState", inboxState);
+    f.setHistory({ ok: true, identity: "bot", data: { messages: [
+      { message_id: "om_recurring_first", chat_id: "oc_recurring_duplicate", create_time: "1786553650354" },
+    ] } });
+    f.setWriteResult({ status: 0, signal: null, output: [], pid: 1,
+      stdout: JSON.stringify({ ok: true, data: { message_id: "om_recurring_first" } }), stderr: "", error: undefined });
+    assert.equal(f.run(argv).code, 3, "the new provider head must be reconciled before retrying the write");
+    const duplicate = f.run(argv);
+    assert.equal(duplicate.code, 0, duplicate.stderr);
+    const reminder = JSON.parse(fs.readFileSync(f.store.paths.reminders, "utf8")).reminders[0];
+    assert.equal(reminder.events.at(-1).eventType, "delivery_failed");
+    assert.equal(reminder.events.at(-1).metadata.occurrenceId, "rem_occurrence_2",
+      "the audit must finalize the same occurrence selected for the write memo");
+    assert.match(reminder.events.at(-1).metadata.reason, /earlier reminder firing/);
+    assert.ok(f.store.resolveCurrentReminder(), "the later occurrence remains auditable after provider deduplication");
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a recurring document-comment duplicate fails the later firing without a provider call", () => {
+  const f = fixture();
+  try {
+    const reminderId = "reminder-recurring-comment-duplicate";
+    const target = "document-comment:docx:doc_comment_file:doc_comment_anchor:in-thread";
+    const anchor = `doc_comment_${"e".repeat(32)}`;
+    const argv = ["comment", "reply", "--message-id", anchor, "--text", "same comment"];
+    f.store.bindInboxDeliveryAnchor(anchor, target);
+    f.store.appendNdjson("inbox", { kind: "reminder", message_id: "rem_comment_occurrence_1", target: "runtime:reminder",
+      reminderId, deliveryTarget: target, deliveryAnchor: anchor, content: "reminder" });
+    f.store.pollInbox({ target: "runtime:reminder", limit: 1 });
+    f.store.writeJson("reminders", { reminders: [{ reminderId, status: "scheduled", repeat: "every:1h",
+      fireAt: "2026-07-16T03:00:00.000Z", events: [{ eventType: "delivery_pending", metadata: { occurrenceId: "rem_comment_occurrence_1" } }] }] });
+    f.setWriteResult({ status: 0, signal: null, output: [], pid: 1,
+      stdout: JSON.stringify({ ok: true, data: {} }), stderr: "", error: undefined });
+    assert.equal(f.run(argv).code, 0);
+
+    f.store.bindInboxDeliveryAnchor(anchor, target);
+    f.store.appendNdjson("inbox", { kind: "reminder", message_id: "rem_comment_occurrence_2", target: "runtime:reminder",
+      reminderId, deliveryTarget: target, deliveryAnchor: anchor, content: "reminder" });
+    f.store.pollInbox({ target: "runtime:reminder", limit: 1 });
+    const reminders = f.store.readJson("reminders", { reminders: [] });
+    reminders.reminders[0].events.push({ eventType: "delivery_pending", metadata: { occurrenceId: "rem_comment_occurrence_2" } });
+    f.store.writeJson("reminders", reminders);
+    const providerCallsBefore = f.calls.filter((call) => call.args[0] === "drive").length;
+    const duplicate = f.run(argv);
+    assert.equal(duplicate.code, 2, duplicate.stderr);
+    assert.equal(f.calls.filter((call) => call.args[0] === "drive").length, providerCallsBefore, "the sent ledger skips the provider");
+    const reminder = f.store.readJson("reminders", { reminders: [] }).reminders[0];
+    assert.equal(reminder.events.at(-1).eventType, "delivery_failed");
+    assert.match(reminder.events.at(-1).metadata.reason, /earlier reminder firing/);
+    assert.deepEqual(f.store.resolveCurrentReminders().map((row) => row.deliveryAnchor), ["rem_comment_occurrence_2"]);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("canonical reply and document comment reply audit the consumed reminder", () => {
+  for (const mode of ["reply", "comment"]) {
+    const f = fixture();
+    try {
+      const reminderId = `reminder-cli-${mode}`;
+      const target = mode === "reply" ? "chat:oc_cli_reply_audit" : "document-comment:docx:doc_cli_audit:comment_cli_audit:in-thread";
+      const anchor = mode === "reply" ? "om_cli_reply_anchor" : `doc_comment_${"d".repeat(32)}`;
+      if (mode === "reply") {
+        f.store.appendNdjson("inbox", { message_id: anchor, chat_id: "oc_cli_reply_audit", content: "question" });
+        f.store.pollInbox({ target, limit: 1 });
+      } else {
+        f.store.appendNdjson("inbox", { message_id: anchor, target, kind: "document_comment", content: "question" });
+        f.store.pollInbox({ target, limit: 1 });
+      }
+      f.store.appendNdjson("inbox", { kind: "reminder", message_id: `rem_${mode}_audit`, target: "runtime:reminder",
+        reminderId, deliveryTarget: target, content: "reminder" });
+      f.store.pollInbox({ target: "runtime:reminder", limit: 1 });
+      f.store.writeJson("reminders", { reminders: [{ reminderId, status: "fired", fireAt: "2026-07-16T02:00:00.000Z",
+        events: [{ eventType: "delivery_pending" }] }] });
+      f.setWriteResult({ status: 0, signal: null, output: [], pid: 1,
+        stdout: JSON.stringify({ ok: true, data: mode === "reply" ? { message_id: "om_cli_reply_success" } : {} }), stderr: "", error: undefined });
+      const argv = mode === "reply"
+        ? ["im", "+messages-reply", "--message-id", anchor, "--text", "reply"]
+        : ["comment", "reply", "--message-id", anchor, "--text", "comment"];
+      const result = f.run(argv);
+      assert.equal(result.code, 0, `${mode}: ${result.stderr}`);
+      const reminder = JSON.parse(fs.readFileSync(f.store.paths.reminders, "utf8")).reminders[0];
+      assert.equal(reminder.events.at(-1).eventType, "delivery_succeeded", mode);
+      assert.equal(f.store.resolveCurrentReminder(), null, mode);
+    } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+  }
 });
 
 test("provider failure and ambiguous termination retain a stable idempotency key", () => {

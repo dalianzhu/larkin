@@ -58,10 +58,10 @@ function writeOfficialLarkCli(mockBin) {
   const launcher = path.join(packageDir, "scripts", "run.sh");
   fs.mkdirSync(path.dirname(launcher), { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(packageDir, "package.json"), JSON.stringify({
-    name: "@larksuite/cli", version: "1.0.79", bin: { "lark-cli": "scripts/run.sh" },
+    name: "@larksuite/cli", version: "1.0.80", bin: { "lark-cli": "scripts/run.sh" },
   }), { mode: 0o600 });
   fs.writeFileSync(launcher, `#!/bin/sh
-if [ "$1" = "--version" ]; then printf '1.0.79\n'; exit 0; fi
+if [ "$1" = "--version" ]; then printf '1.0.80\n'; exit 0; fi
 if [ "$1" = "config" ] && [ "$2" = "bind" ] && [ "$3" = "--help" ]; then
   printf '%s\n' 'Usage: config bind --source lark-channel --identity bot-only'; exit 0
 fi
@@ -77,16 +77,18 @@ exit 0
 
 const piFixture = `import fs from "node:fs";
 import readline from "node:readline";
-if (process.argv.includes("--version")) { console.log("0.83.0"); process.exit(0); }
+if (process.argv.includes("--version")) { console.log("0.84.2"); process.exit(0); }
 const marker = process.env.PI_PREFLIGHT_MARKER;
 const record = (value) => fs.appendFileSync(marker, JSON.stringify(value) + "\\n");
 const output = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
-const model = { provider: "fixture", id: "pi-preflight", reasoning: false, contextWindow: 32000 };
+const model = { provider: "fixture", id: "pi-preflight", reasoning: false, contextWindow: 272000 };
 record({ type: "launch", args: process.argv.slice(2) });
 readline.createInterface({ input: process.stdin }).on("line", (line) => {
   const request = JSON.parse(line);
   if (request.type === "get_state") return output({ id: request.id, type: "response", command: request.type, success: true,
-    data: { sessionId: "PRIVATE_STANDALONE_SESSION", model, thinkingLevel: "off", isStreaming: false } });
+    data: { sessionId: "PRIVATE_STANDALONE_SESSION", model, thinkingLevel: "off", isStreaming: false,
+      autoCompactionEnabled: true, compactionCapabilities: { reserveTokens: 40800, keepRecentTokens: 20000,
+        events: ["compaction_start", "compaction_end", "agent_end", "agent_settled"] } } });
   if (request.type === "get_available_models") return output({ id: request.id, type: "response", command: request.type, success: true,
     data: { models: [model] } });
   if (request.type !== "prompt") return;

@@ -14,8 +14,14 @@ import {
   requirePiResumeSessionFile,
   resolvePiProcessExtensionArgs,
 } from "../../../dist/runtime/runtime-adapters.mjs";
+import {
+  buildCanonicalPiSubagentAssistantMessage,
+  buildCanonicalPiSubagentNotificationContent,
+} from "../../../dist/runtime/pi-subagents-notification.mjs";
+import { classifyStrictProviderError } from "../../../dist/runtime/provider-error-classifier.mjs";
 
 const fakeProcesses = new Set();
+const temporaryRoots = new Set();
 
 afterEach(() => {
   for (const child of fakeProcesses) {
@@ -24,6 +30,8 @@ afterEach(() => {
     child.stderr.destroy();
   }
   fakeProcesses.clear();
+  for (const root of temporaryRoots) fs.rmSync(root, { recursive: true, force: true });
+  temporaryRoots.clear();
 });
 
 class FakeProcess extends EventEmitter {
@@ -51,6 +59,56 @@ const create = (overrides = {}) => ({
   model: "test-model",
   ...overrides,
 });
+
+function makeProductionPiCommand(root, mode = "stable") {
+  const log = path.join(root, "pi-rpc.log");
+  const script = path.join(root, "fake-pi.mjs");
+  fs.writeFileSync(script, `import fs from "node:fs";
+const args = process.argv.slice(2);
+const log = process.env.LARKIN_PI_TEST_LOG;
+const probe = args.includes("--no-session");
+let stateRequests = 0;
+const record = (value) => fs.appendFileSync(log + "." + process.pid, JSON.stringify(value) + "\\n");
+record({ kind: "argv", probe, args });
+if (args.includes("--version")) { process.stdout.write("0.84.2\\n"); process.exit(0); }
+const respond = (request, data) => process.stdout.write(JSON.stringify({ type: "response", id: request.id, command: request.type, success: true, data }) + "\\n");
+const state = () => {
+  stateRequests += 1;
+  const drift = !probe && stateRequests > 1;
+  const contextWindow = ${mode === "context-mismatch" ? 'probe ? 333333 : 333334' : mode === "context-revalidate" ? 'drift ? 333334 : 333333' : '333333'};
+  const model = ${mode === "model-mismatch" ? 'probe ? { provider: "test-provider", id: "test-model" } : { provider: "other-provider", id: "other-model" }' : mode === "model-revalidate" ? 'drift ? { provider: "other-provider", id: "other-model" } : { provider: "test-provider", id: "test-model" }' : '{ provider: "test-provider", id: "test-model" }'};
+  const autoCompactionEnabled = ${mode === "auto-revalidate" ? 'drift ? false : true' : 'true'};
+  return { sessionId: "production-session", model: { ...model, contextWindow }, autoCompactionEnabled, thinkingLevel: "medium", compactionCapabilities: { reserveTokens: 50000, keepRecentTokens: 20000, events: ["compaction_start", "compaction_end", "agent_end", "agent_settled"] } };
+};
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk.toString();
+  while (true) {
+    const newline = buffer.indexOf("\\n");
+    if (newline < 0) break;
+    const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+    const request = JSON.parse(line); record({ kind: "request", probe, type: request.type });
+    if (request.type === "get_state") respond(request, state());
+    else if (request.type === "get_available_models") respond(request, { models: [{ provider: "test-provider", id: "test-model" }] });
+    else if (request.type === "prompt" || request.type === "steer" || request.type === "compact") respond(request, {});
+    else respond(request, {});
+  }
+});
+`, { mode: 0o600 });
+  temporaryRoots.add(root);
+  return { command: process.execPath, commandArgs: [script], log };
+}
+
+function readProductionPiLog(log) {
+  return fs.readdirSync(path.dirname(log)).filter((name) => name.startsWith(`${path.basename(log)}.`))
+    .flatMap((name) => fs.readFileSync(path.join(path.dirname(log), name), "utf8").trim().split(/\r?\n|\\n/).filter(Boolean).map((line) => JSON.parse(line)));
+}
+
+function clearProductionPiLog(log) {
+  for (const name of fs.readdirSync(path.dirname(log)).filter((entry) => entry.startsWith(`${path.basename(log)}.`))) {
+    fs.rmSync(path.join(path.dirname(log), name), { force: true });
+  }
+}
 
 async function startedCodexTurn(inputId = "input-A", turnId = "turn-A") {
   const child = new FakeProcess();
@@ -92,8 +150,13 @@ test("context prompt is capability-driven, versioned and produces bounded notifi
 
 test("default context prompt consumes the Agent CLI manifest", () => {
   const prompt = new ContextPromptBuilder().build({ agentId: "cli_test", runtime: "pi" });
-  assert.equal(prompt.version, "larkin-standing-v19");
+  assert.equal(prompt.version, "larkin-standing-v23");
+  assert.match(prompt.content, /never emit feishu\.cn for a Lark tenant/);
   assert.match(prompt.content, /larkin reminder schedule/);
+  assert.match(prompt.content, /explicit delivery target/);
+  assert.match(prompt.content, /Never infer recipients from a reminder title/);
+  assert.match(prompt.content, /at most one bounded wait call per turn/);
+  assert.match(prompt.content, /do not loop or call wait again in the same turn/);
   assert.match(prompt.content, /larkin reminder cancel/);
   assert.match(prompt.content, /larkin interaction resolve/);
   assert.match(prompt.content, /larkin comment reply --message-id/);
@@ -195,10 +258,17 @@ test("default context prompt consumes the Agent CLI manifest", () => {
   assert.doesNotMatch(prompt.content, /oc_eval_exact|om_eval_anchor|原文：“修复 A\/B”|收到：“A\/B”|引用：“抢到”|消息原文：“保持”/);
 });
 
-test("Codex, Claude and Pi receive the markdown-default standing contract", async () => {
+test("Codex, Claude and Pi receive the clickable-link and exact-content standing contracts", async () => {
   const standingPrompt = (runtime) => new ContextPromptBuilder().build({ agentId: "cli_test", runtime });
   const assertContract = (content) => {
     assert.match(content, /regular textual message bodies.*`--markdown`/i);
+    assert.match(content, /URL must be visible, clickable, or openable.*complete bare `https:\/\/\.\.\.` URL.*visible text/i);
+    assert.match(content, /Do not rely solely on `\[label\]\(URL\)`.*Feishu client rendering is unreliable/i);
+    assert.match(content, /label may also be included.*bare URL must remain present/i);
+    assert.match(content, /Never rewrite or normalize.*exact or verbatim user-supplied body.*existing exact-content paths.*authoritative.*unchanged/i);
+    assert.match(content, /exact text supplied directly.*body unchanged as one literal `--text` argument/i);
+    assert.match(content, /explicit exact or verbatim direct literal uses `--text`.*overrides.*markdown default/i);
+    assert.match(content, /tool-sourced exact or verbatim text.*deterministic native `--jq`.*`--content`/i);
     assert.match(content, /native `--text`.*logs.*code.*exact whitespace/i);
     assert.doesNotMatch(content, /rejected|--literal-text/i);
     assert.doesNotMatch(content, /use `--text` for brief single-line replies/i);
@@ -289,6 +359,216 @@ test("Codex native notifications normalize start, intermediate output, and termi
   assert.deepEqual(events.filter((event) => ["turn-start", "activity", "turn-end"].includes(event.type))
     .map((event) => event.type === "activity" ? `${event.type}:${event.activity}` : event.type),
   ["turn-start", "activity:thinking", "activity:text", "turn-end"]);
+});
+
+test("Pi canonical late completion notifications bridge once and ignore assistant lookalikes", async () => {
+  let listener;
+  const sdk = {
+    sessionId: "pi-late-complete", prompt() {}, steer() {}, abort() {},
+    subscribe(next) { listener = next; return () => {}; },
+  };
+  const session = await createNativeRuntimeAdapter("pi", {
+    createPiSession: async () => sdk,
+    env: { LARKIN_PI_DISTRIBUTION: "builtin" },
+  }).createSession(create());
+  const events = [];
+  session.subscribe((event) => events.push(event));
+  const canonical = buildCanonicalPiSubagentAssistantMessage({
+    taskId: "task-bridge-1",
+    toolUseId: "tool-use-bridge-1",
+    outputFile: "/tmp/task-bridge-1.output",
+    summary: "Agent \"fixture\" completed",
+    result: "Fixture result.",
+  });
+  listener({ type: "agent_end", willRetry: false, messages: [canonical] });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events.filter((event) => ["turn-start", "turn-end"].includes(event.type)), []);
+  assert.deepEqual(events.filter((event) => event.type === "runtime-observation"), [],
+    "unowned agent_end must not emit the completion bridge while Pi can still reject prompts");
+  listener({ type: "agent_settled" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const observations = events.filter((event) => event.type === "runtime-observation");
+  assert.deepEqual(observations.map((event) => event.phase), ["completed"]);
+  assert.equal(observations[0].completionKey, "task-bridge-1");
+});
+
+test("Pi assistant text lookalikes do not trigger the late completion bridge", async () => {
+  let listener;
+  const sdk = {
+    sessionId: "pi-late-complete-lookalike", prompt() {}, steer() {}, abort() {},
+    subscribe(next) { listener = next; return () => {}; },
+  };
+  const session = await createNativeRuntimeAdapter("pi", {
+    createPiSession: async () => sdk,
+    env: { LARKIN_PI_DISTRIBUTION: "builtin" },
+  }).createSession(create());
+  const events = [];
+  session.subscribe((event) => events.push(event));
+  for (const content of ["ordinary assistant text mentioning subagent-notification", "ordinary assistant text mentioning not-subagent-notification"]) {
+    listener({ type: "agent_end", willRetry: false, messages: [{ role: "assistant", stopReason: "stop", content }] });
+    listener({ type: "agent_settled" });
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events.filter((event) => event.type !== "session-init"), []);
+});
+
+test("Pi failed and aborted late notifications still bridge a completion key", async () => {
+  let listener;
+  const sdk = {
+    sessionId: "pi-late-complete-failed",
+    prompt() {}, steer() {}, abort() {},
+    subscribe(next) { listener = next; return () => {}; },
+  };
+  const session = await createNativeRuntimeAdapter("pi", {
+    createPiSession: async () => sdk,
+    env: { LARKIN_PI_DISTRIBUTION: "builtin" },
+  }).createSession(create());
+  const events = [];
+  session.subscribe((event) => events.push(event));
+  listener({
+    type: "agent_end",
+    willRetry: false,
+    messages: [buildCanonicalPiSubagentAssistantMessage({
+      taskId: "task-aborted-bridge",
+      status: "Aborted (max turns exceeded)",
+      summary: "Agent \"fixture\" aborted (aborted — hit the turn limit before completion; output may be incomplete)",
+      result: "partial",
+    })],
+  });
+  listener({ type: "agent_settled" });
+  listener({
+    type: "agent_end",
+    willRetry: false,
+    messages: [buildCanonicalPiSubagentAssistantMessage({
+      taskId: "task-error-bridge",
+      status: "Error: provider failed",
+      summary: "Agent \"fixture\" error",
+      result: "failed",
+    })],
+  });
+  listener({ type: "agent_settled" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const observations = events.filter((event) => event.type === "runtime-observation");
+  assert.deepEqual(observations.map((event) => event.phase), ["completed", "completed"]);
+  assert.deepEqual(observations.map((event) => event.completionKey), ["task-aborted-bridge", "task-error-bridge"]);
+});
+
+test("Pi mixed-status late notification groups keep terminal successes", async () => {
+  let listener;
+  const sdk = {
+    sessionId: "pi-late-complete-mixed",
+    prompt() {}, steer() {}, abort() {},
+    subscribe(next) { listener = next; return () => {}; },
+  };
+  const session = await createNativeRuntimeAdapter("pi", {
+    createPiSession: async () => sdk,
+    env: { LARKIN_PI_DISTRIBUTION: "builtin" },
+  }).createSession(create());
+  const events = [];
+  session.subscribe((event) => events.push(event));
+  listener({
+    type: "agent_end",
+    willRetry: false,
+    messages: [{
+      role: "assistant",
+      content: [{
+        type: "custom",
+        customType: "subagent-notification",
+        content: [
+          buildCanonicalPiSubagentNotificationContent({
+            taskId: "task-running",
+            status: "running",
+            summary: "Agent \"still\" running",
+            result: "not done",
+          }),
+          buildCanonicalPiSubagentNotificationContent({
+            taskId: "task-mixed-ok",
+            status: "Done",
+            summary: "Agent \"ok\" completed",
+            result: "success",
+          }),
+          buildCanonicalPiSubagentNotificationContent({
+            taskId: "task-mixed-error",
+            status: "error",
+            summary: "Agent \"fail\" error",
+            result: "failed",
+          }),
+        ].join("\n"),
+      }],
+    }],
+  });
+  listener({ type: "agent_settled" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const observations = events.filter((event) => event.type === "runtime-observation");
+  assert.deepEqual(observations.map((event) => event.phase), ["completed"]);
+  assert.equal(observations[0].completionKey, "task-mixed-ok|task-mixed-error");
+});
+
+test("Pi batched agent_end messages bridge every canonical notification", async () => {
+  let listener;
+  const sdk = {
+    sessionId: "pi-late-complete-batch",
+    prompt() {}, steer() {}, abort() {},
+    subscribe(next) { listener = next; return () => {}; },
+  };
+  const session = await createNativeRuntimeAdapter("pi", {
+    createPiSession: async () => sdk,
+    env: { LARKIN_PI_DISTRIBUTION: "builtin" },
+  }).createSession(create());
+  const events = [];
+  session.subscribe((event) => events.push(event));
+  listener({
+    type: "agent_end",
+    willRetry: false,
+    messages: [
+      buildCanonicalPiSubagentAssistantMessage({
+        taskId: "task-batch-a",
+        status: "Done",
+        summary: "Agent \"a\" completed",
+        result: "a",
+      }),
+      buildCanonicalPiSubagentAssistantMessage({
+        taskId: "task-batch-b",
+        status: "Error: boom",
+        summary: "Agent \"b\" error",
+        result: "b",
+      }),
+    ],
+  });
+  listener({ type: "agent_settled" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const observations = events.filter((event) => event.type === "runtime-observation");
+  assert.deepEqual(observations.map((event) => event.phase), ["completed"]);
+  assert.equal(observations[0].completionKey, "task-batch-a|task-batch-b");
+});
+
+test("Pi repeated canonical late completion notifications only bridge once", async () => {
+  let listener;
+  const sdk = {
+    sessionId: "pi-late-complete-repeat", prompt() {}, steer() {}, abort() {},
+    subscribe(next) { listener = next; return () => {}; },
+  };
+  const session = await createNativeRuntimeAdapter("pi", {
+    createPiSession: async () => sdk,
+    env: { LARKIN_PI_DISTRIBUTION: "builtin" },
+  }).createSession(create());
+  const events = [];
+  session.subscribe((event) => events.push(event));
+  const canonical = buildCanonicalPiSubagentAssistantMessage({
+    taskId: "task-bridge-repeat",
+    toolUseId: "tool-use-bridge-repeat",
+    outputFile: "/tmp/task-bridge-repeat.output",
+    summary: "Agent \"repeat fixture\" completed",
+    result: "Repeat result.",
+  });
+  listener({ type: "agent_end", willRetry: false, messages: [canonical] });
+  listener({ type: "agent_settled" });
+  listener({ type: "agent_end", willRetry: false, messages: [canonical] });
+  listener({ type: "agent_settled" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const observations = events.filter((event) => event.type === "runtime-observation");
+  assert.deepEqual(observations.map((event) => event.phase), ["completed"]);
+  assert.equal(observations[0].completionKey, "task-bridge-repeat");
 });
 
 test("Codex resume failure falls back to a fresh thread with the same standing prompt", async () => {
@@ -497,6 +777,121 @@ test.each(["external", "builtin"])("%s Pi launches one shared append standing-pr
   }
 });
 
+test("production Pi probe uses isolated get_state only and preserves the verified dynamic policy", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-pi-production-probe-"));
+  const { command, commandArgs, log } = makeProductionPiCommand(root);
+  const input = create({
+    workspaceDir: path.join(root, "workspace"), stateDir: path.join(root, "state"), model: "test-provider/test-model",
+    env: { LARKIN_PI_TEST_LOG: log },
+  });
+  fs.mkdirSync(input.workspaceDir, { recursive: true });
+  let session;
+  try {
+    const adapter = createNativeRuntimeAdapter("pi", {
+      piCommand: command, piCommandArgs: commandArgs, resolvePiProcessExtensionArgs: () => ["-e", "fixture-extension"],
+      piRpcClientOptions: { requestTimeoutMs: 1_000, shutdownGraceMs: 100 },
+    });
+    await adapter.probe(input);
+    clearProductionPiLog(log);
+    session = await adapter.createSession(input);
+    const rows = readProductionPiLog(log);
+    const probeArgs = rows.find((row) => row.kind === "argv" && row.probe);
+    const probeRequests = rows.filter((row) => row.kind === "request" && row.probe).map((row) => row.type);
+    const runtimeArgs = rows.find((row) => row.kind === "argv" && !row.probe && !row.args.includes("--version"));
+    assert.ok(probeArgs);
+    assert.ok(probeArgs.args.includes("--no-session"), JSON.stringify(probeArgs));
+    assert.ok(probeArgs.args.includes("--no-extensions"), JSON.stringify(rows));
+    assert.equal(probeArgs.args.includes("-e"), false);
+    assert.deepEqual(probeRequests, ["get_state"]);
+    assert.ok(runtimeArgs.args.includes("-e"));
+    assert.ok(runtimeArgs.args.includes("fixture-extension"));
+    assert.equal(session.effectiveModel, "test-provider/test-model");
+    const settings = JSON.parse(fs.readFileSync(path.join(input.stateDir, "pi-agent", "settings.json"), "utf8"));
+    assert.deepEqual(settings.compaction, { enabled: true, reserveTokens: 50_000, keepRecentTokens: 20_000 });
+  } finally {
+    await session?.close("production probe test complete").catch(() => {});
+  }
+});
+
+test.each(["context-mismatch", "model-mismatch"])("production Pi startup rejects isolated probe %s drift", async (mode) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `larkin-pi-production-${mode}-`));
+  const { command, commandArgs, log } = makeProductionPiCommand(root, mode);
+  const input = create({
+    workspaceDir: path.join(root, "workspace"), stateDir: path.join(root, "state"), model: "test-provider/test-model",
+    env: { LARKIN_PI_TEST_LOG: log },
+  });
+  fs.mkdirSync(input.workspaceDir, { recursive: true });
+  const adapter = createNativeRuntimeAdapter("pi", { piCommand: command, piCommandArgs: commandArgs, piRpcClientOptions: { requestTimeoutMs: 1_000, shutdownGraceMs: 100 } });
+  await adapter.probe(input);
+  clearProductionPiLog(log);
+  await assert.rejects(
+    adapter.createSession(input),
+    /changed between the isolated probe and runtime startup/,
+  );
+  const rows = readProductionPiLog(log);
+  assert.equal(rows.some((row) => row.kind === "request" && !row.probe && ["prompt", "steer", "compact"].includes(row.type)), false);
+});
+
+test.each(["context-revalidate", "model-revalidate", "auto-revalidate"])("production Pi backend rejects %s before prompt or compact submission", async (mode) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `larkin-pi-production-revalidate-${mode}-`));
+  const { command, commandArgs, log } = makeProductionPiCommand(root, mode);
+  const input = create({
+    workspaceDir: path.join(root, "workspace"), stateDir: path.join(root, "state"), model: "test-provider/test-model",
+    env: { LARKIN_PI_TEST_LOG: log },
+  });
+  fs.mkdirSync(input.workspaceDir, { recursive: true });
+  const adapter = createNativeRuntimeAdapter("pi", {
+    piCommand: command, piCommandArgs: commandArgs, piRpcClientOptions: { requestTimeoutMs: 1_000, shutdownGraceMs: 100 },
+  });
+  await adapter.probe(input);
+  clearProductionPiLog(log);
+  const session = await adapter.createSession(input);
+  try {
+    const reason = mode === "auto-revalidate" ? /native compaction must be enabled/ : /changed after startup/;
+    const promptResult = await session.prompt({ inputId: "drift-prompt", kind: "user", text: "prompt", attempt: 0 });
+    assert.equal(promptResult.status, "rejected");
+    assert.match(promptResult.reason, reason);
+    await assert.rejects(session.compact(), reason);
+    await assert.rejects(session.getContextUsage(), reason);
+    const rows = readProductionPiLog(log);
+    const runtimeRequests = rows.filter((row) => row.kind === "request" && !row.probe).map((row) => row.type);
+    assert.equal(runtimeRequests.filter((type) => ["prompt", "compact", "steer"].includes(type)).length, 0);
+    assert.ok(runtimeRequests.filter((type) => type === "get_state").length >= 4);
+  } finally {
+    await session.close("production revalidation test complete").catch(() => {});
+  }
+});
+
+test.each(["reserveTokens", "keepRecentTokens"])("production Pi backend rejects owned %s drift before prompt or compact submission", async (field) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `larkin-pi-production-owned-${field}-`));
+  const { command, commandArgs, log } = makeProductionPiCommand(root);
+  const input = create({
+    workspaceDir: path.join(root, "workspace"), stateDir: path.join(root, "state"), model: "test-provider/test-model",
+    env: { LARKIN_PI_TEST_LOG: log },
+  });
+  fs.mkdirSync(input.workspaceDir, { recursive: true });
+  const adapter = createNativeRuntimeAdapter("pi", {
+    piCommand: command, piCommandArgs: commandArgs, piRpcClientOptions: { requestTimeoutMs: 1_000, shutdownGraceMs: 100 },
+  });
+  await adapter.probe(input);
+  clearProductionPiLog(log);
+  const session = await adapter.createSession(input);
+  try {
+    const settingsFile = path.join(input.stateDir, "pi-agent", "settings.json");
+    const settings = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
+    settings.compaction[field] = field === "reserveTokens" ? 49_999 : 19_999;
+    fs.writeFileSync(settingsFile, JSON.stringify(settings));
+    const promptResult = await session.prompt({ inputId: `owned-${field}-prompt`, kind: "user", text: "prompt", attempt: 0 });
+    assert.equal(promptResult.status, "rejected");
+    assert.match(promptResult.reason, /must be exactly/);
+    await assert.rejects(session.compact(), /must be exactly/);
+    const rows = readProductionPiLog(log);
+    assert.equal(rows.some((row) => row.kind === "request" && !row.probe && ["prompt", "compact", "steer"].includes(row.type)), false);
+  } finally {
+    await session.close("production owned settings test complete").catch(() => {});
+  }
+});
+
 test("Pi prompt reports acceptance only after the RPC command acknowledgement", async () => {
   let acknowledge;
   const acceptedByRpc = new Promise((resolve) => { acknowledge = resolve; });
@@ -514,6 +909,32 @@ test("Pi prompt reports acceptance only after the RPC command acknowledgement", 
   acknowledge();
   const result = await pending;
   assert.deepEqual(result, { status: "accepted", inputId: "pi-input" });
+});
+
+test("Pi revalidates its startup policy before prompt and manual compact operations", async () => {
+  let validations = 0;
+  const sdk = {
+    sessionId: "pi-policy",
+    validatePolicy: async () => { validations += 1; },
+    prompt: async () => {},
+    compact: async () => {},
+    steer: async () => {},
+    abort: async () => {},
+  };
+  const session = await createNativeRuntimeAdapter("pi", { createPiSession: async () => sdk }).createSession(create());
+  await session.prompt({ inputId: "policy-prompt", kind: "user", text: "work", attempt: 0 });
+  await session.compact();
+  assert.equal(validations, 2);
+});
+
+test("Pi rejects malformed get_session_stats contextUsage instead of silently skipping proactive compaction", async () => {
+  const sdk = {
+    sessionId: "pi-malformed-stats",
+    prompt: async () => {}, steer: async () => {}, abort: async () => {},
+    getSessionStats: async () => ({ contextUsage: { tokens: "not-a-token-count", contextWindow: 272_000 } }),
+  };
+  const session = await createNativeRuntimeAdapter("pi", { createPiSession: async () => sdk }).createSession(create());
+  await assert.rejects(session.getContextUsage(), /invalid contextUsage/i);
 });
 
 test("bundled Pi normalizes preflight compaction, retry, and terminal timeout without payload fields or a false turn", async () => {
@@ -571,12 +992,12 @@ test("bundled Pi emits content-free RPC timing phases while preserving normalize
   ["turn-start", "activity:thinking", "activity:text", "activity:tool", "turn-end"]);
   const observations = events.filter((event) => event.type === "runtime-observation");
   assert.deepEqual(observations.map((event) => event.phase), [
-    "rpc_submit", "rpc_accepted", "turn_start", "first_output", "tool_call", "completed", "tool_result", "settled",
+    "rpc_submit", "rpc_accepted", "turn_start", "first_output", "tool_call", "agent_end", "completed", "tool_result", "settled",
   ]);
   assert.ok(observations.every((event) => event.runtime === "pi" && event.distribution === "builtin"));
   assert.equal(events.filter((event) => event.type === "turn-start").length, 1);
   assert.equal(events.filter((event) => event.type === "turn-end").length, 1);
-  assert.doesNotMatch(JSON.stringify(observations), /reason|answer|read|out-of-order|FORBIDDEN|toolName|toolResult|message|text/);
+  assert.doesNotMatch(JSON.stringify(observations), /answer|read|out-of-order|FORBIDDEN|toolName|toolResult|message|text/);
 });
 
 test("bundled Pi closes an epoch RPC observation only from its original submit owner", async () => {
@@ -709,8 +1130,19 @@ test("Pi reports an exhausted transport failure against every owned input before
   assert.equal(events.filter((event) => event.type === "error").length, 0);
 });
 
+test("strict classifier accepts only the exact categorized Pi context projection", () => {
+  const canonical = "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again.";
+  const projection = classifyPiProviderError({ message: canonical }).reason;
+  assert.equal(classifyStrictProviderError({ message: projection, errorCategory: "context_window" }), "context_window");
+  assert.equal(classifyStrictProviderError({ message: projection }), undefined);
+  assert.equal(classifyStrictProviderError({ message: projection.replace("exceeded", "exceedeD"), errorCategory: "context_window" }), undefined);
+  assert.equal(classifyStrictProviderError({ message: "provider rejected the input because context overflow happened", errorCategory: "context_window" }), undefined);
+  assert.equal(classifyStrictProviderError({ message: "Codex error: provider rejected the input because the context window was exceeded", errorCategory: "context_window" }), undefined);
+});
+
 test("Pi provider failures preserve safe actionable categories", () => {
   for (const [upstream, category] of [
+    [{ provider: "openai-codex", message: "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again." }, "context_window"],
     [{ status: 402, message: "payment required" }, "billing"],
     [{ status: 429, code: "insufficient_quota", message: "monthly allowance exhausted" }, "quota"],
     [{ status: 429, message: "too many requests" }, "rate_limit"],
@@ -725,6 +1157,7 @@ test("Pi provider failures preserve safe actionable categories", () => {
   }
   for (const upstream of [
     { provider: "policy-gateway", message: "Authorization metadata documents the API key policy for this workspace" },
+    { provider: "openai-codex", message: "The context policy token limit may apply" },
     { provider: "policy-gateway", code: "policy_error", message: "API key authorization requirements are controlled by tenant policy" },
   ]) {
     assert.equal(classifyPiProviderError(upstream).category, "provider");

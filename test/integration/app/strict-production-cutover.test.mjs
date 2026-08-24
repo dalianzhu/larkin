@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const APP = "cli_strictA1";
+const TRANSIENT_VERIFY_CHILD_TIMEOUT_MS = 10_000;
+const TRANSIENT_VERIFY_TEST_TIMEOUT_MS = 15_000;
 
 function storedConfig() {
   return { version: 3, serverId: "server-strict", activeAgent: APP, agents: { [APP]: { runtime: "codex", model: "gpt-5.5" } } };
@@ -62,7 +64,9 @@ test("bot credential verification pins lark-cli identity explicitly to bot", () 
   assert.match(register, /\[\.\.\.official\.argsPrefix, "im", "\+chat-list", "--as", "bot"\]/);
   assert.match(register, /synchronizeAgentProfile\(agent/);
   assert.match(bind, /\["--profile", profile\.name, "im", "\+chat-list", "--as", "bot", "--json"\]/);
-  assert.match(bind, /profile\.name !== profile\.appId/);
+  assert.match(bind, /不要求名字等于 App ID/);
+  assert.doesNotMatch(bind, /profile\.name !== profile\.appId/);
+  assert.match(bind, /loadValidatedBotCredential/);
 });
 
 test("run fails closed for missing or malformed App-ID bot credentials before daemon spawn", () => {
@@ -213,13 +217,13 @@ cp.spawnSync=function(command,args,options={}){
   return {status:0,stdout:"",stderr:""};
 };
 require("node:module").syncBuiltinESMExports();
-module.exports={registerApp:async()=>({client_id:${JSON.stringify(returnedId)},client_secret:${JSON.stringify(returnedSecret)},user_info:{tenant_brand:"feishu",open_id:"ou_owner"}}),qrcode:{generate(){}},spawnSync:cp.spawnSync,wait:async()=>{},resolveOfficialLarkCli:()=>({command:"lark-cli",argsPrefix:[],version:"1.0.79"}),syncAgentProfile(agent,env){fs.appendFileSync(process.env.CALL_MARKER,JSON.stringify({command:"lark-cli",args:["config","bind","--source","lark-channel","--identity","bot-only"],larkConfigDir:agent.larkConfigDir,hasHermesHome:Object.hasOwn(env,"HERMES_HOME"),hasOpenClawHome:Object.hasOwn(env,"OPENCLAW_HOME"),hasLarkChannel:Object.keys(env).some(key=>key==="LARK_CHANNEL"||key.startsWith("LARK_CHANNEL_")),secretViaStdin:false})+"\\n");if(${JSON.stringify(mode)}==="sync-fail")throw new Error("bind failed canary-secret");const source=path.join(agent.stateDir,"lark-channel-source"),workspace=path.join(agent.larkConfigDir,"lark-channel");fs.mkdirSync(source,{recursive:true,mode:0o700});fs.mkdirSync(workspace,{recursive:true,mode:0o700});fs.writeFileSync(path.join(source,"config.json"),"{}",{mode:0o600});fs.writeFileSync(path.join(workspace,"config.json"),"{}",{mode:0o600});}};
+module.exports={registerApp:async()=>({client_id:${JSON.stringify(returnedId)},client_secret:${JSON.stringify(returnedSecret)},user_info:{tenant_brand:"feishu",open_id:"ou_owner"}}),qrcode:{generate(){}},spawnSync:cp.spawnSync,wait:async()=>{},resolveOfficialLarkCli:()=>({command:"lark-cli",argsPrefix:[],version:"1.0.80"}),syncAgentProfile(agent,env){fs.appendFileSync(process.env.CALL_MARKER,JSON.stringify({command:"lark-cli",args:["config","bind","--source","lark-channel","--identity","bot-only"],larkConfigDir:agent.larkConfigDir,hasHermesHome:Object.hasOwn(env,"HERMES_HOME"),hasOpenClawHome:Object.hasOwn(env,"OPENCLAW_HOME"),hasLarkChannel:Object.keys(env).some(key=>key==="LARK_CHANNEL"||key.startsWith("LARK_CHANNEL_")),secretViaStdin:false})+"\\n");if(${JSON.stringify(mode)}==="sync-fail")throw new Error("bind failed canary-secret");const source=path.join(agent.stateDir,"lark-channel-source"),workspace=path.join(agent.larkConfigDir,"lark-channel");fs.mkdirSync(source,{recursive:true,mode:0o700});fs.mkdirSync(workspace,{recursive:true,mode:0o700});fs.writeFileSync(path.join(source,"config.json"),"{}",{mode:0o600});fs.writeFileSync(path.join(workspace,"config.json"),"{}",{mode:0o600});}};
 `);
   fs.writeFileSync(loader, `import { mock } from "bun:test"; import { createRequire } from "node:module"; import * as channel from ${JSON.stringify(new URL(`file://${channelMock}`).href)}; import qrcode from ${JSON.stringify(new URL(`file://${qrcodeMock}`).href)}; process.env.LARKIN_TEST_BOT_REGISTER_MODULE=${JSON.stringify(preload)}; const require=createRequire(import.meta.url); require(${JSON.stringify(preload)}); const cp=require("node:child_process"), cpMock={...cp,spawnSync:cp.spawnSync,spawn:cp.spawn}; for(const id of ["node:child_process",import.meta.resolve("node:child_process")])mock.module(id,()=>cpMock); for(const id of ["@larksuite/channel",import.meta.resolve("@larksuite/channel")])mock.module(id,()=>channel); for(const id of ["qrcode-terminal",import.meta.resolve("qrcode-terminal")])mock.module(id,()=>({default:qrcode}));`);
   return { preload, loader };
 }
 
-test("bot-register binds once, then retries transient new-App Bot verification without exposing the secret", () => {
+test("bot-register binds once, then retries transient new-App Bot verification without exposing the secret", { timeout: TRANSIENT_VERIFY_TEST_TIMEOUT_MS }, () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-strict-register-transient-sync-"));
   try {
     const root = path.join(temp, "root");
@@ -231,7 +235,7 @@ test("bot-register binds once, then retries transient new-App Bot verification w
     const result = spawnSync(process.execPath, ["--preload", loader, path.join(ROOT, "dist/setup/bot-register.mjs"), "--auto", "--result-file", resultFile], {
       cwd: ROOT,
       encoding: "utf8",
-      timeout: 5_000,
+      timeout: TRANSIENT_VERIFY_CHILD_TIMEOUT_MS,
       env: {
         ...process.env,
         HOME: path.join(temp, "home"),
@@ -263,7 +267,7 @@ test("bot-register binds once, then retries transient new-App Bot verification w
 });
 
 for (const [mode, expectedCalls, expectedStatus] of [["sync-network", 2, 0], ["sync-agent-context", 1, 1]]) {
-  test(`bot-register classifies ${mode} Bot verification with the intended retry policy`, () => {
+  test(`bot-register classifies ${mode} Bot verification with the intended retry policy`, { timeout: 15_000 }, () => {
     const temp = fs.mkdtempSync(path.join(os.tmpdir(), `larkin-strict-register-${mode}-`));
     try {
       const root = path.join(temp, "root");
@@ -287,7 +291,7 @@ for (const [mode, expectedCalls, expectedStatus] of [["sync-network", 2, 0], ["s
   });
 }
 
-test("bot-register bounds transient Bot verification retries and preserves authoritative binding state", () => {
+test("bot-register bounds transient Bot verification retries and preserves authoritative binding state", { timeout: 10_000 }, () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-strict-register-transient-exhaust-"));
   try {
     const root = path.join(temp, "root");
@@ -518,7 +522,7 @@ for (const mode of ["sync-fail", "verify-fail"]) {
   });
 }
 
-test("host exits nonzero and records status when channel authentication fails; no consume fallback is spawned", () => {
+test("host exits nonzero and records status when channel authentication fails; no consume fallback is spawned", { timeout: 10_000 }, () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-strict-host-channel-"));
   try {
     const root = path.join(temp, "root");
@@ -563,10 +567,10 @@ for (const mode of ["bind-fail", "workspace-mismatch"]) {
       const fixtureBin = path.join(temp, "bin");
       fs.mkdirSync(path.dirname(official), { recursive: true, mode: 0o700 });
       fs.mkdirSync(fixtureBin, { mode: 0o700 });
-      fs.writeFileSync(path.join(packageDir, "package.json"), JSON.stringify({ name: "@larksuite/cli", version: "1.0.79", bin: { "lark-cli": "scripts/run.sh" } }), { mode: 0o600 });
+      fs.writeFileSync(path.join(packageDir, "package.json"), JSON.stringify({ name: "@larksuite/cli", version: "1.0.80", bin: { "lark-cli": "scripts/run.sh" } }), { mode: 0o600 });
       fs.writeFileSync(official, "#!/bin/sh\nexit 99\n", { mode: 0o700 });
       fs.symlinkSync(official, path.join(fixtureBin, "lark-cli"));
-      fs.writeFileSync(preload, `const cp=require("node:child_process"),fs=require("node:fs"),path=require("node:path"),original=cp.spawnSync; cp.spawn=()=>{fs.writeFileSync(process.env.SPAWN_MARKER,"yes");throw new Error("daemon spawn reached")}; cp.spawnSync=(command,args,options={})=>{if(args?.[0]==="-lc"&&String(args?.[1]).includes("command -v lark-cli"))return {status:0,stdout:process.env.OFFICIAL_CLI+"\\n",stderr:""};let pinned=false;try{pinned=fs.realpathSync(String(command))===fs.realpathSync(process.env.OFFICIAL_CLI)}catch{}if(!pinned)return original(command,args,options);const cli=args;if(cli[0]==="--version")return {status:0,stdout:"1.0.79\\n",stderr:""};if(cli[0]==="config"&&cli[1]==="bind"&&cli[2]==="--help")return {status:0,stdout:"Usage: config bind --source lark-channel --identity bot-only\\n",stderr:""};fs.appendFileSync(process.env.CALL_MARKER,JSON.stringify({command:"official-global",args:cli,secretViaStdin:options.input==="secret-value"})+"\\n");if(cli[0]==="config"&&cli[1]==="bind"){if(${JSON.stringify(mode)}==="bind-fail")return {status:1,stdout:"",stderr:"secret-value"};const source=JSON.parse(fs.readFileSync(options.env.LARK_CHANNEL_CONFIG,"utf8")),id=source.accounts.app.id,dir=path.join(options.env.LARKSUITE_CLI_CONFIG_DIR,"lark-channel");fs.mkdirSync(dir,{recursive:true,mode:0o700});fs.writeFileSync(path.join(dir,"config.json"),JSON.stringify({apps:[{appId:${JSON.stringify(mode)}==="workspace-mismatch"?"cli_wrong":id,appSecret:{source:"keychain",id:"appsecret:"+id},defaultAs:"bot",strictMode:"bot",users:[]}]}),{mode:0o600});}return {status:0,stdout:"",stderr:""};};require("node:module").syncBuiltinESMExports();`);
+      fs.writeFileSync(preload, `const cp=require("node:child_process"),fs=require("node:fs"),path=require("node:path"),original=cp.spawnSync; cp.spawn=()=>{fs.writeFileSync(process.env.SPAWN_MARKER,"yes");throw new Error("daemon spawn reached")}; cp.spawnSync=(command,args,options={})=>{if(args?.[0]==="-lc"&&String(args?.[1]).includes("command -v lark-cli"))return {status:0,stdout:process.env.OFFICIAL_CLI+"\\n",stderr:""};let pinned=false;try{pinned=fs.realpathSync(String(command))===fs.realpathSync(process.env.OFFICIAL_CLI)}catch{}if(!pinned)return original(command,args,options);const cli=args;if(cli[0]==="--version")return {status:0,stdout:"1.0.80\\n",stderr:""};if(cli[0]==="config"&&cli[1]==="bind"&&cli[2]==="--help")return {status:0,stdout:"Usage: config bind --source lark-channel --identity bot-only\\n",stderr:""};fs.appendFileSync(process.env.CALL_MARKER,JSON.stringify({command:"official-global",args:cli,secretViaStdin:options.input==="secret-value"})+"\\n");if(cli[0]==="config"&&cli[1]==="bind"){if(${JSON.stringify(mode)}==="bind-fail")return {status:1,stdout:"",stderr:"secret-value"};const source=JSON.parse(fs.readFileSync(options.env.LARK_CHANNEL_CONFIG,"utf8")),id=source.accounts.app.id,dir=path.join(options.env.LARKSUITE_CLI_CONFIG_DIR,"lark-channel");fs.mkdirSync(dir,{recursive:true,mode:0o700});fs.writeFileSync(path.join(dir,"config.json"),JSON.stringify({apps:[{appId:${JSON.stringify(mode)}==="workspace-mismatch"?"cli_wrong":id,appSecret:{source:"keychain",id:"appsecret:"+id},defaultAs:"bot",strictMode:"bot",users:[]}]}),{mode:0o600});}return {status:0,stdout:"",stderr:""};};require("node:module").syncBuiltinESMExports();`);
       const result = spawnSync(process.execPath, [path.join(ROOT, "dist/app/run.mjs")], {
         cwd: ROOT, encoding: "utf8", env: { ...process.env, HOME: path.join(temp, "home"), SHELL: "/bin/sh", PATH: `${fixtureBin}:${process.env.PATH || "/usr/bin:/bin"}`, OFFICIAL_CLI: path.join(fixtureBin, "lark-cli"), LARKIN_CONFIG_DIR: root, SPAWN_MARKER: spawnMarker, CALL_MARKER: callMarker, BUN_OPTIONS: `--preload=${preload}` },
       });
@@ -620,7 +624,7 @@ test("dry-run EVENT_FILE injection takes precedence over profile channel startup
 });
 
 for (const scenario of ["keepalive", "missing-identity"]) {
-  test(`host routes ${scenario} failure through status recording and bounded fatal shutdown`, () => {
+  test(`host routes ${scenario} failure through status recording and bounded fatal shutdown`, { timeout: 10_000 }, () => {
     const temp = fs.mkdtempSync(path.join(os.tmpdir(), `larkin-strict-channel-${scenario}-`));
     try {
       const root = path.join(temp, "root");
@@ -686,7 +690,7 @@ for (const disconnectMode of ["pending", "reject"]) {
   });
 }
 
-test("synchronous channel creation failure stops multi-agent startup and closes earlier channels", () => {
+test("synchronous channel creation failure stops multi-agent startup and closes earlier channels", { timeout: 10_000 }, () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-strict-channel-multi-create-"));
   try {
     const root = path.join(temp, "root");

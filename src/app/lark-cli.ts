@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createAgentStateStore, type AgentStateStore } from "../agent/agent-state-store.js";
+import { auditReminderDelivery } from "../agent/reminder-delivery-audit.js";
 import { evaluateFreshness, type FreshnessTarget } from "../agent/freshness-gate.js";
 import {
   feishuImFreshnessAdapter, feishuImTarget, mergeFeishuImCursor, serializeFeishuImTarget,
@@ -44,7 +45,7 @@ function portableSignalCode(signal: NodeJS.Signals): number {
 
 export type LarkCliCommandDecision =
   | { kind: "passthrough" }
-  | { kind: "guarded"; operation: "send" | "reply" | "card" }
+  | { kind: "guarded"; operation: "send" | "reply" | "card" | "urgent-app" }
   | { kind: "comment-reply" }
   | { kind: "denied"; reason: string };
 
@@ -69,7 +70,7 @@ const HISTORY_VALUE_FLAGS = new Set([
   "--format", "--jq", "-q", "--download-dir",
 ]);
 
-type ProtectedOperation = "send" | "reply" | "card-patch" | "card-update" | "raw-create" | "raw-reply"
+type ProtectedOperation = "send" | "reply" | "card-patch" | "card-update" | "urgent-app" | "raw-create" | "raw-reply"
   | "raw-forward" | "raw-merge_forward" | "raw-delete" | "raw-urgent_app" | "raw-urgent_phone" | "raw-urgent_sms"
   | "thread-forward" | "thread-merge_forward" | "api";
 
@@ -99,7 +100,7 @@ function hasCanonicalUnprotectedCommandPath(argv: readonly string[]): boolean {
   const command = nativeArgv[1];
   if (!service || service.startsWith("-") || !command || command.startsWith("-")) return false;
   if (service !== "im") return service !== "api" && service !== "larkin-draft";
-  if (command === "+messages-send" || command === "+messages-reply" || command === "api") {
+  if (command === "+messages-send" || command === "+messages-reply" || command === "+messages-urgent-app" || command === "api") {
     return false;
   }
   if (command.startsWith("+")) return true;
@@ -220,6 +221,14 @@ export function classifyLarkCliCommand(argv: readonly string[]): LarkCliCommandD
   if (exactPath(parsed.commandArgv, ["im", "+messages-reply"])) return uniqueProtectedOperation(protectedPaths, "reply")
     ? (parsed.commandArgv.includes("--dry-run") ? { kind: "passthrough" } : { kind: "guarded", operation: "reply" })
     : noncanonicalProtectedDecision();
+  if (exactPath(parsed.commandArgv, ["im", "+messages-urgent-app"])) {
+    return { kind: "denied", reason: "不要使用合成入口 +messages-urgent-app；请使用官方 im messages urgent_app" };
+  }
+  if (exactPath(parsed.commandArgv, ["im", "messages", "urgent_app"])) {
+    return uniqueProtectedOperation(protectedPaths, "raw-urgent_app")
+      ? (parsed.commandArgv.includes("--dry-run") || parsed.help ? { kind: "passthrough" } : { kind: "guarded", operation: "urgent-app" })
+      : noncanonicalProtectedDecision();
+  }
   if (exactPath(parsed.commandArgv, ["im", "messages", "patch"]) || exactPath(parsed.commandArgv, ["im", "messages", "update"])) {
     const expected = parsed.commandArgv[2] === "patch" ? "card-patch" : "card-update";
     return uniqueProtectedOperation(protectedPaths, expected)
@@ -232,7 +241,7 @@ export function classifyLarkCliCommand(argv: readonly string[]): LarkCliCommandD
       ? { kind: "denied", reason: "该原始 IM 写入口会旁路 target freshness；请使用 +messages-send/+messages-reply" }
       : noncanonicalProtectedDecision();
   }
-  if (["forward", "merge_forward", "delete", "urgent_app", "urgent_phone", "urgent_sms"]
+  if (["forward", "merge_forward", "delete", "urgent_phone", "urgent_sms"]
     .some((operation) => exactPath(parsed.commandArgv, ["im", "messages", operation]))) {
     const expected = `raw-${parsed.commandArgv[2]}` as ProtectedOperation;
     return uniqueProtectedOperation(protectedPaths, expected)
@@ -288,7 +297,7 @@ type CommentReplyLedger = {
   document_comment_replies?: Record<string, { digest: string; status: "sending" | "sent" | "failed"; updated_at: string }>;
 };
 
-type ImWriteMemoEntry = { message_id: string; updated_at: string };
+type ImWriteMemoEntry = { message_id: string; updated_at: string; source_message_id?: string };
 type ImWriteMemoState = {
   version: 1;
   cursors?: Record<string, unknown>;
@@ -300,21 +309,28 @@ const IM_WRITE_MEMO_LIMIT = 512;
 // 只标注、不拦截：每次成功写把「实际生效的幂等 key → 服务端返回的 message_id」记进备忘。
 // 同 key 再次成功且服务端返回同一个 message_id，说明服务端走了幂等去重（没有产生新消息），
 // 返回 true 供输出标注 duplicate。拦截权始终在服务端，备忘不会吞掉任何发送。
-function recordImWriteMemo(store: AgentStateStore, key: string, messageId: string): boolean {
-  let duplicate = false;
-  store.mutateJson<ImWriteMemoState, void>("freshnessState", { version: 1, cursors: {} }, (state) => {
-    state.im_write_memo ??= {};
-    const prior = state.im_write_memo[key];
-    if (prior && prior.message_id === messageId) duplicate = true;
-    state.im_write_memo[key] = { message_id: messageId, updated_at: new Date().toISOString() };
-    const keys = Object.keys(state.im_write_memo);
-    for (const stale of keys.slice(0, Math.max(0, keys.length - IM_WRITE_MEMO_LIMIT))) delete state.im_write_memo[stale];
-  });
-  return duplicate;
+function recordImWriteMemo(store: AgentStateStore, key: string, messageId: string, sourceMessageId?: string): {
+  duplicate: boolean; priorSourceMessageId?: string;
+} {
+  return store.mutateJson<ImWriteMemoState, { duplicate: boolean; priorSourceMessageId?: string }>(
+    "freshnessState", { version: 1, cursors: {} }, (state) => {
+      state.im_write_memo ??= {};
+      const prior = state.im_write_memo[key];
+      if (prior && prior.message_id === messageId) {
+        return { duplicate: true, ...(prior.source_message_id ? { priorSourceMessageId: prior.source_message_id } : {}) };
+      }
+      state.im_write_memo[key] = { message_id: messageId, updated_at: new Date().toISOString(),
+        ...(sourceMessageId ? { source_message_id: sourceMessageId } : {}) };
+      const keys = Object.keys(state.im_write_memo);
+      for (const stale of keys.slice(0, Math.max(0, keys.length - IM_WRITE_MEMO_LIMIT))) delete state.im_write_memo[stale];
+      return { duplicate: false };
+    },
+  );
 }
 
 function runCommentReply(
   argv: readonly string[], privateEnv: Env, io: LarkCliIo, dependencies: LarkCliLauncherDependencies, store: AgentStateStore,
+  agentId: string,
 ): number {
   const input = parseCommentReply(argv);
   const targetKey = store.resolveInboxMessageTarget(input.messageId);
@@ -322,25 +338,39 @@ function runCommentReply(
   if (!target) throw new Error("comment reply 无法从当前 Agent Inbox 绑定文档评论 locator；先 poll 该消息且不得跨 Agent/评论回复");
   if (!store.inboxTargetIsFresh(targetKey!)) throw new Error("comment reply 需要先 poll 当前 document-comment target 的最新 Inbox 消息");
   const digest = createHash("sha256").update(input.text).digest("hex");
-  const claim = store.mutateJson<CommentReplyLedger, "ready" | "sent" | "ambiguous" | "conflict">(
+  const ledgerKey = `${input.messageId}::${digest}`;
+  const claim = store.mutateJson<CommentReplyLedger, "ready" | "sent" | "ambiguous">(
     "freshnessState", { version: 1, cursors: {} }, (state) => {
       state.document_comment_replies ??= {};
-      const prior = state.document_comment_replies[input.messageId];
-      if (prior?.status === "sent" && prior.digest === digest) return "sent";
-      if (prior?.status === "sending" && prior.digest === digest) return "ambiguous";
-      if (prior && prior.status !== "failed" && prior.digest !== digest) return "conflict";
-      state.document_comment_replies[input.messageId] = { digest, status: "sending", updated_at: new Date().toISOString() };
-      const keys = Object.keys(state.document_comment_replies);
-      for (const stale of keys.slice(0, Math.max(0, keys.length - 512))) delete state.document_comment_replies[stale];
+      const legacy = state.document_comment_replies[input.messageId];
+      const prior = state.document_comment_replies[ledgerKey]
+        ?? (legacy?.digest === digest ? legacy : undefined);
+      if (prior?.status === "sent") return "sent";
+      const messageEntries = Object.entries(state.document_comment_replies)
+        .filter(([key]) => key === input.messageId || key.startsWith(`${input.messageId}::`));
+      if (messageEntries.some(([, entry]) => entry.status === "sending")) return "ambiguous";
+      state.document_comment_replies[ledgerKey] = { digest, status: "sending", updated_at: new Date().toISOString() };
+      const terminalKeys = Object.keys(state.document_comment_replies)
+        .filter((key) => state.document_comment_replies![key]?.status !== "sending");
+      for (const stale of terminalKeys.slice(0, Math.max(0, terminalKeys.length - 512))) delete state.document_comment_replies[stale];
       return "ready";
     },
   );
   if (claim === "sent") {
+    const currentReminder = store.resolveCurrentReminders().filter((reminder) => reminder.deliveryTarget === targetKey).at(-1) ?? null;
+    try {
+      auditReminderDelivery({ stateStore: store, agentId, target: targetKey!, deliveryAnchor: currentReminder?.deliveryAnchor,
+        succeeded: !currentReminder, ...(currentReminder ? { reason: "document comment ledger already sent this text to the anchor on an earlier reminder firing" } : {}) });
+    }
+    catch (error) { io.stderr(`lark-cli: reminder delivery audit failed: ${error instanceof Error ? error.message : String(error)}\n`); }
+    if (currentReminder) {
+      io.stderr("comment reply was already sent for an earlier reminder firing; no new delivery was committed\n");
+      return 2;
+    }
     io.stdout(`${JSON.stringify({ ok: true, identity: "bot", committed: true, duplicate: true, target: targetKey })}\n`);
     return 0;
   }
-  if (claim === "ambiguous") throw new Error("comment reply 上次调用结果不明确，已 fail-closed 以避免重复评论；请由用户检查原评论线程");
-  if (claim === "conflict") throw new Error("comment reply 已为同一 Inbox 消息提交不同正文，拒绝覆盖或重复发送");
+  if (claim === "ambiguous") throw new Error("comment reply 上次调用结果不明确，已 fail-closed 以避免重复评论；请勿改写正文重试，请由用户检查原评论线程");
   const nativeArgs = target.topLevel
     ? [
         "drive", "file.comments", "create_v2",
@@ -367,12 +397,26 @@ function runCommentReply(
   if (terminalStatus) {
     store.mutateJson<CommentReplyLedger, void>("freshnessState", { version: 1, cursors: {} }, (state) => {
       state.document_comment_replies ??= {};
-      state.document_comment_replies[input.messageId] = {
+      state.document_comment_replies[ledgerKey] = {
         digest,
         status: terminalStatus,
         updated_at: new Date().toISOString(),
       };
     });
+  }
+  const committedWrite = !result.error && result.status === 0;
+  const currentReminder = committedWrite
+    ? store.resolveCurrentReminders().filter((reminder) => reminder.deliveryTarget === targetKey).at(-1) ?? null
+    : null;
+  try {
+    auditReminderDelivery({ stateStore: store, agentId, target: targetKey!, succeeded: committedWrite,
+      ...(committedWrite ? {} : { reason: (result.stderr || result.stdout || "comment provider failed").trim().split("\n")[0] }) });
+  } catch (error) {
+    if (committedWrite && currentReminder) {
+      try { store.markCurrentReminderDeliveryCommitted(currentReminder.reminderId, currentReminder.deliveryAnchor); }
+      catch (markerError) { io.stderr(`lark-cli: reminder committed marker failed: ${markerError instanceof Error ? markerError.message : String(markerError)}\n`); }
+    }
+    io.stderr(`lark-cli: reminder delivery audit failed: ${error instanceof Error ? error.message : String(error)}\n`);
   }
   return emitNativeResult(result, io);
 }
@@ -456,7 +500,9 @@ function guardedTarget(decision: Extract<LarkCliCommandDecision, { kind: "guarde
   if (decision.operation === "send") {
     const chatId = policyFlagValue(argv, "--chat-id");
     const userId = policyFlagValue(argv, "--user-id");
-    if (!chatId || userId) throw new Error("Runtime +messages-send 必须只使用 Inbox 已确认的 --chat-id；--user-id 无法建立 freshness target");
+    if (!chatId || userId) {
+      throw new Error("Runtime +messages-send 必须只使用 Inbox 已确认的 --chat-id；--user-id 无法建立 freshness target");
+    }
     return feishuImTarget(`chat:${chatId}`);
   }
   const messageId = policyFlagValue(argv, "--message-id");
@@ -466,16 +512,187 @@ function guardedTarget(decision: Extract<LarkCliCommandDecision, { kind: "guarde
   return feishuImTarget(target);
 }
 
-function botArgv(argv: readonly string[], intentId: string): string[] {
+function uniqueRawFlagValue(argv: readonly string[], flag: string): string | null {
+  const nativeArgv = nativeArgvBeforeBoundary(argv);
+  const values: string[] = [];
+  for (let index = 0; index < nativeArgv.length; index += 1) {
+    const argument = nativeArgv[index];
+    if (argument === flag) {
+      values.push(nativeArgv[index + 1] ?? "");
+      index += 1;
+      continue;
+    }
+    if (argument.startsWith(`${flag}=`)) values.push(argument.slice(flag.length + 1));
+  }
+  if (values.length > 1) throw new Error(`Runtime im messages urgent_app 不允许重复 ${flag}；官方 CLI 会采用最后一次赋值`);
+  return values[0] || null;
+}
+
+function resolveUrgentAppTarget(
+  argv: readonly string[],
+  env: Env,
+  io: LarkCliIo,
+  dependencies: LarkCliLauncherDependencies,
+): { target: FreshnessTarget; message: FeishuImMessage } {
+  const messageId = policyFlagValue(argv, "--message-id");
+  if (!messageId || !/^om_/.test(messageId)) {
+    throw new Error("Runtime im messages urgent_app 只接受真实 Feishu om_ message_id");
+  }
+  const result = callNative([
+    "im", "+messages-mget",
+    "--message-ids", messageId,
+    "--no-reactions",
+    "--json",
+    "--as", "bot",
+  ], env, io, dependencies);
+  if (result.error) throw new Error(`urgent_app message lookup failed: ${result.error.message}`);
+  if (result.status !== 0) throw new Error(`urgent_app message lookup exited ${result.status ?? "without status"}: ${result.stderr || "no details"}`);
+  let value: unknown;
+  try { value = JSON.parse(result.stdout || ""); } catch { throw new Error("urgent_app message lookup returned non-JSON output"); }
+  const root = value as { ok?: unknown; identity?: unknown; data?: { messages?: unknown } } | null;
+  if (!root || root.ok !== true || !root.data) throw new Error("urgent_app message lookup returned an unsuccessful payload");
+  if (root.identity !== "bot") throw new Error("urgent_app message lookup did not confirm Bot identity");
+  const rows = root.data.messages;
+  if (!Array.isArray(rows)) throw new Error("urgent_app message lookup omitted messages");
+  const message = rows.find((row) => row && typeof row === "object" && !Array.isArray(row)
+    && (row as { message_id?: unknown }).message_id === messageId) as FeishuImMessage | undefined;
+  if (!message || typeof message.chat_id !== "string" || !message.chat_id) {
+    throw new Error(`无法从官方 +messages-mget 确认 ${messageId} 的 chat；禁止旁路加急`);
+  }
+  return { target: feishuImTarget(`chat:${message.chat_id}`), message };
+}
+
+function botArgv(argv: readonly string[], intentId: string, decision?: Extract<LarkCliCommandDecision, { kind: "guarded" }>): string[] {
   const next = [...argv];
   const parsed = parsePolicyArgv(next);
   const boundary = next.indexOf("--");
   const insertion = boundary < 0 ? next.length : boundary;
   const injected: string[] = [];
   if (!parsed.flags.has("--as")) injected.push("--as", "bot");
-  if (!parsed.flags.has("--idempotency-key")) injected.push("--idempotency-key", intentId);
+  if (decision?.operation !== "urgent-app" && !parsed.flags.has("--idempotency-key")) injected.push("--idempotency-key", intentId);
   next.splice(insertion, 0, ...injected);
-  return next;
+  if (decision?.operation !== "urgent-app") return next;
+  const rewritten: string[] = [];
+  for (let index = 0; index < next.length; index += 1) {
+    const argument = next[index];
+    if (argument === "--idempotency-key") {
+      index += 1;
+      continue;
+    }
+    if (argument.startsWith("--idempotency-key=")) continue;
+    rewritten.push(argument);
+  }
+  return rewritten;
+}
+
+function parseJsonObject(value: string, label: string): Record<string, unknown> {
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { throw new Error(`${label} 必须是 JSON 对象`); }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${label} 必须是 JSON 对象`);
+  return parsed as Record<string, unknown>;
+}
+
+function senderRecord(message: FeishuImMessage): Record<string, unknown> | null {
+  const sender = message.sender;
+  return sender && typeof sender === "object" && !Array.isArray(sender) ? sender as Record<string, unknown> : null;
+}
+
+function isOwnBotMessage(message: FeishuImMessage, feishuAppId: string): boolean {
+  const sender = senderRecord(message);
+  if (!sender) return false;
+  const senderType = sender.sender_type;
+  const senderId = sender.id ?? sender.sender_id;
+  return senderType === "app" && senderId === feishuAppId;
+}
+
+function assertUrgentAppPreconditions(
+  argv: readonly string[],
+  message: FeishuImMessage,
+  target: FreshnessTarget,
+  feishuAppId: string,
+): string[] {
+  const messageId = policyFlagValue(argv, "--message-id");
+  if (!messageId || !/^om_/.test(messageId) || message.message_id !== messageId) {
+    throw new Error("Runtime im messages urgent_app 只接受真实 Feishu om_ message_id");
+  }
+  const userIdType = uniqueRawFlagValue(argv, "--user-id-type");
+  if (userIdType !== "open_id") throw new Error("Runtime im messages urgent_app 必须使用 --user-id-type open_id");
+  const data = uniqueRawFlagValue(argv, "--data");
+  if (!data) throw new Error("Runtime im messages urgent_app 缺少 --data");
+  const body = parseJsonObject(data, "--data");
+  const userIds = body.user_id_list;
+  if (!Array.isArray(userIds) || userIds.length === 0 || userIds.some((value) => typeof value !== "string" || !value.startsWith("ou_"))) {
+    throw new Error("Runtime im messages urgent_app 的 user_id_list 必须是非空 open_id 列表");
+  }
+  if (target.resourceKind === "chat" && message.chat_id && message.chat_id !== target.resourceId) {
+    throw new Error("加急目标消息不属于当前 chat freshness target");
+  }
+  if (!isOwnBotMessage(message, feishuAppId)) throw new Error("Runtime im messages urgent_app 只能加急当前 Bot 自己发出的消息");
+  return userIds.filter((value): value is string => typeof value === "string");
+}
+
+function parseChatMemberOpenIds(result: SpawnSyncReturns<string>): string[] {
+  if (result.error) throw new Error(`urgent-app member probe failed: ${result.error.message}`);
+  if (result.status !== 0) throw new Error(`urgent-app member probe exited ${result.status ?? "without status"}: ${result.stderr || "no details"}`);
+  let value: unknown;
+  try { value = JSON.parse(result.stdout || ""); } catch { throw new Error("urgent-app member probe returned non-JSON output"); }
+  const root = value as { ok?: unknown; identity?: unknown; data?: { users?: unknown; truncations?: unknown; has_more?: unknown } } | null;
+  if (!root || root.ok !== true || !root.data) throw new Error("urgent-app member probe returned an unsuccessful payload");
+  if (root.identity !== "bot") throw new Error("urgent-app member probe did not confirm Bot identity");
+  if (root.data.has_more === true) {
+    throw new Error("urgent-app member probe is incomplete; refusing to guess chat membership");
+  }
+  if (Array.isArray(root.data.truncations) && root.data.truncations.length > 0) {
+    throw new Error("urgent-app member probe was truncated; refusing to guess chat membership");
+  }
+  const users = root.data.users;
+  if (!Array.isArray(users)) throw new Error("urgent-app member probe omitted users");
+  const ids: string[] = [];
+  for (const user of users) {
+    if (!user || typeof user !== "object" || Array.isArray(user)) continue;
+    const memberId = (user as { member_id?: unknown }).member_id;
+    if (typeof memberId === "string" && memberId.startsWith("ou_")) ids.push(memberId);
+  }
+  return ids;
+}
+
+function assertUrgentAppMembers(
+  argv: readonly string[],
+  target: FreshnessTarget,
+  userIds: readonly string[],
+  env: Env,
+  io: LarkCliIo,
+  dependencies: LarkCliLauncherDependencies,
+): void {
+  if (target.resourceKind !== "chat" || !target.resourceId) {
+    throw new Error("Runtime im messages urgent_app 只能对照已确认的 chat freshness target 校验成员");
+  }
+  const members = new Set(parseChatMemberOpenIds(callNative([
+    "im", "+chat-members-list",
+    "--chat-id", target.resourceId,
+    "--member-id-type", "open_id",
+    "--member-types", "user",
+    "--page-all",
+    "--page-limit", "0",
+    "--json",
+    "--as", "bot",
+  ], env, io, dependencies)));
+  const unknown = userIds.filter((userId) => !members.has(userId));
+  if (unknown.length > 0) {
+    throw new Error(`Runtime im messages urgent_app 拒绝非本会话成员: ${unknown.join(",")}`);
+  }
+}
+
+function assertUrgentAppNativeAccepted(result: SpawnSyncReturns<string>): void {
+  if (result.error || result.status !== 0) return;
+  let value: unknown;
+  try { value = JSON.parse(result.stdout || ""); } catch { return; }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return;
+  const data = (value as { data?: unknown }).data;
+  if (!data || typeof data !== "object" || Array.isArray(data)) return;
+  const invalid = (data as { invalid_user_id_list?: unknown }).invalid_user_id_list;
+  if (!Array.isArray(invalid) || invalid.length === 0) return;
+  throw new Error(`Runtime im messages urgent_app 收到 invalid_user_id_list，已 fail-closed: ${invalid.join(",")}`);
 }
 
 function probeArgv(target: FreshnessTarget): string[] {
@@ -872,7 +1089,7 @@ export function runLarkCli(
         } catch { /* telemetry is failure-isolated */ }
       }
       return telemetry.externalPhase(agent.agentId, store.paths.root, "document.comment.reply", SpanKind.CLIENT,
-        () => runCommentReply(argv, privateEnv, io, nativeDependencies, store), "comment_cli") as number;
+        () => runCommentReply(argv, privateEnv, io, nativeDependencies, store, agent.agentId), "comment_cli") as number;
     }
     catch (error) {
       io.stderr(`lark-cli: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -881,7 +1098,10 @@ export function runLarkCli(
   }
   if (decision.kind === "passthrough") return passthroughWithObservation(effectiveArgv, privateEnv, io, nativeDependencies, store);
   try {
-    const target = guardedTarget(decision, effectiveArgv, store);
+    const urgent = decision.operation === "urgent-app"
+      ? resolveUrgentAppTarget(effectiveArgv, privateEnv, io, nativeDependencies)
+      : null;
+    const target = urgent?.target ?? guardedTarget(decision, effectiveArgv, store);
     const targetKey = serializeFeishuImTarget(target);
     const generation = freshnessGeneration(privateEnv);
     const seen = store.readFreshnessCursor<FeishuImCursor>(targetKey, generation);
@@ -899,11 +1119,58 @@ export function runLarkCli(
       store.mergeFreshnessCursor(targetKey, gated.current, mergeFeishuImCursor, generation);
       return 3;
     }
+    if (decision.operation === "urgent-app") {
+      const userIds = assertUrgentAppPreconditions(effectiveArgv, urgent!.message, target, agent.feishuAppId);
+      assertUrgentAppMembers(effectiveArgv, target, userIds, privateEnv, io, nativeDependencies);
+    }
     const intentKey = policyFlagValue(effectiveArgv, "--idempotency-key") ?? intentId(targetKey, effectiveArgv);
-    const write = callNative(botArgv(effectiveArgv, intentKey), privateEnv, io, nativeDependencies);
+    const write = callNative(botArgv(effectiveArgv, intentKey, decision), privateEnv, io, nativeDependencies);
+    if (decision.operation === "urgent-app") {
+      try { assertUrgentAppNativeAccepted(write); }
+      catch (error) {
+        io.stderr(`${JSON.stringify({
+          ok: false,
+          identity: "bot",
+          committed: true,
+          error: { type: "validation", message: error instanceof Error ? error.message : String(error) },
+        })}\n`);
+        return 2;
+      }
+      return emitNativeResult(write, io);
+    }
     const writeMessage = writeResponseMessage(write);
-    const duplicate = !write.error && write.status === 0 && writeMessage
-      ? recordImWriteMemo(store, intentKey, writeMessage.message_id) : false;
+    const deliveryTarget = decision.operation === "send"
+      ? `chat:${policyFlagValue(effectiveArgv, "--chat-id")}`
+      : store.resolveInboxMessageTarget(policyFlagValue(effectiveArgv, "--message-id") || "") || targetKey;
+    const matchingReminderContexts = store.resolveCurrentReminders().filter((reminder) => reminder.deliveryTarget === deliveryTarget);
+    // When recurring firings overlap, attach this write to one occurrence rather
+    // than dropping audit state merely because reminder_id is shared. Reuse this
+    // exact anchor for both the memo and audit so they cannot select different
+    // occurrences.
+    const currentReminder = matchingReminderContexts.at(-1) ?? null;
+    const deliveryAnchor = currentReminder?.deliveryAnchor;
+    const memo = !write.error && write.status === 0 && writeMessage
+      ? recordImWriteMemo(store, intentKey, writeMessage.message_id, deliveryAnchor) : { duplicate: false };
+    const duplicateOfEarlierReminder = memo.duplicate && Boolean(currentReminder)
+      && memo.priorSourceMessageId !== currentReminder?.deliveryAnchor;
+    const committedWrite = !write.error && write.status === 0 && !duplicateOfEarlierReminder;
+    try {
+      auditReminderDelivery({ stateStore: store, agentId: agent.agentId, target: deliveryTarget, deliveryAnchor,
+        succeeded: committedWrite,
+        ...(!committedWrite ? {
+          reason: duplicateOfEarlierReminder
+            ? "provider deduplicated this write to an earlier reminder firing"
+            : (write.stderr || write.stdout || "provider write failed").trim().split("\n")[0],
+        } : {}),
+        ...(writeMessage?.message_id ? { messageId: writeMessage.message_id } : {}) });
+    } catch (error) {
+      if (committedWrite && currentReminder) {
+        try { store.markCurrentReminderDeliveryCommitted(currentReminder.reminderId, currentReminder.deliveryAnchor, writeMessage?.message_id); }
+        catch (markerError) { io.stderr(`lark-cli: reminder committed marker failed: ${markerError instanceof Error ? markerError.message : String(markerError)}\n`); }
+      }
+      io.stderr(`lark-cli: reminder delivery audit failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
+    const duplicate = memo.duplicate;
     if (duplicate) {
       observeSuccessfulWrite(write, target, targetKey, store, generation);
       emitDuplicatedWrite(write, io, { target: targetKey });

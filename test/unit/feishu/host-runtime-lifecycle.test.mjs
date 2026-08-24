@@ -5,9 +5,12 @@ import path from "node:path";
 import { test } from "bun:test";
 import { fileURLToPath } from "node:url";
 import { createHostShell } from "../../../dist/feishu/host-shell.mjs";
+import { createAgentStateStore } from "../../../dist/agent/agent-state-store.mjs";
+import { createRuntimeHost } from "../../../dist/runtime/runtime-host.mjs";
+import { ContextPromptBuilder } from "../../../dist/agent/context-prompt.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
-const testManagedCli = () => ({ command: { command: "/test/official-lark-cli", argsPrefix: [], version: "1.0.79" }, env: {} });
+const testManagedCli = () => ({ command: { command: "/test/official-lark-cli", argsPrefix: [], version: "1.0.80" }, env: {} });
 
 test("production channel disconnect and RuntimeHost use one idempotent ordered shutdown", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-host-lifecycle-"));
@@ -63,6 +66,273 @@ test("production channel disconnect and RuntimeHost use one idempotent ordered s
   } finally {
     if (releaseDisconnect) releaseDisconnect();
     await host.shutdown("cleanup");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("HostShell recovery lifecycle persists the new session but exposes only sanitized aggregate state", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-host-context-recovery-"));
+  const agentId = "cli_hostContextA1";
+  const stateDir = path.join(root, "state", "agents", agentId);
+  const store = createAgentStateStore(root, agentId);
+  for (let index = 0; index < 4; index += 1) store.appendNdjson("inbox", { message_id: `om_host_context_${index}`, chat_id: "oc_host_context", content: "synthetic" });
+  let channelCreated = false;
+  const runtimeHost = {
+    subscribe() { return () => {}; },
+    async start() {},
+    async recoverSession() { return { generationChanged: true, sessionChanged: true, turns: 0, runtimeReady: true,
+      pendingCount: 4, rearmedCount: 4, replayStatus: "pending", sessionId: "private-session-not-output" }; },
+    async deliver() { throw new Error("not used"); },
+    async stop() {},
+    async shutdown() {},
+  };
+  const agent = { agentId, name: agentId, runtime: "pi", model: "model", feishuAppId: agentId, feishuAppSecret: "fixture",
+    feishuProfile: agentId, feishuDomain: "https://open.feishu.cn", workspaceDir: path.join(root, "agents", agentId), stateDir };
+  const env = { LARKIN_HOME: root, LARKIN_CONFIG_DIR: root, LARKIN_SERVER_ID: "server-context-recovery",
+    LARKIN_AGENTS_CONFIG: JSON.stringify([agent]), LARKIN_INBOUND_DROUGHT_SEC: "0" };
+  const channelPackage = { createLarkChannel() { channelCreated = true; return {
+    botIdentity: { openId: "ou_context", name: "Context" }, rawClient: null, dispatcher: { register() {} }, on() {},
+    async connect() {}, async disconnect() {},
+  }; } };
+  const host = createHostShell({ env, runtimeHost, channelPackage, eventSourceStartDelayMs: 0 });
+  try {
+    await host.start();
+    const deadline = Date.now() + 1_000;
+    while (!channelCreated && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(channelCreated, true);
+    const result = await host.recoverSession(agentId, "context-overflow", 0);
+    assert.equal(result.recoveryCommitted, true);
+    assert.equal(result.rearmedCount, 4);
+    assert.equal(result.remainingPendingCount, 4);
+    assert.doesNotMatch(JSON.stringify(result), /private-session-not-output|stateDir|fixture/);
+    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "agent-state.json"), "utf8"));
+    assert.equal(state.sessions.pi, "private-session-not-output", "private session identity is persisted internally, not returned to the operator");
+  } finally {
+    await host.shutdown("context recovery lifecycle test complete");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("HostShell recovery refusal preserves the prior Runtime readiness", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-host-context-recovery-refused-"));
+  const agentId = "cli_hostContextRefusedA1";
+  const stateDir = path.join(root, "state", "agents", agentId);
+  const store = createAgentStateStore(root, agentId);
+  let channelCreated = false;
+  const runtimeHost = {
+    subscribe() { return () => {}; },
+    async start() {},
+    async recoverSession() { throw Object.assign(new Error("context-window recovery has no retained Inbox backlog"), { code: "recovery_refused" }); },
+    async deliver() { throw new Error("not used"); },
+    async stop() {},
+    async shutdown() {},
+  };
+  const agent = { agentId, name: agentId, runtime: "pi", model: "model", feishuAppId: agentId, feishuAppSecret: "fixture",
+    feishuProfile: agentId, feishuDomain: "https://open.feishu.cn", workspaceDir: path.join(root, "agents", agentId), stateDir };
+  const env = { LARKIN_HOME: root, LARKIN_CONFIG_DIR: root, LARKIN_SERVER_ID: "server-context-recovery-refused",
+    LARKIN_AGENTS_CONFIG: JSON.stringify([agent]), LARKIN_INBOUND_DROUGHT_SEC: "0" };
+  const channelPackage = { createLarkChannel() { channelCreated = true; return {
+    botIdentity: { openId: "ou_context_refused", name: "Context Refused" }, rawClient: null, dispatcher: { register() {} }, on() {},
+    async connect() {}, async disconnect() {},
+  }; } };
+  const host = createHostShell({ env, runtimeHost, channelPackage, eventSourceStartDelayMs: 0 });
+  try {
+    await host.start();
+    const deadline = Date.now() + 1_000;
+    while (!channelCreated && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(channelCreated, true);
+    const observedAt = new Date().toISOString();
+    const status = store.readJson("status", {});
+    const priorReadiness = { runtime: "pi", state: "ready", observedAt };
+    store.writeJson("status", {
+      ...status,
+      session: { runtime: "pi", id: "existing-session", launchId: "existing-launch", startedAt: observedAt, lastSeenAt: observedAt, lastTurnAt: null, turns: 0 },
+      runtimeReadiness: priorReadiness,
+    });
+
+    await assert.rejects(host.recoverSession(agentId, "context-overflow", 0), (error) => error.code === "recovery_refused");
+    assert.deepEqual(store.readJson("status", {}).runtimeReadiness, priorReadiness);
+  } finally {
+    await host.shutdown("context recovery refusal test complete");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("HostShell reset publishes a current readiness observation and rejects stale ready during transition", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-host-reset-freshness-"));
+  const agentId = "cli_hostResetFreshA1";
+  const stateDir = path.join(root, "state", "agents", agentId);
+  let channelCreated = false;
+  let releaseReset;
+  let resetStarted;
+  const runtimeHost = {
+    subscribe() { return () => {}; },
+    async start() {},
+    async resetSession() {
+      resetStarted?.();
+      return await new Promise((resolve) => { releaseReset = () => resolve({ generationChanged: true, sessionChanged: true, turns: 0, runtimeReady: true, pendingCount: 0, sessionId: null }); });
+    },
+    async deliver() { throw new Error("not used"); },
+    async stop() {},
+    async shutdown() {},
+  };
+  const agent = { agentId, name: agentId, runtime: "pi", model: "model", feishuAppId: agentId, feishuAppSecret: "fixture",
+    feishuProfile: agentId, feishuDomain: "https://open.feishu.cn", workspaceDir: path.join(root, "agents", agentId), stateDir };
+  const env = { LARKIN_HOME: root, LARKIN_CONFIG_DIR: root, LARKIN_SERVER_ID: "server-reset-freshness",
+    LARKIN_AGENTS_CONFIG: JSON.stringify([agent]), LARKIN_INBOUND_DROUGHT_SEC: "0" };
+  const channelPackage = { createLarkChannel() { channelCreated = true; return {
+    botIdentity: { openId: "ou_reset_fresh", name: "Reset Fresh" }, rawClient: null, dispatcher: { register() {} }, on() {},
+    async connect() {}, async disconnect() {},
+  }; } };
+  const host = createHostShell({ env, runtimeHost, channelPackage, eventSourceStartDelayMs: 0 });
+  try {
+    await host.start();
+    const statusFile = path.join(stateDir, "status.json");
+    const deadline = Date.now() + 1_000;
+    while ((!channelCreated || !fs.existsSync(statusFile) || JSON.parse(fs.readFileSync(statusFile, "utf8")).connectedVia !== "channel") && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(channelCreated, true);
+    let markStarted;
+    resetStarted = () => markStarted?.();
+    const resetStartedPromise = new Promise((resolve) => { markStarted = resolve; });
+    const resetPromise = host.resetSession(agentId, 0);
+    await resetStartedPromise;
+    const transitioning = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+    assert.equal(transitioning.runtimeReadiness.state, "unavailable");
+    releaseReset();
+    const result = await resetPromise;
+    assert.equal(result.runtimeReady, true);
+    const final = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+    const transitionObservedAt = Date.parse(transitioning.runtimeReadiness.observedAt);
+    assert.equal(final.runtimeReadiness.state, "ready");
+    assert.equal(Date.parse(final.runtimeReadiness.observedAt) >= transitionObservedAt, true);
+    assert.equal(Date.parse(final.session.startedAt) >= transitionObservedAt, true);
+  } finally {
+    releaseReset?.();
+    await host.shutdown("reset freshness test complete");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("assembled HostShell recovery compensates persisted session/status after a later Runtime listener throws", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-host-context-listener-failure-"));
+  const agentId = "cli_hostListenerA1";
+  const stateDir = path.join(root, "state", "agents", agentId);
+  const store = createAgentStateStore(root, agentId);
+  const messageId = "om_host_listener_context";
+  store.appendNdjson("inbox", { message_id: messageId, chat_id: "oc_host_listener", content: "synthetic" });
+  store.writeJson("runtimeDeliveries", { version: 1, records: [{ deliveryId: "d-host-listener", messageId, status: "error", retryable: false,
+    reason: "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again.", errorCategory: "context_window",
+    input: { inputId: "i-host-listener", deliveryId: "d-host-listener", kind: "wake", text: "redacted", attempt: 0 }, updatedAt: "before" }] });
+  const sessions = [];
+  class Session {
+    constructor(sessionId) { this.sessionId = sessionId; this.listeners = new Set(); this.closes = []; this.prompts = []; }
+    subscribe(listener) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
+    async prompt(input) { this.prompts.push(input); return { status: "accepted", inputId: input.inputId }; }
+    async close(reason) { this.closes.push(reason); }
+  }
+  const adapter = { id: "pi", capabilities: {}, async createSession() {
+    const session = new Session(sessions.length === 0 ? "old-host-listener" : "fresh-host-listener");
+    sessions.push(session);
+    return session;
+  } };
+  const runtimeHost = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store });
+  const agent = { agentId, name: agentId, runtime: "pi", model: "model", feishuAppId: agentId, feishuAppSecret: "fixture",
+    feishuProfile: agentId, feishuDomain: "https://open.feishu.cn", workspaceDir: path.join(root, "agents", agentId), stateDir };
+  let channelCreated = false;
+  const channelPackage = { createLarkChannel() { channelCreated = true; return {
+    botIdentity: { openId: "ou_host_listener", name: "Listener" }, rawClient: null, dispatcher: { register() {} }, on() {},
+    async connect() {}, async disconnect() {},
+  }; } };
+  const env = { LARKIN_HOME: root, LARKIN_CONFIG_DIR: root, LARKIN_SERVER_ID: "server-host-listener",
+    LARKIN_AGENTS_CONFIG: JSON.stringify([agent]), LARKIN_INBOUND_DROUGHT_SEC: "0" };
+  const host = createHostShell({ env, runtimeHost, channelPackage, eventSourceStartDelayMs: 0 });
+  try {
+    await host.start();
+    const deadline = Date.now() + 1_000;
+    while (Date.now() < deadline) {
+      const status = store.readJson("status", {});
+      if (channelCreated && status.connectedAt) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(channelCreated, true);
+    const oldLaunchId = store.readJson("status", {}).session.launchId;
+    assert.equal(typeof oldLaunchId, "string");
+    runtimeHost.subscribe((event) => {
+      if (event.type === "session" && event.sessionId === "fresh-host-listener") throw new Error("later listener failure");
+    });
+    await assert.rejects(host.recoverSession(agentId, "context-overflow", 0), /later listener failure|not committed/);
+    assert.deepEqual(sessions[0].closes, []);
+    assert.deepEqual(sessions[1].closes, ["context-window recovery not committed"]);
+    assert.equal(store.readJson("agentState", {}).sessions.pi, "old-host-listener");
+    const status = store.readJson("status", {});
+    assert.equal(status.session.id, "old-host-listener");
+    assert.equal(status.session.launchId, oldLaunchId);
+    assert.equal(store.readJson("runtimeDeliveries", { records: [] }).records[0].status, "error");
+  } finally {
+    await host.shutdown("assembled listener failure test complete");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("assembled HostShell recovery restores a null old session projection after a later Runtime listener throws", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-host-context-null-listener-"));
+  const agentId = "cli_hostNullListenerA1";
+  const stateDir = path.join(root, "state", "agents", agentId);
+  const store = createAgentStateStore(root, agentId);
+  const messageId = "om_host_null_listener_context";
+  store.appendNdjson("inbox", { message_id: messageId, chat_id: "oc_host_null_listener", content: "synthetic" });
+  store.writeJson("runtimeDeliveries", { version: 1, records: [{ deliveryId: "d-host-null-listener", messageId, status: "error", retryable: false,
+    reason: "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again.", errorCategory: "context_window",
+    input: { inputId: "i-host-null-listener", deliveryId: "d-host-null-listener", kind: "wake", text: "redacted", attempt: 0 }, updatedAt: "before" }] });
+  const sessions = [];
+  class Session {
+    constructor(sessionId) { this.sessionId = sessionId; this.listeners = new Set(); this.closes = []; }
+    subscribe(listener) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
+    async prompt() { return { status: "accepted" }; }
+    async close(reason) { this.closes.push(reason); }
+  }
+  const adapter = { id: "pi", capabilities: {}, async createSession() {
+    const session = new Session(sessions.length === 0 ? null : "fresh-host-null-listener");
+    sessions.push(session);
+    return session;
+  } };
+  const runtimeHost = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store });
+  let oldLaunchId = null;
+  const captureOld = runtimeHost.subscribe((event) => {
+    if (event.type === "session" && event.sessionId === null) oldLaunchId = event.launchId;
+  });
+  const agent = { agentId, name: agentId, runtime: "pi", model: "model", feishuAppId: agentId, feishuAppSecret: "fixture",
+    feishuProfile: agentId, feishuDomain: "https://open.feishu.cn", workspaceDir: path.join(root, "agents", agentId), stateDir };
+  let channelCreated = false;
+  const channelPackage = { createLarkChannel() { channelCreated = true; return {
+    botIdentity: { openId: "ou_host_null_listener", name: "Null Listener" }, rawClient: null, dispatcher: { register() {} }, on() {},
+    async connect() {}, async disconnect() {},
+  }; } };
+  const env = { LARKIN_HOME: root, LARKIN_CONFIG_DIR: root, LARKIN_SERVER_ID: "server-host-null-listener",
+    LARKIN_AGENTS_CONFIG: JSON.stringify([agent]), LARKIN_INBOUND_DROUGHT_SEC: "0" };
+  const host = createHostShell({ env, runtimeHost, channelPackage, eventSourceStartDelayMs: 0 });
+  try {
+    await host.start();
+    const channelDeadline = Date.now() + 1_000;
+    while (!channelCreated && Date.now() < channelDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(channelCreated, true);
+    runtimeHost.subscribe((event) => {
+      if (event.type === "session" && event.sessionId === "fresh-host-null-listener") throw new Error("later null-session listener failure");
+    });
+    await assert.rejects(host.recoverSession(agentId, "context-overflow", 0), /later null-session listener failure|not committed/);
+    assert.equal(typeof oldLaunchId, "string");
+    assert.deepEqual(sessions[0].closes, []);
+    assert.deepEqual(sessions[1].closes, ["context-window recovery not committed"]);
+    assert.equal(store.readJson("agentState", {}).sessions.pi, undefined);
+    const status = store.readJson("status", {});
+    assert.equal(status.session.id, null);
+    assert.equal(status.session.launchId, oldLaunchId);
+    assert.equal(store.readJson("runtimeDeliveries", { records: [] }).records[0].status, "error");
+  } finally {
+    captureOld();
+    await host.shutdown("assembled null-session listener failure test complete");
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
@@ -324,6 +594,49 @@ test("channel options disable inbound message merging (issue #88)", async () => 
       "必须关闭 SDK 防抖批量合并，逐条投递以保持身份与内容同源（#88/#66）");
   } finally {
     await host.shutdown("issue88 test complete");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("drought reconnect scans accepted inbox_update deliveries as a second fallback", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-drought-inbox-scan-"));
+  const agentId = "cli_droughtScanA1";
+  const scans = [];
+  const runtimeHost = {
+    subscribe() { return () => {}; },
+    async start() {},
+    async deliver() { throw new Error("not used"); },
+    async stop() {},
+    async shutdown() {},
+    async scanPendingInboxUpdates(id) { scans.push(id ?? null); },
+  };
+  let disconnects = 0;
+  const channelPackage = {
+    createLarkChannel() {
+      return {
+        botIdentity: { openId: "ou_drought_scan", name: "DroughtScan" },
+        rawClient: null,
+        dispatcher: { register() {} },
+        on() {},
+        async connect() {},
+        async disconnect() { disconnects += 1; },
+      };
+    },
+  };
+  const agent = { agentId, name: agentId, runtime: "codex", model: "gpt", feishuAppId: agentId,
+    feishuAppSecret: "fixture-secret", feishuProfile: agentId, feishuDomain: "https://open.feishu.cn",
+    workspaceDir: path.join(root, "agents", agentId), stateDir: path.join(root, "state", "agents", agentId) };
+  const env = { LARKIN_HOME: root, LARKIN_CONFIG_DIR: root, LARKIN_SERVER_ID: "server-drought-scan",
+    LARKIN_AGENTS_CONFIG: JSON.stringify([agent]), LARKIN_INBOUND_DROUGHT_SEC: "1" };
+  const host = createHostShell({ env, runtimeHost, channelPackage, eventSourceStartDelayMs: 0 });
+  try {
+    await host.start();
+    const deadline = Date.now() + 4_000;
+    while (scans.length === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.deepEqual(scans, [agentId], "preventive reconnect must scan pending inbox_update deliveries");
+    assert.ok(disconnects >= 1, "drought fallback must disconnect the silent channel before scanning");
+  } finally {
+    await host.shutdown("drought inbox scan test complete");
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

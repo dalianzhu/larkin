@@ -4,10 +4,26 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "bun:test";
 import { ContextPromptBuilder } from "../../../dist/agent/context-prompt.mjs";
-import { createRuntimeHost } from "../../../dist/runtime/runtime-host.mjs";
+import { createRuntimeHost as createProductionRuntimeHost } from "../../../dist/runtime/runtime-host.mjs";
 import { RuntimePrerequisiteError } from "../../../dist/runtime/runtime-readiness.mjs";
+import { calculatePiCompactionSettings } from "../../../dist/runtime/pi-compaction-recovery.mjs";
 import { createAgentStateStore } from "../../../dist/agent/agent-state-store.mjs";
 import { ProcessingEyeOrchestrator } from "../../../dist/feishu/host-processing-eye.mjs";
+
+// Unrelated RuntimeHost scenarios use a producer-valid canonical chat locator. The dedicated
+// runtime-inbox-target contract invokes the unwrapped production host for rejection coverage.
+function createRuntimeHost(options) {
+  const host = createProductionRuntimeHost(options);
+  const deliver = host.deliver.bind(host);
+  host.deliver = (agentId, envelope) => {
+    const messageId = typeof envelope?.message_id === "string" ? envelope.message_id : "";
+    const alreadyLocatable = typeof envelope?.target === "string" || typeof envelope?.chat_id === "string"
+      || (envelope?.kind === "reminder" && /^rem_[A-Za-z0-9_-]+$/.test(messageId))
+      || (envelope?.kind === "redelivery" && /^redeliver_[A-Za-z0-9_-]+$/.test(messageId));
+    return deliver(agentId, alreadyLocatable ? envelope : { ...envelope, chat_id: "oc_runtime_host_fixture" });
+  };
+  return host;
+}
 
 class FakeSession {
   sessionId = "session-1";
@@ -17,7 +33,16 @@ class FakeSession {
   cancels = [];
   closes = [];
   nextBusy = null;
-  subscribe(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); }
+  subscribeFailure = null;
+  unsubscribeFailure = null;
+  subscribe(fn) {
+    if (this.subscribeFailure) throw new Error(this.subscribeFailure);
+    this.listeners.add(fn);
+    return () => {
+      if (this.unsubscribeFailure) throw new Error(this.unsubscribeFailure);
+      this.listeners.delete(fn);
+    };
+  }
   emit(event) { for (const fn of this.listeners) fn(event); }
   async prompt(input) { this.prompts.push(input); return { status: "accepted", inputId: input.inputId }; }
   async busyInput(input) {
@@ -27,6 +52,719 @@ class FakeSession {
   async cancel(reason) { this.cancels.push(reason); }
   async close(reason) { this.closes.push(reason); }
 }
+
+test("RuntimeHost manually compacts one exact overflow and retries the same stable input once", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-pi-manual-compaction-"));
+  const agentId = "cli_piManualA1";
+  const store = createAgentStateStore(root, agentId);
+  let releaseCompact;
+  class CompactingSession extends FakeSession {
+    compactCalls = 0;
+    async compact() { this.compactCalls += 1; await new Promise((resolve) => { releaseCompact = resolve; }); return {}; }
+  }
+  const session = new CompactingSession();
+  const adapter = { id: "pi", capabilities: {}, async createSession() { return session; } };
+  const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store });
+  try {
+    await host.start([{ agentId, name: "manual", runtime: "pi", model: "model", workspaceDir: "/tmp", stateDir: root }]);
+    store.appendNdjson("inbox", { message_id: "om_pi_manual", chat_id: "oc_pi_manual", content: "stable" });
+    const first = await host.deliver(agentId, { message_id: "om_pi_manual", chat_id: "oc_pi_manual", content: "stable" });
+    assert.equal(first.status, "accepted");
+    const inputId = session.prompts[0].inputId;
+    session.emit({ type: "input-error", inputId, retryable: false, willRetry: false,
+      message: "Your input exceeds the context window of this model. Please adjust your input and try again.", errorCategory: "context_window" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(session.compactCalls, 1);
+    const breaker = JSON.parse(fs.readFileSync(path.join(root, "piCompactionRecovery.json"), "utf8"));
+    assert.equal(breaker.records[0].manualAttempt, 1);
+    session.emit({ type: "runtime-observation", runtime: "pi", distribution: "external", phase: "compaction_end",
+      reason: "manual", success: true, willRetry: false });
+    releaseCompact();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(session.prompts.length, 2, `compact=${session.compactCalls} breaker=${fs.readFileSync(path.join(root, "piCompactionRecovery.json"), "utf8")}`);
+    assert.equal(session.prompts[1].inputId, inputId);
+    assert.equal(session.prompts[1].deliveryId, session.prompts[0].deliveryId);
+    assert.equal(session.compactCalls, 1);
+  } finally {
+    await host.shutdown("done");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("RuntimeHost refuses overflow retry when the Pi policy drifts before compact", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-pi-overflow-policy-drift-"));
+  const agentId = "cli_piDriftA1";
+  const store = createAgentStateStore(root, agentId);
+  let createCalls = 0;
+  class DriftingSession extends FakeSession {
+    compactCalls = 0;
+    async compact() {
+      this.compactCalls += 1;
+      throw new Error("Pi model or context window changed after startup; compaction policy is no longer safe");
+    }
+  }
+  const session = new DriftingSession();
+  const adapter = {
+    id: "pi", capabilities: {},
+    async createSession() {
+      createCalls += 1;
+      if (createCalls > 1) throw new Error("Pi model or context window changed between the isolated probe and runtime startup");
+      return session;
+    },
+  };
+  const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store });
+  try {
+    await host.start([{ agentId, name: "drift", runtime: "pi", model: "model", workspaceDir: "/tmp", stateDir: root }]);
+    store.appendNdjson("inbox", { message_id: "om_pi_overflow_drift", chat_id: "oc_pi_overflow_drift", content: "stable" });
+    const first = await host.deliver(agentId, { message_id: "om_pi_overflow_drift", chat_id: "oc_pi_overflow_drift", content: "stable" });
+    assert.equal(first.status, "accepted");
+    const inputId = session.prompts[0].inputId;
+    session.emit({ type: "input-error", inputId, retryable: false, willRetry: false,
+      message: "Your input exceeds the context window of this model. Please adjust your input and try again.", errorCategory: "context_window" });
+    const deadline = Date.now() + 1_000;
+    while (session.compactCalls < 1 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(session.compactCalls, 1);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(session.prompts.length, 1, "policy drift must prevent the retry prompt submission");
+    const durable = store.readJson("runtimeDeliveries", { records: [] });
+    assert.equal(durable.records.some((record) => record.status === "consumed"), false);
+    assert.ok(durable.records.some((record) => record.status === "error" || record.status === "pending"));
+  } finally {
+    await host.shutdown("done");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("RuntimeHost proactively compacts only above each session's verified dynamic threshold", async () => {
+  for (const contextWindow of [272_000, 500_000]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-pi-proactive-"));
+    const policy = calculatePiCompactionSettings(contextWindow);
+    class ProactiveSession extends FakeSession {
+      usage = { tokens: policy.threshold, contextWindow };
+      compactCalls = 0;
+      async getContextUsage() { return { ...this.usage }; }
+      async compact() { this.compactCalls += 1; this.usage.tokens = 100; }
+    }
+    const session = new ProactiveSession();
+    const adapter = { id: "pi", capabilities: {}, async createSession() { return session; } };
+    const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder() });
+    try {
+      await host.start([{ agentId: `cli_piProactive${contextWindow}`, name: "proactive", runtime: "pi", model: "model", workspaceDir: "/tmp", stateDir: root }]);
+      session.usage.tokens = policy.threshold + 1;
+      session.emit({ type: "turn-start" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(session.compactCalls, 0, "busy turns must not trigger idle proactive compaction");
+      session.emit({ type: "turn-end" });
+      session.emit({ type: "turn-end" });
+      const deadline = Date.now() + 1_000;
+      while (session.compactCalls < 1 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.equal(session.compactCalls, 1);
+      assert.equal(session.usage.tokens, 100);
+      session.usage.tokens = policy.threshold + 1;
+      session.emit({ type: "turn-end" });
+      const secondDeadline = Date.now() + 1_000;
+      while (session.compactCalls < 2 && Date.now() < secondDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.equal(session.compactCalls, 2, "a later idle turn may compact again after verified success");
+    } finally {
+      await host.shutdown("done");
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("RuntimeHost does not proactively compact at the strict threshold", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-pi-proactive-equal-"));
+  const contextWindow = 500_000;
+  const policy = calculatePiCompactionSettings(contextWindow);
+  class EqualSession extends FakeSession {
+    compactCalls = 0;
+    async getContextUsage() { return { tokens: policy.threshold, contextWindow }; }
+    async compact() { this.compactCalls += 1; }
+  }
+  const session = new EqualSession();
+  const adapter = { id: "pi", capabilities: {}, async createSession() { return session; } };
+  const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder() });
+  try {
+    await host.start([{ agentId: "cli_piProactiveEqualA1", name: "equal", runtime: "pi", model: "model", workspaceDir: "/tmp", stateDir: root }]);
+    session.emit({ type: "turn-end" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(session.compactCalls, 0);
+  } finally {
+    await host.shutdown("done");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("RuntimeHost bounds proactive compact failure without retry or session reset", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-pi-proactive-failure-"));
+  const policy = calculatePiCompactionSettings(272_000);
+  class FailingSession extends FakeSession {
+    compactCalls = 0;
+    async getContextUsage() { return { tokens: policy.threshold + 1, contextWindow: 272_000 }; }
+    async compact() { this.compactCalls += 1; throw new Error("fixture proactive compact failure"); }
+  }
+  const session = new FailingSession();
+  const store = createAgentStateStore(root, "cli_piProactiveFailureA1");
+  store.appendNdjson("inbox", { message_id: "om_pi_proactive_failure", chat_id: "oc_pi_proactive_failure", content: "pending" });
+  const adapter = { id: "pi", capabilities: {}, async createSession() { return session; } };
+  const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store });
+  try {
+    await host.start([{ agentId: "cli_piProactiveFailureA1", name: "failure", runtime: "pi", model: "model", workspaceDir: "/tmp", stateDir: root }]);
+    session.emit({ type: "turn-end" });
+    session.emit({ type: "turn-end" });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(session.compactCalls, 1);
+    assert.equal(session.closes.length, 0, "proactive failure must not reset the session");
+    const receipt = await host.deliver("cli_piProactiveFailureA1", {
+      message_id: "om_pi_proactive_failure", chat_id: "oc_pi_proactive_failure", content: "pending",
+    });
+    assert.equal(receipt.status, "deferred");
+    assert.equal(session.prompts.length, 0, "degraded generation must not submit pending work");
+    assert.equal(store.readJson("runtimeDeliveries", { records: [] }).records[0].status, "pending");
+  } finally {
+    await host.shutdown("done");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("RuntimeHost gates startup replay behind high-water proactive compaction", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-pi-proactive-startup-"));
+  const agentId = "cli_piProactiveStartupA1";
+  const store = createAgentStateStore(root, agentId);
+  const policy = calculatePiCompactionSettings(500_000);
+  store.appendNdjson("inbox", { message_id: "om_pi_proactive_startup", chat_id: "oc_pi_proactive_startup", content: "startup" });
+  store.writeJson("runtimeDeliveries", { version: 1, records: [{
+    deliveryId: "startup-delivery", messageId: "om_pi_proactive_startup", status: "pending",
+    input: { inputId: "startup-input", deliveryId: "startup-delivery", kind: "wake", text: "startup", attempt: 0 },
+    updatedAt: "before",
+  }] });
+  const order = [];
+  let releaseCompact;
+  class StartupSession extends FakeSession {
+    usage = { tokens: policy.threshold + 1, contextWindow: 500_000 };
+    compactCalls = 0;
+    async getContextUsage() { return { ...this.usage }; }
+    async compact() {
+      order.push("compact"); this.compactCalls += 1;
+      await new Promise((resolve) => { releaseCompact = resolve; });
+      this.usage.tokens = 100;
+    }
+    async prompt(input) { order.push("prompt"); return super.prompt(input); }
+  }
+  const session = new StartupSession();
+  const adapter = { id: "pi", capabilities: {}, async createSession() { return session; } };
+  const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store });
+  try {
+    const starting = host.start([{ agentId, name: "startup", runtime: "pi", model: "model", workspaceDir: "/tmp", stateDir: root }]);
+    const deadline = Date.now() + 1_000;
+    while (session.compactCalls < 1 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(session.compactCalls, 1);
+    session.emit({ type: "turn-end" });
+    session.emit({ type: "turn-end" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(order, ["compact"]);
+    releaseCompact();
+    await starting;
+    assert.deepEqual(order, ["compact", "prompt"]);
+  } finally {
+    await host.shutdown("done");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("RuntimeHost wakes once for a canonical late completion and re-wakes for a later independent one", async () => {
+  const session = new FakeSession();
+  const adapter = { id: "pi", capabilities: {}, async createSession() { return session; } };
+  const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder() });
+  try {
+    await host.start([{ agentId: "cli_piWakeA1", name: "wake", runtime: "pi", model: "model", workspaceDir: "/tmp" }]);
+    await host.deliver("cli_piWakeA1", { message_id: "om_pi_wake", chat_id: "oc_pi_wake", content: "start" });
+    session.emit({ type: "turn-start" });
+    session.emit({ type: "turn-end" });
+    assert.equal(session.prompts.length, 1);
+    session.emit({ type: "runtime-observation", runtime: "pi", distribution: "builtin", phase: "completed", completionKey: "task-bridge-1" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(session.prompts.length, 2);
+    assert.equal(session.prompts[1].kind, "wake");
+    session.emit({ type: "turn-start" });
+    session.emit({ type: "turn-end" });
+    session.emit({ type: "runtime-observation", runtime: "pi", distribution: "builtin", phase: "completed", completionKey: "task-bridge-1" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(session.prompts.length, 2);
+    session.emit({ type: "runtime-observation", runtime: "pi", distribution: "builtin", phase: "completed", completionKey: "task-bridge-2" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(session.prompts.length, 3);
+    assert.equal(session.prompts[2].kind, "wake");
+    assert.match(session.prompts[2].text, /Inbox changed|reason=background subagent completed/i);
+  } finally {
+    await host.shutdown("done");
+  }
+});
+
+test("RuntimeHost ignores background completion wake bridges while busy or mid-turn", async () => {
+  const session = new FakeSession();
+  const adapter = { id: "pi", capabilities: {}, async createSession() { return session; } };
+  const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder() });
+  try {
+    await host.start([{ agentId: "cli_piWakeBusyA1", name: "wake-busy", runtime: "pi", model: "model", workspaceDir: "/tmp" }]);
+    await host.deliver("cli_piWakeBusyA1", { message_id: "om_pi_wake_busy", chat_id: "oc_pi_wake_busy", content: "start" });
+    session.emit({ type: "runtime-observation", runtime: "pi", distribution: "builtin", phase: "completed", completionKey: "task-busy-1" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(session.prompts.length, 1);
+    session.emit({ type: "turn-start" });
+    session.emit({ type: "runtime-observation", runtime: "pi", distribution: "builtin", phase: "completed", completionKey: "task-busy-2" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(session.prompts.length, 1);
+  } finally {
+    await host.shutdown("done");
+  }
+});
+
+test("RuntimeHost drains a completion queued while a rejected foreground prompt is submitting", async () => {
+  let releaseForeground;
+  const session = new FakeSession();
+  session.prompt = async function(input) {
+    this.prompts.push(input);
+    if (this.prompts.length === 1) {
+      return new Promise((_, reject) => {
+        releaseForeground = () => reject(new Error("foreground prompt rejected before turn-start"));
+      });
+    }
+    return { status: "accepted", inputId: input.inputId };
+  };
+  const adapter = { id: "pi", capabilities: {}, async createSession() { return session; } };
+  const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder() });
+  try {
+    await host.start([{ agentId: "cli_piWakeSubmitRejectA1", name: "wake-submit-reject", runtime: "pi", model: "model", workspaceDir: "/tmp" }]);
+    const delivering = host.deliver("cli_piWakeSubmitRejectA1", {
+      message_id: "om_pi_wake_submit_reject", chat_id: "oc_pi_wake_submit_reject", content: "start",
+    });
+    const waitForFirst = Date.now() + 1_000;
+    while (session.prompts.length < 1 && Date.now() < waitForFirst) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(session.prompts.length, 1);
+    session.emit({ type: "runtime-observation", runtime: "pi", distribution: "builtin", phase: "completed", completionKey: "task-submit-reject-1" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(session.prompts.length, 1, "must not wake while the foreground prompt is still submitting");
+    releaseForeground();
+    const receipt = await delivering;
+    assert.equal(receipt.status, "deferred");
+    const deadline = Date.now() + 1_000;
+    while (session.prompts.length < 2 && Date.now() < deadline) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(session.prompts.length, 2, "a later drain must still wake after submit clears without turn-start");
+    assert.equal(session.prompts[1].kind, "wake");
+    assert.match(session.prompts[1].text, /reason=background subagent completed/i);
+  } finally {
+    await host.shutdown("done");
+  }
+});
+
+test("RuntimeHost ignores additional completion wake bridges while a wake prompt is submitting", async () => {
+  let releaseWake;
+  const session = new FakeSession();
+  session.prompt = async function(input) {
+    this.prompts.push(input);
+    if (this.prompts.length === 2) return new Promise((resolve) => { releaseWake = () => resolve({ status: "accepted", inputId: input.inputId }); });
+    return { status: "accepted", inputId: input.inputId };
+  };
+  const adapter = { id: "pi", capabilities: {}, async createSession() { return session; } };
+  const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder() });
+  try {
+    await host.start([{ agentId: "cli_piWakeSubmitA1", name: "wake-submit", runtime: "pi", model: "model", workspaceDir: "/tmp" }]);
+    await host.deliver("cli_piWakeSubmitA1", { message_id: "om_pi_wake_submit", chat_id: "oc_pi_wake_submit", content: "start" });
+    session.emit({ type: "turn-start" });
+    session.emit({ type: "turn-end" });
+    assert.equal(session.prompts.length, 1);
+    session.emit({ type: "runtime-observation", runtime: "pi", distribution: "builtin", phase: "completed", completionKey: "task-submit-1" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(session.prompts.length, 2);
+    session.emit({ type: "runtime-observation", runtime: "pi", distribution: "builtin", phase: "completed", completionKey: "task-submit-2" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(session.prompts.length, 2);
+    releaseWake();
+    await new Promise((resolve) => setImmediate(resolve));
+    session.emit({ type: "turn-start" });
+    session.emit({ type: "turn-end" });
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    await host.shutdown("done");
+  }
+});
+
+test("RuntimeHost wakes both concurrent idle background completions", async () => {
+  const session = new FakeSession();
+  const adapter = { id: "pi", capabilities: {}, async createSession() { return session; } };
+  const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder() });
+  try {
+    await host.start([{ agentId: "cli_piWakeBothA1", name: "wake-both", runtime: "pi", model: "model", workspaceDir: "/tmp" }]);
+    await host.deliver("cli_piWakeBothA1", { message_id: "om_pi_wake_both", chat_id: "oc_pi_wake_both", content: "start" });
+    session.emit({ type: "turn-start" });
+    session.emit({ type: "turn-end" });
+    assert.equal(session.prompts.length, 1);
+    session.emit({ type: "runtime-observation", runtime: "pi", distribution: "builtin", phase: "completed", completionKey: "task-concurrent-1" });
+    session.emit({ type: "runtime-observation", runtime: "pi", distribution: "builtin", phase: "completed", completionKey: "task-concurrent-2" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(session.prompts.length, 2, "first idle completion must reserve and wake before the second drain can drop the queue head");
+    assert.equal(session.prompts[1].kind, "wake");
+    session.emit({ type: "turn-start" });
+    session.emit({ type: "turn-end" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(session.prompts.length, 3, "second concurrent idle completion must still wake after the first turn ends");
+    assert.equal(session.prompts[2].kind, "wake");
+  } finally {
+    await host.shutdown("done");
+  }
+});
+
+const isBackgroundCompletionWake = (input) => input?.kind === "wake"
+  && /reason=background subagent completed/i.test(String(input.text || ""));
+
+test("RuntimeHost retries a rejected background completion wake", async () => {
+  let wakeAttempts = 0;
+  const session = new FakeSession();
+  session.prompt = async function(input) {
+    this.prompts.push(input);
+    if (isBackgroundCompletionWake(input)) {
+      wakeAttempts += 1;
+      if (wakeAttempts === 1) {
+        return { status: "rejected", inputId: input.inputId, retryable: true, reason: "wake rejected" };
+      }
+    }
+    return { status: "accepted", inputId: input.inputId };
+  };
+  const adapter = { id: "pi", capabilities: {}, async createSession() { return session; } };
+  const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder() });
+  try {
+    await host.start([{ agentId: "cli_piWakeRetryA1", name: "wake-retry", runtime: "pi", model: "model", workspaceDir: "/tmp" }]);
+    await host.deliver("cli_piWakeRetryA1", { message_id: "om_pi_wake_retry", chat_id: "oc_pi_wake_retry", content: "start" });
+    session.emit({ type: "turn-start" });
+    session.emit({ type: "turn-end" });
+    assert.equal(session.prompts.length, 1);
+    session.emit({ type: "runtime-observation", runtime: "pi", distribution: "builtin", phase: "completed", completionKey: "task-retry-1" });
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(wakeAttempts, 2, "a rejected idle wake must schedule another drain without a second completion event");
+    assert.equal(session.prompts.length, 3, "the same completion must be able to wake again after a rejected prompt");
+    assert.equal(session.prompts[2].kind, "wake");
+    session.emit({ type: "runtime-observation", runtime: "pi", distribution: "builtin", phase: "completed", completionKey: "task-retry-1" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(wakeAttempts, 2, "the accepted retry must keep the completion deduped");
+  } finally {
+    await host.shutdown("done");
+  }
+});
+
+test("RuntimeHost still wakes after five immediate rejected background completion drains", async () => {
+  let wakeAttempts = 0;
+  const session = new FakeSession();
+  session.prompt = async function(input) {
+    this.prompts.push(input);
+    if (isBackgroundCompletionWake(input)) {
+      wakeAttempts += 1;
+      if (wakeAttempts <= 5) throw new Error("preflight RPC unavailable");
+    }
+    return { status: "accepted", inputId: input.inputId };
+  };
+  const adapter = { id: "pi", capabilities: {}, async createSession() { return session; } };
+  const host = createRuntimeHost({
+    adapterFor: () => adapter,
+    promptBuilder: new ContextPromptBuilder(),
+    retryPolicy: { baseDelayMs: 20, maxDelayMs: 40, maxAttempts: 3 },
+  });
+  try {
+    await host.start([{ agentId: "cli_piWakeBackoffA1", name: "wake-backoff", runtime: "pi", model: "model", workspaceDir: "/tmp" }]);
+    await host.deliver("cli_piWakeBackoffA1", { message_id: "om_pi_wake_backoff", chat_id: "oc_pi_wake_backoff", content: "start" });
+    session.emit({ type: "turn-start" });
+    session.emit({ type: "turn-end" });
+    assert.equal(session.prompts.length, 1);
+    session.emit({ type: "runtime-observation", runtime: "pi", distribution: "builtin", phase: "completed", completionKey: "task-backoff-1" });
+    for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(wakeAttempts, 5, "five immediate rejects must not abandon the queued completion");
+    assert.equal(session.prompts.filter(isBackgroundCompletionWake).length, 5);
+    const deadline = Date.now() + 200;
+    while (wakeAttempts < 6 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(wakeAttempts, 6, "a later backoff drain must still wake while the item remains queued");
+    assert.equal(session.prompts.at(-1).kind, "wake");
+  } finally {
+    await host.shutdown("done");
+  }
+});
+
+test("RuntimeHost keeps an accepted wake queued until the turn succeeds", async () => {
+  let wakeAttempts = 0;
+  const session = new FakeSession();
+  session.prompt = async function(input) {
+    this.prompts.push(input);
+    if (isBackgroundCompletionWake(input)) wakeAttempts += 1;
+    return { status: "accepted", inputId: input.inputId };
+  };
+  const adapter = { id: "pi", capabilities: {}, async createSession() { return session; } };
+  const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder() });
+  try {
+    await host.start([{ agentId: "cli_piWakeRearmA1", name: "wake-rearm", runtime: "pi", model: "model", workspaceDir: "/tmp" }]);
+    await host.deliver("cli_piWakeRearmA1", { message_id: "om_pi_wake_rearm", chat_id: "oc_pi_wake_rearm", content: "start" });
+    session.emit({ type: "turn-start" });
+    session.emit({ type: "turn-end" });
+    assert.equal(session.prompts.length, 1);
+    session.emit({ type: "runtime-observation", runtime: "pi", distribution: "builtin", phase: "completed", completionKey: "task-rearm-1" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(wakeAttempts, 1);
+    const wake = session.prompts.find(isBackgroundCompletionWake);
+    assert.ok(wake);
+    session.emit({ type: "turn-start" });
+    session.emit({ type: "input-error", inputId: wake.inputId, retryable: true, willRetry: false, message: "Pi assistant turn aborted" });
+    session.emit({ type: "turn-end" });
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(wakeAttempts, 2, "an accepted wake that aborts must be re-armed and drained again");
+    session.emit({ type: "turn-start" });
+    session.emit({ type: "turn-end" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(wakeAttempts, 2, "a successful wake turn must dequeue the completion");
+  } finally {
+    await host.shutdown("done");
+  }
+});
+
+test("RuntimeHost does not retry a terminal background wake input-error unbounded", async () => {
+  let wakeAttempts = 0;
+  const session = new FakeSession();
+  session.prompt = async function(input) {
+    this.prompts.push(input);
+    if (isBackgroundCompletionWake(input)) wakeAttempts += 1;
+    return { status: "accepted", inputId: input.inputId };
+  };
+  const adapter = { id: "pi", capabilities: {}, async createSession() { return session; } };
+  const host = createRuntimeHost({
+    adapterFor: () => adapter,
+    promptBuilder: new ContextPromptBuilder(),
+    retryPolicy: { baseDelayMs: 15, maxDelayMs: 20, maxAttempts: 1 },
+  });
+  try {
+    await host.start([{ agentId: "cli_piWakeBoundA1", name: "wake-bound", runtime: "pi", model: "model", workspaceDir: "/tmp" }]);
+    await host.deliver("cli_piWakeBoundA1", { message_id: "om_pi_wake_bound", chat_id: "oc_pi_wake_bound", content: "start" });
+    session.emit({ type: "turn-start" });
+    session.emit({ type: "turn-end" });
+    session.emit({ type: "runtime-observation", runtime: "pi", distribution: "builtin", phase: "completed", completionKey: "task-bound-1" });
+    const deadline = Date.now() + 400;
+    while (Date.now() < deadline) {
+      const wake = session.prompts.filter(isBackgroundCompletionWake).at(-1);
+      if (wake) {
+        session.emit({ type: "turn-start" });
+        session.emit({
+          type: "input-error", inputId: wake.inputId, retryable: true, willRetry: false,
+          message: "persistent upstream failure",
+        });
+        session.emit({ type: "turn-end" });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(wakeAttempts, 6, "accepted+terminal input-error must consume the immediate streak and one delayed attempt");
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(wakeAttempts, 6, "an accepted prompt must not reset the wake retry streak");
+  } finally {
+    await host.shutdown("done");
+  }
+});
+
+test("RuntimeHost consults the idle compaction gate before a background completion wake", async () => {
+  const policy = calculatePiCompactionSettings(272_000);
+  const order = [];
+  class GateSession extends FakeSession {
+    usage = { tokens: 100, contextWindow: 272_000 };
+    compactCalls = 0;
+    async getContextUsage() { order.push("usage"); return { ...this.usage }; }
+    async compact() { order.push("compact"); this.compactCalls += 1; this.usage.tokens = 100; }
+    async prompt(input) { order.push("prompt"); return super.prompt(input); }
+  }
+  const session = new GateSession();
+  const adapter = { id: "pi", capabilities: {}, async createSession() { return session; } };
+  const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder() });
+  try {
+    await host.start([{ agentId: "cli_piWakeCompactA1", name: "wake-compact", runtime: "pi", model: "model", workspaceDir: "/tmp" }]);
+    await host.deliver("cli_piWakeCompactA1", { message_id: "om_pi_wake_compact", chat_id: "oc_pi_wake_compact", content: "start" });
+    session.emit({ type: "turn-start" });
+    session.emit({ type: "turn-end" });
+    const firstPromptAt = order.lastIndexOf("prompt");
+    assert.equal(session.prompts.length, 1);
+    assert.equal(session.compactCalls, 0, "the first delivery stays below the idle threshold");
+    session.usage.tokens = policy.threshold + 1;
+    session.emit({ type: "runtime-observation", runtime: "pi", distribution: "builtin", phase: "completed", completionKey: "task-compact-1" });
+    const deadline = Date.now() + 1_000;
+    while (session.prompts.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(session.compactCalls, 1, "the wake drain must consult the idle compaction gate");
+    assert.equal(session.prompts.length, 2);
+    assert.equal(session.prompts[1].kind, "wake");
+    assert.ok(order.indexOf("compact", firstPromptAt) >= 0);
+    assert.ok(order.indexOf("compact", firstPromptAt) < order.indexOf("prompt", firstPromptAt + 1));
+  } finally {
+    await host.shutdown("done");
+  }
+});
+
+test("RuntimeHost does not let an exhausted background wake block a later completion", async () => {
+  let wakeAttempts = 0;
+  const session = new FakeSession();
+  session.prompt = async function(input) {
+    this.prompts.push(input);
+    if (isBackgroundCompletionWake(input)) {
+      wakeAttempts += 1;
+      if (wakeAttempts <= 6) return { status: "rejected", inputId: input.inputId, retryable: true, reason: "head still failing" };
+    }
+    return { status: "accepted", inputId: input.inputId };
+  };
+  const adapter = { id: "pi", capabilities: {}, async createSession() { return session; } };
+  const host = createRuntimeHost({
+    adapterFor: () => adapter,
+    promptBuilder: new ContextPromptBuilder(),
+    retryPolicy: { baseDelayMs: 15, maxDelayMs: 20, maxAttempts: 1 },
+  });
+  try {
+    await host.start([{ agentId: "cli_piWakeSkipA1", name: "wake-skip", runtime: "pi", model: "model", workspaceDir: "/tmp" }]);
+    await host.deliver("cli_piWakeSkipA1", { message_id: "om_pi_wake_skip", chat_id: "oc_pi_wake_skip", content: "start" });
+    session.emit({ type: "turn-start" });
+    session.emit({ type: "turn-end" });
+    session.emit({ type: "runtime-observation", runtime: "pi", distribution: "builtin", phase: "completed", completionKey: "task-skip-head" });
+    session.emit({ type: "runtime-observation", runtime: "pi", distribution: "builtin", phase: "completed", completionKey: "task-skip-later" });
+    const deadline = Date.now() + 400;
+    while (wakeAttempts < 7 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(wakeAttempts, 7, "after the exhausted head is dropped the later completion must still wake");
+    assert.equal(session.prompts.filter(isBackgroundCompletionWake).length, 7);
+    assert.equal(session.prompts.at(-1).kind, "wake");
+  } finally {
+    await host.shutdown("done");
+  }
+});
+
+test("RuntimeHost preserves queued background completions across session replacement", async () => {
+  const sessions = [];
+  const adapter = { id: "pi", capabilities: {}, async createSession() {
+    const session = new FakeSession();
+    session.sessionId = `wake-replace-${sessions.length + 1}`;
+    sessions.push(session);
+    return session;
+  } };
+  const host = createRuntimeHost({
+    adapterFor: () => adapter,
+    promptBuilder: new ContextPromptBuilder(),
+    retryPolicy: { baseDelayMs: 5, maxDelayMs: 10, maxAttempts: 3 },
+  });
+  try {
+    await host.start([{ agentId: "cli_piWakeReplaceA1", name: "wake-replace", runtime: "pi", model: "model", workspaceDir: "/tmp" }]);
+    await host.deliver("cli_piWakeReplaceA1", { message_id: "om_pi_wake_replace", chat_id: "oc_pi_wake_replace", content: "start" });
+    sessions[0].emit({ type: "turn-start" });
+    sessions[0].emit({ type: "runtime-observation", runtime: "pi", distribution: "builtin", phase: "completed", completionKey: "task-replace-1" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(sessions[0].prompts.length, 1, "busy turn must queue the completion instead of waking immediately");
+    sessions[0].emit({ type: "closed", code: 1, signal: null });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(sessions.length, 2, "closed runtime must be recreated");
+    sessions[1].emit({ type: "turn-start" });
+    sessions[1].emit({ type: "turn-end" });
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(sessions[1].prompts.some(isBackgroundCompletionWake),
+      "queued completion must wake on the replacement session");
+  } finally {
+    await host.shutdown("done");
+  }
+});
+
+test("RuntimeHost reschedules an inherited completion drain after stage commit clears backoff", async () => {
+  let wakeAttempts = 0;
+  const sessions = [];
+  class StageSession extends FakeSession {
+    async prompt(input) {
+      this.prompts.push(input);
+      if (isBackgroundCompletionWake(input)) {
+        wakeAttempts += 1;
+        if (sessions[0] === this && wakeAttempts <= 5) throw new Error("preflight RPC unavailable");
+      }
+      return { status: "accepted", inputId: input.inputId };
+    }
+  }
+  const adapter = { id: "pi", capabilities: {}, async createSession(input) {
+    const session = new StageSession();
+    session.sessionId = input.model === "next" ? "stage-next" : `stage-old-${sessions.length + 1}`;
+    sessions.push(session);
+    return session;
+  } };
+  const host = createRuntimeHost({
+    adapterFor: () => adapter,
+    promptBuilder: new ContextPromptBuilder(),
+    retryPolicy: { baseDelayMs: 250, maxDelayMs: 250, maxAttempts: 3 },
+  });
+  const base = { agentId: "cli_piWakeStageA1", name: "wake-stage", runtime: "pi", workspaceDir: "/tmp" };
+  try {
+    await host.start([{ ...base, model: "old" }]);
+    await host.deliver(base.agentId, { message_id: "om_pi_wake_stage", chat_id: "oc_pi_wake_stage", content: "start" });
+    sessions[0].emit({ type: "turn-start" });
+    sessions[0].emit({ type: "turn-end" });
+    sessions[0].emit({ type: "runtime-observation", runtime: "pi", distribution: "builtin", phase: "completed", completionKey: "task-stage-1" });
+    for (let i = 0; i < 12; i++) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(wakeAttempts, 5, "five immediate rejects must arm the inherited backoff timer");
+    const staged = await host.stage({ ...base, model: "next" });
+    await staged.commit();
+    assert.equal(sessions.length, 2);
+    const deadline = Date.now() + 1_000;
+    while (!sessions[1].prompts.some(isBackgroundCompletionWake) && Date.now() < deadline) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.ok(sessions[1].prompts.some(isBackgroundCompletionWake),
+      "stage commit that clears backoff must still drain the inherited queue");
+  } finally {
+    await host.shutdown("done");
+  }
+});
+
+test("RuntimeHost treats a failed manual compact as an internal fresh-session fallback", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-pi-fallback-"));
+  const agentId = "cli_piFallbackA1";
+  const store = createAgentStateStore(root, agentId);
+  const sessions = [];
+  class FailingCompactionSession extends FakeSession {
+    async compact() { throw new Error("compact RPC unavailable after send"); }
+  }
+  const adapter = { id: "pi", capabilities: {}, async createSession(input) {
+    const session = new FailingCompactionSession(); session.sessionId = `pi-session-${sessions.length + 1}`;
+    sessions.push({ session, input }); return session;
+  } };
+  const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store });
+  try {
+    await host.start([{ agentId, name: "fallback", runtime: "pi", model: "model", workspaceDir: "/tmp", stateDir: root }]);
+    store.appendNdjson("inbox", { message_id: "om_pi_fallback", chat_id: "oc_pi_fallback", content: "stable" });
+    await host.deliver(agentId, { message_id: "om_pi_fallback", chat_id: "oc_pi_fallback", content: "stable" });
+    const oldInput = sessions[0].session.prompts[0];
+    sessions[0].session.emit({ type: "input-error", inputId: oldInput.inputId, retryable: false, willRetry: false,
+      message: "Your input exceeds the context window of this model. Please adjust your input and try again.", errorCategory: "context_window" });
+    const deadline = Date.now() + 1_000;
+    while (sessions.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(sessions.length, 2);
+    assert.equal(sessions[1].input.resumeSessionId, null);
+    const retryDeadline = Date.now() + 1_000;
+    while (sessions[1].session.prompts.length < 1 && Date.now() < retryDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(sessions[1].session.prompts[0].inputId, oldInput.inputId);
+    assert.equal(sessions[1].session.prompts[0].deliveryId, oldInput.deliveryId);
+    assert.match(sessions[0].session.closes.join(" "), /fallback/);
+  } finally {
+    await host.shutdown("done");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("RuntimeHost honors Pi-owned willRetry without manual compact or duplicate input", async () => {
+  const session = new FakeSession();
+  let host;
+  const adapter = { id: "pi", capabilities: {}, async createSession() { return session; } };
+  host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder() });
+  await host.start([{ agentId: "cli_piNativeA1", name: "native", runtime: "pi", model: "model", workspaceDir: "/tmp" }]);
+  const first = await host.deliver("cli_piNativeA1", { message_id: "om_pi_native", chat_id: "oc_pi_native", content: "stable" });
+  const input = session.prompts[0];
+  session.emit({ type: "input-error", inputId: input.inputId, retryable: true, willRetry: true,
+    message: "Pi owns the context-overflow retry", errorCategory: "context_window" });
+  assert.equal(first.status, "accepted");
+  assert.equal(session.prompts.length, 1);
+  await host.shutdown("done");
+});
 
 test("RuntimeHost stages a candidate session without stopping the old healthy Agent", async () => {
   const oldSession = new FakeSession();
@@ -135,6 +873,120 @@ test("RuntimeHost aborts a staged reset when Inbox arrival or turn start races c
     await host.shutdown("done");
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("RuntimeHost context-overflow recovery stages no-resume, rearms exact records, and schedules normal retry", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-context-runtime-recovery-"));
+  const agentId = "cli_contextRuntimeA1";
+  const store = createAgentStateStore(root, agentId);
+  const messages = ["om_runtime_overflow_1", "om_runtime_overflow_2", "om_runtime_overflow_3", "om_runtime_overflow_4"];
+  for (const messageId of messages) store.appendNdjson("inbox", { message_id: messageId, chat_id: "oc_runtime_overflow", content: "synthetic" });
+  store.writeJson("runtimeDeliveries", { version: 1, records: messages.map((messageId, index) => ({
+    deliveryId: `runtime-delivery-${index}`, messageId, status: "error", retryable: false,
+    reason: "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again.", errorCategory: "context_window",
+    input: { inputId: `runtime-input-${index}`, deliveryId: `runtime-delivery-${index}`, kind: "wake", text: "redacted", attempt: 0 }, updatedAt: "before",
+  })) });
+  const sessions = [];
+  try {
+    const adapter = { id: "pi", capabilities: {}, async createSession(input) {
+      const session = new FakeSession(); session.sessionId = sessions.length === 0 ? "old-context-session" : `fresh-context-${sessions.length}`;
+      sessions.push({ session, input }); return session;
+    } };
+    const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store });
+    await host.start([{ agentId, name: "context", runtime: "pi", model: "model", workspaceDir: "/tmp", sessionId: "resume-old" }]);
+    const result = await host.recoverSession(agentId, "context-overflow");
+    assert.equal(result.rearmedCount, 4);
+    assert.equal(result.replayStatus, "pending", "the Inbox remains durable until the normal Runtime poll consumes it");
+    assert.equal(sessions[1].input.resumeSessionId, null);
+    assert.deepEqual(sessions[0].session.closes, ["context-window recovery committed"]);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const ledger = store.readJson("runtimeDeliveries", { records: [] });
+    assert.equal(ledger.records.filter((record) => record.messageId.startsWith("om_runtime_overflow_")).length, 4);
+    assert.equal(new Set(ledger.records.map((record) => record.deliveryId)).size, 4);
+    assert.equal(ledger.records.filter((record) => record.status === "accepted").length, 1, "retry uses the existing delivery identity");
+    const sessionsBeforeRepeat = sessions.length;
+    const repeatDeadline = Date.now() + 1_000;
+    while (host.isBusy?.(agentId) && Date.now() < repeatDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    await assert.rejects(host.recoverSession(agentId, "context-overflow"), (error) => ["agent_busy", "recovery_refused"].includes(error.code));
+    assert.equal(sessions.length, sessionsBeforeRepeat, "repeating recovery does not stage another Runtime session");
+    await host.shutdown("done");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("RuntimeHost context-overflow recovery closes the staged session and preserves the old session on commit race", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-context-runtime-race-"));
+  const agentId = "cli_contextRaceA1";
+  const store = createAgentStateStore(root, agentId);
+  store.appendNdjson("inbox", { message_id: "om_context_race", chat_id: "oc_context_race", content: "synthetic" });
+  store.writeJson("runtimeDeliveries", { version: 1, records: [{ deliveryId: "delivery-context-race", messageId: "om_context_race",
+    status: "error", retryable: false, reason: "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again.", errorCategory: "context_window", input: { inputId: "input-context-race", deliveryId: "delivery-context-race", kind: "wake", text: "redacted", attempt: 0 }, updatedAt: "before" }] });
+  const sessions = [];
+  try {
+    const adapter = { id: "pi", capabilities: {}, async createSession(input) {
+      const session = new FakeSession(); session.sessionId = sessions.length === 0 ? "old-race-session" : "fresh-race-session";
+      sessions.push({ session, input }); return session;
+    } };
+    const racingStore = { readJson: store.readJson.bind(store), readNdjson: store.readNdjson.bind(store),
+      writeJson: store.writeJson.bind(store), withInboxTransaction: store.withInboxTransaction.bind(store),
+      resolveInboxDeliverySource: store.resolveInboxDeliverySource.bind(store), rearmContextOverflow(callback) {
+      store.appendNdjson("inbox", { message_id: "om_context_arrived_during_stage", chat_id: "oc_context_race", content: "synthetic" });
+      return store.rearmContextOverflow(callback);
+    } };
+    const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => racingStore });
+    await host.start([{ agentId, name: "race", runtime: "pi", model: "model", workspaceDir: "/tmp" }]);
+    await assert.rejects(host.recoverSession(agentId, "context-overflow"), /canonical Inbox row has no Runtime delivery record/);
+    assert.deepEqual(sessions[0].session.closes, []);
+    assert.deepEqual(sessions[1].session.closes, ["context-window recovery not committed"]);
+    assert.equal(store.readJson("runtimeDeliveries", { records: [] }).records[0].status, "error");
+    await host.shutdown("done");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("RuntimeHost context-overflow recovery rolls back durable rearm when fresh subscription fails", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-context-subscribe-failure-"));
+  const agentId = "cli_contextSubscribeA1";
+  const store = createAgentStateStore(root, agentId);
+  store.appendNdjson("inbox", { message_id: "om_context_subscribe", chat_id: "oc_context_subscribe", content: "synthetic" });
+  store.writeJson("runtimeDeliveries", { version: 1, records: [{ deliveryId: "d-subscribe", messageId: "om_context_subscribe", status: "error", retryable: false, reason: "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again.", errorCategory: "context_window", input: { inputId: "i-subscribe", deliveryId: "d-subscribe" }, updatedAt: "before" }] });
+  const sessions = [];
+  try {
+    const adapter = { id: "pi", capabilities: {}, async createSession(input) {
+      const session = new FakeSession(); session.sessionId = sessions.length === 0 ? "old-subscribe" : "fresh-subscribe";
+      if (sessions.length > 0) session.subscribeFailure = "injected subscription failure";
+      sessions.push({ session, input }); return session;
+    } };
+    const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store });
+    await host.start([{ agentId, name: "subscribe", runtime: "pi", model: "model", workspaceDir: "/tmp" }]);
+    await assert.rejects(host.recoverSession(agentId, "context-overflow"), /subscription failed/);
+    assert.deepEqual(sessions[0].session.closes, []);
+    assert.deepEqual(sessions[1].session.closes, ["context-window recovery subscription failed"]);
+    assert.equal(store.readJson("runtimeDeliveries", { records: [] }).records[0].status, "error");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("RuntimeHost context-overflow recovery rolls back durable rearm when commit emission fails", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-context-emission-failure-"));
+  const agentId = "cli_contextEmissionA1";
+  const store = createAgentStateStore(root, agentId);
+  store.appendNdjson("inbox", { message_id: "om_context_emission", chat_id: "oc_context_emission", content: "synthetic" });
+  store.writeJson("runtimeDeliveries", { version: 1, records: [{ deliveryId: "d-emission", messageId: "om_context_emission", status: "error", retryable: false, reason: "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again.", errorCategory: "context_window", input: { inputId: "i-emission", deliveryId: "d-emission" }, updatedAt: "before" }] });
+  const sessions = [];
+  let failEmission = false;
+  try {
+    const adapter = { id: "pi", capabilities: {}, async createSession(input) {
+      const session = new FakeSession(); session.sessionId = sessions.length === 0 ? "old-emission" : "fresh-emission";
+      if (sessions.length > 0) session.unsubscribeFailure = "injected unsubscribe failure";
+      sessions.push({ session, input }); return session;
+    } };
+    const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store });
+    host.subscribe((event) => { if (failEmission && event.type === "session") throw new Error("injected commit emission failure"); });
+    await host.start([{ agentId, name: "emission", runtime: "pi", model: "model", workspaceDir: "/tmp" }]);
+    failEmission = true;
+    await assert.rejects(host.recoverSession(agentId, "context-overflow"), /not committed/);
+    assert.deepEqual(sessions[0].session.closes, []);
+    assert.deepEqual(sessions[1].session.closes, ["context-window recovery not committed"]);
+    assert.equal(store.readJson("runtimeDeliveries", { records: [] }).records[0].status, "error");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test("RuntimeHost isolates a missing runtime and keeps healthy agents active", async () => {
@@ -275,6 +1127,128 @@ test("Runtime Host owns duplicate suppression, busy delivery and turn-boundary r
   await host.shutdown("test complete");
 });
 
+test("issue 122 injected former prompt-builder target omission retries while the corrected exact-target path is terminal", async () => {
+  const run = async (formerPromptOmission) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), formerPromptOmission ? "larkin-issue122-former-prompt-" : "larkin-issue122-current-"));
+    const agentId = formerPromptOmission ? "cli_issue122FormerA1" : "cli_issue122CurrentA1";
+    const store = createAgentStateStore(root, agentId);
+    const session = new FakeSession();
+    const canonicalBuilder = new ContextPromptBuilder();
+    const promptBuilder = formerPromptOmission ? {
+      build(input) { return canonicalBuilder.build(input); },
+      buildInboxNotice(input) { return canonicalBuilder.buildInboxNotice({ ...input, target: undefined }); },
+    } : canonicalBuilder;
+    const host = createRuntimeHost({
+      adapterFor: () => ({ id: "codex", capabilities: {}, async createSession() { return session; } }),
+      promptBuilder, stateStoreFor: () => store,
+    });
+    try {
+      await host.start([{ agentId, name: agentId, runtime: "codex", model: "g", workspaceDir: path.join(root, "agents", agentId), stateDir: store.paths.root }]);
+      const source = { kind: "reminder", message_id: formerPromptOmission ? "rem_issue122_former" : "rem_issue122_current",
+        target: "runtime:reminder", channel_type: "dm", channel_name: "system", wake: true };
+      store.appendNdjson("inbox", source);
+      assert.equal(store.readNdjson("inbox")[0].target, "runtime:reminder");
+      await host.deliver(agentId, source);
+      if (formerPromptOmission) {
+        assert.doesNotMatch(session.prompts[0].text, /Inbox changed for /, "injected former prompt-builder omission produces a targetless final payload");
+      } else {
+        assert.match(session.prompts[0].text, /Inbox changed for runtime:reminder/, "new final payload names the exact poll target");
+        const polled = store.pollInbox({ target: "runtime:reminder", limit: 1 });
+        assert.deepEqual(polled.envelopes.map((row) => row.message_id), [source.message_id]);
+      }
+      session.emit({ type: "turn-start", turnId: formerPromptOmission ? "former-turn" : "current-turn" });
+      session.emit({ type: "turn-end", turnId: formerPromptOmission ? "former-turn" : "current-turn" });
+      await new Promise((resolve) => setImmediate(resolve));
+      return { prompts: session.prompts.length, inbox: store.readNdjson("inbox"),
+        statuses: store.readJson("runtimeDeliveries", { records: [] }).records.map((record) => record.status) };
+    } finally {
+      await host.shutdown("issue 122 counterfactual complete");
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  };
+  const oldResult = await run(true);
+  const newResult = await run(false);
+  assert.equal(oldResult.prompts, 2, "the injected former prompt-builder target omission leaves the valid durable row and retries at turn end");
+  assert.equal(oldResult.inbox.length, 1);
+  assert.deepEqual(oldResult.statuses, ["accepted"]);
+  assert.equal(newResult.prompts, 1, "exact-target durable poll prevents turn-end retry");
+  assert.deepEqual(newResult.inbox, []);
+  assert.deepEqual(newResult.statuses, ["consumed"]);
+});
+
+test("implicit Inbox source expires when its Runtime turn ends and before a direct next turn", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-runtime-source-expiry-"));
+  const agentId = "cli_runtimeSourceExpiryA1";
+  const store = createAgentStateStore(root, agentId);
+  const session = new FakeSession();
+  const host = createRuntimeHost({
+    adapterFor: () => ({ id: "codex", capabilities: {}, async createSession() { return session; } }),
+    promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store,
+  });
+  try {
+    await host.start([{ agentId, name: agentId, runtime: "codex", model: "g", workspaceDir: "/tmp", stateDir: store.paths.root }]);
+    store.appendNdjson("inbox", { message_id: "om_source_expiry", chat_id: "oc_source_expiry", content: "source" });
+    session.emit({ type: "turn-start", turnId: "source-turn" });
+    store.pollInbox({ target: "chat:oc_source_expiry", limit: 1 });
+    assert.ok(store.resolveCurrentInboxSource());
+    session.emit({ type: "turn-end", turnId: "source-turn" });
+    assert.equal(store.resolveCurrentInboxSource(), null);
+
+    store.appendNdjson("inbox", { kind: "reminder", message_id: "rem_turn_expiry", target: "runtime:reminder",
+      reminderId: "reminder-turn-expiry", deliveryTarget: "chat:oc_turn_expiry", content: "reminder" });
+    store.pollInbox({ target: "runtime:reminder", limit: 1 });
+    store.writeJson("reminders", { reminders: [{ reminderId: "reminder-turn-expiry", status: "fired",
+      fireAt: "2026-07-16T02:00:00.000Z", events: [{ eventType: "delivery_pending" }] }] });
+    assert.ok(store.resolveCurrentReminder());
+    session.emit({ type: "turn-end", turnId: "source-turn-reminder" });
+    const finalizedReminder = store.readJson("reminders", { reminders: [] }).reminders[0];
+    assert.equal(finalizedReminder.events.at(-1).eventType, "delivery_failed", "turn end must finalize an unfulfilled pending delivery");
+    assert.equal(store.resolveCurrentReminder(), null, "reminder audit context must expire at turn end");
+
+    store.appendNdjson("inbox", { message_id: "om_source_stale", chat_id: "oc_source_stale", content: "stale" });
+    store.pollInbox({ target: "chat:oc_source_stale", limit: 1 });
+    assert.ok(store.resolveCurrentInboxSource());
+    session.emit({ type: "turn-start", turnId: "direct-turn" });
+    assert.equal(store.resolveCurrentInboxSource(), null, "a direct task cannot inherit the prior turn's chat");
+    session.emit({ type: "turn-end", turnId: "direct-turn" });
+  } finally {
+    await host.shutdown("source expiry test complete");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a stale reminder context from a crashed turn is finalized before the next turn starts", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-runtime-reminder-turn-start-"));
+  const agentId = "cli_reminderTurnStartA1";
+  const store = createAgentStateStore(root, agentId);
+  const session = new FakeSession();
+  const host = createRuntimeHost({
+    adapterFor: () => ({ id: "codex", capabilities: {}, async createSession() { return session; } }),
+    promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store,
+  });
+  try {
+    await host.start([{ agentId, name: agentId, runtime: "codex", model: "g", workspaceDir: "/tmp", stateDir: store.paths.root }]);
+    // A prior turn polled the reminder and then crashed without turn-end.
+    session.emit({ type: "turn-start", turnId: "crashed-turn" });
+    store.appendNdjson("inbox", { kind: "reminder", message_id: "rem_crashed_turn", target: "runtime:reminder",
+      reminderId: "reminder-crashed-turn", deliveryTarget: "chat:oc_crashed_turn", content: "reminder" });
+    store.pollInbox({ target: "runtime:reminder", limit: 1 });
+    store.writeJson("reminders", { reminders: [{ reminderId: "reminder-crashed-turn", status: "fired",
+      fireAt: "2026-07-16T02:00:00.000Z", events: [{ eventType: "delivery_pending", metadata: { occurrenceId: "rem_crashed_turn" } }] }] });
+    assert.ok(store.resolveCurrentReminder());
+
+    session.emit({ type: "turn-start", turnId: "next-turn" });
+    const finalized = store.readJson("reminders", { reminders: [] }).reminders[0];
+    assert.equal(finalized.events.at(-1).eventType, "delivery_failed", "turn start must finalize a stale pending delivery");
+    assert.equal(finalized.events.at(-1).metadata.occurrenceId, "rem_crashed_turn");
+    assert.equal(store.resolveCurrentReminder(), null, "a direct outbound in the new turn cannot inherit the stale reminder context");
+    session.emit({ type: "turn-end", turnId: "next-turn" });
+  } finally {
+    await host.shutdown("reminder turn-start expiry test complete");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Codex compatibility recovery closes, updates once, recreates, and retries the owned delivery", async () => {
   const sessions = [];
   let recoveries = 0;
@@ -342,10 +1316,11 @@ test("delivery ownership, dedupe and correlation survive recreation and reach co
   const adapter = { id: "codex", capabilities: {}, async createSession() { const session = new FakeSession(); session.sessionId = `session-${sessions.length + 1}`; sessions.push(session); return session; } };
   const config = { agentId, name: agentId, runtime: "codex", model: "gpt", workspaceDir: path.join(root, "agents", agentId), stateDir: store.paths.root };
   try {
-    store.appendNdjson("inbox", { message_id: "om_persist", content: "canonical" });
+    const persistedEnvelope = { message_id: "om_persist", target: "chat:oc_persist", chat_id: "oc_persist", content: "canonical" };
+    store.appendNdjson("inbox", persistedEnvelope);
     const host1 = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store });
     await host1.start([config]);
-    const accepted = await host1.deliver(agentId, { message_id: "om_persist" });
+    const accepted = await host1.deliver(agentId, persistedEnvelope);
     await host1.shutdown("simulated process exit");
 
     const events = [];
@@ -353,7 +1328,7 @@ test("delivery ownership, dedupe and correlation survive recreation and reach co
     host2.subscribe((event) => events.push(event));
     await host2.start([config]);
     assert.equal(sessions[1].prompts[0].inputId, accepted.deliveryId, "pending reconstruction preserves deliveryId");
-    assert.deepEqual(await host2.deliver(agentId, { message_id: "om_persist" }), { status: "duplicate", deliveryId: accepted.deliveryId });
+    assert.deepEqual(await host2.deliver(agentId, persistedEnvelope), { status: "duplicate", deliveryId: accepted.deliveryId });
     store.drainInbox();
     await new Promise((resolve) => setTimeout(resolve, 300));
     assert.ok(events.some((event) => event.type === "delivery" && event.status === "consumed" && event.deliveryId === accepted.deliveryId));
@@ -461,7 +1436,7 @@ test("turn end retries an accepted wake when the Agent never polls without advan
   }
 });
 
-test("startup migration consumes orphan synthetic active deliveries but never guesses for real om_ messages", async () => {
+test("startup migration consumes orphan synthetic active deliveries and quarantines a real message without canonical Inbox evidence", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-runtime-synthetic-migration-"));
   const agentId = "cli_migrateA1";
   const store = createAgentStateStore(root, agentId);
@@ -476,13 +1451,16 @@ test("startup migration consumes orphan synthetic active deliveries but never gu
     promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store });
   try {
     await host.start([{ agentId, name: agentId, runtime: "codex", model: "g", workspaceDir: path.join(root, "agents", agentId), stateDir: store.paths.root }]);
-    assert.deepEqual(session.prompts.map((input) => input.inputId), ["delivery-real"], "only the real message retains delivery ownership");
-    const statuses = Object.fromEntries(store.readJson("runtimeDeliveries", { records: [] }).records
-      .map((item) => [item.messageId, item.status]));
-    assert.equal(statuses.redeliver_509c, "consumed");
-    assert.equal(statuses.rem_legacy, "consumed");
-    assert.equal(statuses.interaction_run_missing, "consumed");
-    assert.equal(statuses.om_real_missing, "accepted", "real Feishu delivery is never blindly consumed without Inbox evidence");
+    assert.deepEqual(session.prompts, [], "a real message without canonical Inbox evidence is never resubmitted from stale text");
+    const records = Object.fromEntries(store.readJson("runtimeDeliveries", { records: [] }).records
+      .map((item) => [item.messageId, item]));
+    assert.equal(records.redeliver_509c.status, "consumed");
+    assert.equal(records.rem_legacy.status, "consumed");
+    assert.equal(records.interaction_run_missing.status, "consumed");
+    assert.equal(records.om_real_missing.status, "error");
+    assert.equal(records.om_real_missing.retryable, false);
+    assert.match(records.om_real_missing.reason, /canonical_inbox_row_missing/);
+    assert.notEqual(records.om_real_missing.input.text, "check", "quarantine scrubs the stale targetless Runtime input");
   } finally {
     await host.shutdown("test complete");
     fs.rmSync(root, { recursive: true, force: true });
@@ -497,7 +1475,7 @@ test("a canonical drain that wins before the current deliver call atomically clo
   const host = createRuntimeHost({ adapterFor: () => ({ id: "codex", capabilities: {}, async createSession() { return session; } }),
     promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store });
   try {
-    store.appendNdjson("inbox", { message_id: "om_drain_won", wake: true });
+    store.appendNdjson("inbox", { message_id: "om_drain_won", target: "chat:oc_drain_won", wake: true });
     store.drainInbox();
     await host.start([{ agentId, name: agentId, runtime: "codex", model: "g", workspaceDir: path.join(root, "agents", agentId), stateDir: store.paths.root }]);
     const receipt = await host.deliver(agentId, { message_id: "om_drain_won", wake: true });
@@ -561,6 +1539,30 @@ test("non-retryable input-error produces a terminal delivery error without resub
   assert.equal(session.prompts.length, 1);
   assert.ok(events.some((event) => event.type === "delivery" && event.status === "error" && event.reason === "invalid request"));
   await host.shutdown("test complete");
+});
+
+test("RuntimeHost ingestion uses the shared strict classifier for a legacy Codex context error", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-runtime-legacy-classifier-"));
+  const session = new FakeSession();
+  const agentId = "cli_codexLegacyClassifierA1";
+  const store = createAgentStateStore(root, agentId);
+  store.appendNdjson("inbox", { message_id: "om_codex_legacy_classifier", target: "chat:oc_codex_legacy_classifier", content: "synthetic" });
+  const adapter = { id: "codex", capabilities: {}, async createSession() { return session; } };
+  const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store });
+  try {
+    await host.start([{ agentId, name: agentId, runtime: "codex", model: "codex", workspaceDir: "/tmp" }]);
+    const receipt = await host.deliver(agentId, { message_id: "om_codex_legacy_classifier", target: "chat:oc_codex_legacy_classifier" });
+    session.emit({ type: "input-error", inputId: receipt.deliveryId, retryable: false,
+      message: "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again." });
+    await new Promise((resolve) => setImmediate(resolve));
+    const record = store.readJson("runtimeDeliveries", { records: [] }).records[0];
+    assert.equal(record.status, "error");
+    assert.equal(record.retryable, false);
+    assert.equal(record.errorCategory, "context_window");
+  } finally {
+    await host.shutdown("legacy classifier test complete");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("terminal provider auth failure downgrades only its Agent and a later successful turn restores readiness", async () => {
@@ -885,4 +1887,291 @@ test("short-lived successful creations share one crash epoch and reach bounded e
   assert.equal(creates, 3, "initial session plus two recreation attempts remain bounded");
   assert.ok(errors.some((message) => /recreation exhausted after 2 attempts/.test(message)), errors.join("\n"));
   await host.shutdown("test complete");
+});
+
+const waitForCondition = async (predicate, timeout = 1_000) => {
+  const deadline = Date.now() + timeout;
+  while (!predicate() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(Boolean(predicate()), true, "condition was not reached before timeout");
+};
+
+test("issue 138: inbox_update accepted after turn_ended while submitting stays true is promoted to a wake", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-issue138-promote-"));
+  const agentId = "cli_issue138PromoteA1";
+  const store = createAgentStateStore(root, agentId);
+  const session = new FakeSession();
+  let releasePrompt;
+  session.prompt = async (input) => {
+    session.prompts.push(input);
+    if (session.prompts.length === 1) await new Promise((resolve) => { releasePrompt = resolve; });
+    return { status: "accepted", inputId: input.inputId };
+  };
+  const events = [];
+  const host = createRuntimeHost({
+    adapterFor: () => ({ id: "codex", capabilities: {}, async createSession() { return session; } }),
+    promptBuilder: new ContextPromptBuilder(),
+    stateStoreFor: () => store,
+  });
+  host.subscribe((event) => events.push(event));
+  try {
+    await host.start([{ agentId, name: agentId, runtime: "codex", model: "g", workspaceDir: path.join(root, "agents", agentId), stateDir: store.paths.root }]);
+    const target = "chat:oc_issue138";
+    store.appendNdjson("inbox", { message_id: "om_issue138_first", target, content: "first" });
+    const first = host.deliver(agentId, { message_id: "om_issue138_first", target });
+    await waitForCondition(() => session.prompts.length === 1);
+    session.emit({ type: "turn-start", turnId: "turn-issue138" });
+    const polled = store.pollInbox({ target, limit: 1 });
+    assert.deepEqual(polled.envelopes.map((row) => row.message_id), ["om_issue138_first"]);
+    session.emit({ type: "turn-end", turnId: "turn-issue138" });
+    store.appendNdjson("inbox", { message_id: "om_issue138_late", target, content: "late after turn_ended" });
+    const late = await host.deliver(agentId, { message_id: "om_issue138_late", target });
+    assert.equal(late.status, "accepted");
+    assert.equal(session.steers.length, 1, "late arrival while submitting must take the busy inbox_update path");
+    assert.equal(session.steers[0].kind, "inbox_update");
+    assert.equal(session.prompts.length, 1, "no replacement wake can exist until submitting/busy clears");
+    releasePrompt();
+    assert.equal((await first).status, "accepted");
+    await waitForCondition(() => session.prompts.some((input) => input.inputId === late.deliveryId && input.kind === "wake"));
+    const promoted = session.prompts.find((input) => input.inputId === late.deliveryId);
+    assert.equal(promoted.kind, "wake");
+    assert.ok(events.some((event) => event.type === "delivery" && event.deliveryId === late.deliveryId
+      && event.status === "deferred" && /promoted after Agent became idle/.test(event.reason)));
+    const lateRecord = store.readJson("runtimeDeliveries", { records: [] }).records
+      .find((record) => record.messageId === "om_issue138_late");
+    assert.notEqual(lateRecord?.input?.kind, "inbox_update", "idle Agent must not keep an accepted inbox_update without a wake");
+  } finally {
+    await host.shutdown("issue 138 promote test complete");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("issue 138: idle scan does not emit an extra wake when no accepted inbox_update remains", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-issue138-no-extra-"));
+  const agentId = "cli_issue138NoExtraA1";
+  const store = createAgentStateStore(root, agentId);
+  const session = new FakeSession();
+  const host = createRuntimeHost({
+    adapterFor: () => ({ id: "codex", capabilities: {}, async createSession() { return session; } }),
+    promptBuilder: new ContextPromptBuilder(),
+    stateStoreFor: () => store,
+  });
+  try {
+    await host.start([{ agentId, name: agentId, runtime: "codex", model: "g", workspaceDir: path.join(root, "agents", agentId), stateDir: store.paths.root }]);
+    const target = "chat:oc_issue138_idle";
+    store.appendNdjson("inbox", { message_id: "om_issue138_consumed", target, content: "only wake" });
+    const receipt = await host.deliver(agentId, { message_id: "om_issue138_consumed", target });
+    assert.equal(receipt.status, "accepted");
+    assert.equal(session.prompts.length, 1);
+    assert.equal(session.prompts[0].kind, "wake");
+    store.pollInbox({ target, limit: 1 });
+    session.emit({ type: "turn-start", turnId: "turn-consumed" });
+    session.emit({ type: "turn-end", turnId: "turn-consumed" });
+    await new Promise((resolve) => setImmediate(resolve));
+    await host.scanPendingInboxUpdates(agentId);
+    await host.scanPendingInboxUpdates(agentId);
+    assert.equal(session.prompts.length, 1, "drained Inbox must not synthesize a replacement wake");
+    assert.equal(session.steers.length, 0);
+  } finally {
+    await host.shutdown("issue 138 no-extra-wake test complete");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("issue 138: the same accepted inbox_update is not re-woken in a loop", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-issue138-noloop-"));
+  const agentId = "cli_issue138NoLoopA1";
+  const store = createAgentStateStore(root, agentId);
+  const session = new FakeSession();
+  let releasePrompt;
+  session.prompt = async (input) => {
+    session.prompts.push(input);
+    if (session.prompts.length === 1) await new Promise((resolve) => { releasePrompt = resolve; });
+    return { status: "accepted", inputId: input.inputId };
+  };
+  const host = createRuntimeHost({
+    adapterFor: () => ({ id: "codex", capabilities: {}, async createSession() { return session; } }),
+    promptBuilder: new ContextPromptBuilder(),
+    stateStoreFor: () => store,
+  });
+  try {
+    await host.start([{ agentId, name: agentId, runtime: "codex", model: "g", workspaceDir: path.join(root, "agents", agentId), stateDir: store.paths.root }]);
+    const target = "chat:oc_issue138_noloop";
+    store.appendNdjson("inbox", { message_id: "om_issue138_owner", target, content: "owner" });
+    const first = host.deliver(agentId, { message_id: "om_issue138_owner", target });
+    await waitForCondition(() => session.prompts.length === 1);
+    session.emit({ type: "turn-start", turnId: "turn-noloop" });
+    store.pollInbox({ target, limit: 1 });
+    session.emit({ type: "turn-end", turnId: "turn-noloop" });
+    store.appendNdjson("inbox", { message_id: "om_issue138_stuck", target, content: "stuck update" });
+    const late = await host.deliver(agentId, { message_id: "om_issue138_stuck", target });
+    releasePrompt();
+    await first;
+    await waitForCondition(() => session.prompts.filter((input) => input.inputId === late.deliveryId).length === 1);
+    await host.scanPendingInboxUpdates(agentId);
+    await host.scanPendingInboxUpdates();
+    await host.scanPendingInboxUpdates(agentId);
+    const wakesForLate = session.prompts.filter((input) => input.inputId === late.deliveryId && input.kind === "wake");
+    assert.equal(wakesForLate.length, 1, "the same delivery id must be promoted to wake only once");
+    assert.equal(session.steers.filter((input) => input.inputId === late.deliveryId).length, 1);
+  } finally {
+    await host.shutdown("issue 138 no-loop test complete");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("issue 138: concurrent CLI poll does not emit a promoted-after-idle deferred", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-issue138-poll-skip-"));
+  const agentId = "cli_issue138PollSkipA1";
+  const store = createAgentStateStore(root, agentId);
+  const session = new FakeSession();
+  let releasePrompt;
+  const target = "chat:oc_issue138_poll";
+  session.prompt = async (input) => {
+    session.prompts.push(input);
+    if (session.prompts.length === 1) await new Promise((resolve) => { releasePrompt = resolve; });
+    return { status: "accepted", inputId: input.inputId };
+  };
+  session.busyInput = async (input) => {
+    session.steers.push(input);
+    const polled = store.pollInbox({ target, limit: 1 });
+    assert.deepEqual(polled.envelopes.map((row) => row.message_id), ["om_issue138_consumed_late"]);
+    return { status: "accepted", inputId: input.inputId };
+  };
+  const events = [];
+  const host = createRuntimeHost({
+    adapterFor: () => ({ id: "codex", capabilities: {}, async createSession() { return session; } }),
+    promptBuilder: new ContextPromptBuilder(),
+    stateStoreFor: () => store,
+  });
+  host.subscribe((event) => events.push(event));
+  try {
+    await host.start([{ agentId, name: agentId, runtime: "codex", model: "g", workspaceDir: path.join(root, "agents", agentId), stateDir: store.paths.root }]);
+    store.appendNdjson("inbox", { message_id: "om_issue138_owner_poll", target, content: "owner" });
+    const first = host.deliver(agentId, { message_id: "om_issue138_owner_poll", target });
+    await waitForCondition(() => session.prompts.length === 1);
+    session.emit({ type: "turn-start", turnId: "turn-poll-skip" });
+    store.pollInbox({ target, limit: 1 });
+    session.emit({ type: "turn-end", turnId: "turn-poll-skip" });
+    store.appendNdjson("inbox", { message_id: "om_issue138_consumed_late", target, content: "already polled" });
+    const late = await host.deliver(agentId, { message_id: "om_issue138_consumed_late", target });
+    assert.equal(late.status, "accepted");
+    assert.equal(session.steers[0]?.kind, "inbox_update");
+    releasePrompt();
+    assert.equal((await first).status, "accepted");
+    await host.scanPendingInboxUpdates(agentId);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(session.prompts.filter((input) => input.inputId === late.deliveryId && input.kind === "wake").length, 0,
+      "a concurrently consumed Inbox row must not be promoted to a wake");
+    assert.equal(events.some((event) => event.type === "delivery" && event.deliveryId === late.deliveryId
+      && event.status === "deferred" && /promoted after Agent became idle/.test(event.reason)), false,
+      "must not emit a contradictory promoted-after-idle deferred after CLI poll consumption");
+    const lateRecord = store.readJson("runtimeDeliveries", { records: [] }).records
+      .find((record) => record.messageId === "om_issue138_consumed_late");
+    assert.equal(lateRecord?.status, "consumed");
+  } finally {
+    await host.shutdown("issue 138 poll-skip test complete");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("issue 138: leftover inbox_update is not promoted during Pi compaction recovery", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-issue138-compact-skip-"));
+  const agentId = "cli_issue138CompactSkipA1";
+  const store = createAgentStateStore(root, agentId);
+  let releaseCompact;
+  class CompactingSession extends FakeSession {
+    compactCalls = 0;
+    async compact() { this.compactCalls += 1; await new Promise((resolve) => { releaseCompact = resolve; }); return {}; }
+  }
+  const session = new CompactingSession();
+  const events = [];
+  const host = createRuntimeHost({
+    adapterFor: () => ({ id: "pi", capabilities: {}, async createSession() { return session; } }),
+    promptBuilder: new ContextPromptBuilder(),
+    stateStoreFor: () => store,
+  });
+  host.subscribe((event) => events.push(event));
+  try {
+    await host.start([{ agentId, name: agentId, runtime: "pi", model: "model", workspaceDir: path.join(root, "agents", agentId), stateDir: store.paths.root }]);
+    const target = "chat:oc_issue138_compact";
+    store.appendNdjson("inbox", { message_id: "om_issue138_overflow", target, content: "overflow" });
+    const first = await host.deliver(agentId, { message_id: "om_issue138_overflow", target });
+    assert.equal(first.status, "accepted");
+    session.emit({ type: "turn-start", turnId: "turn-compact-skip" });
+    store.appendNdjson("inbox", { message_id: "om_issue138_late_compact", target, content: "late during overflow" });
+    const late = await host.deliver(agentId, { message_id: "om_issue138_late_compact", target });
+    assert.equal(late.status, "accepted");
+    assert.equal(session.steers[0]?.kind, "inbox_update");
+    session.emit({
+      type: "input-error", inputId: session.prompts[0].inputId, retryable: false, willRetry: false,
+      message: "Your input exceeds the context window of this model. Please adjust your input and try again.",
+      errorCategory: "context_window",
+    });
+    await waitForCondition(() => session.compactCalls === 1);
+    await host.scanPendingInboxUpdates(agentId);
+    assert.equal(session.prompts.filter((input) => input.inputId === late.deliveryId && input.kind === "wake").length, 0,
+      "Pi compaction recovery must not promote leftover inbox_update to a wake");
+    assert.equal(events.some((event) => event.type === "delivery" && event.deliveryId === late.deliveryId
+      && event.status === "deferred" && /promoted after Agent became idle/.test(event.reason)), false);
+    const lateRecord = store.readJson("runtimeDeliveries", { records: [] }).records
+      .find((record) => record.messageId === "om_issue138_late_compact");
+    assert.equal(lateRecord?.input?.kind, "inbox_update");
+    releaseCompact();
+  } finally {
+    await host.shutdown("issue 138 compact-skip test complete");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("issue 138: reopening a terminal wake failure can be promoted again", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-issue138-reopen-"));
+  const agentId = "cli_issue138ReopenA1";
+  const store = createAgentStateStore(root, agentId);
+  const session = new FakeSession();
+  let releasePrompt;
+  session.prompt = async (input) => {
+    session.prompts.push(input);
+    if (session.prompts.length === 1) await new Promise((resolve) => { releasePrompt = resolve; });
+    if (input.kind === "wake" && input.inputId !== session.prompts[0]?.inputId && input.attempt === 0) {
+      return { status: "rejected", inputId: input.inputId, retryable: false, reason: "terminal fixture rejection" };
+    }
+    return { status: "accepted", inputId: input.inputId };
+  };
+  const host = createRuntimeHost({
+    adapterFor: () => ({ id: "codex", capabilities: {}, async createSession() { return session; } }),
+    promptBuilder: new ContextPromptBuilder(),
+    stateStoreFor: () => store,
+  });
+  try {
+    await host.start([{ agentId, name: agentId, runtime: "codex", model: "g", workspaceDir: path.join(root, "agents", agentId), stateDir: store.paths.root }]);
+    const target = "chat:oc_issue138_reopen";
+    store.appendNdjson("inbox", { message_id: "om_issue138_reopen_owner", target, content: "owner" });
+    const first = host.deliver(agentId, { message_id: "om_issue138_reopen_owner", target });
+    await waitForCondition(() => session.prompts.length === 1);
+    session.emit({ type: "turn-start", turnId: "turn-reopen-1" });
+    store.pollInbox({ target, limit: 1 });
+    session.emit({ type: "turn-end", turnId: "turn-reopen-1" });
+    store.appendNdjson("inbox", { message_id: "om_issue138_reopen_late", target, content: "late" });
+    const late = await host.deliver(agentId, { message_id: "om_issue138_reopen_late", target });
+    releasePrompt();
+    await first;
+    await waitForCondition(() => session.prompts.some((input) => input.inputId === late.deliveryId && input.kind === "wake"));
+    await waitForCondition(() => store.readJson("runtimeDeliveries", { records: [] }).records
+      .some((record) => record.messageId === "om_issue138_reopen_late" && record.status === "error"));
+    store.appendNdjson("inbox", { message_id: "om_issue138_reopen_owner2", target, content: "owner2" });
+    const second = host.deliver(agentId, { message_id: "om_issue138_reopen_owner2", target });
+    await waitForCondition(() => session.prompts.length >= 3);
+    session.emit({ type: "turn-start", turnId: "turn-reopen-2" });
+    session.emit({ type: "turn-end", turnId: "turn-reopen-2" });
+    const retried = await host.deliver(agentId, { message_id: "om_issue138_reopen_late", target });
+    assert.equal(retried.deliveryId, late.deliveryId);
+    await second;
+    await host.scanPendingInboxUpdates(agentId);
+    await waitForCondition(() => session.prompts.filter((input) => input.inputId === late.deliveryId && input.kind === "wake").length >= 2);
+    const retryWake = session.prompts.filter((input) => input.inputId === late.deliveryId && input.kind === "wake").at(-1);
+    assert.ok(retryWake.attempt >= 1, "reopened delivery must be promotable again after a terminal wake failure");
+  } finally {
+    await host.shutdown("issue 138 reopen-promote test complete");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

@@ -14,7 +14,7 @@ import { InteractionStateMachine } from "../../dist/agent/interaction-state-mach
 import { createTelemetryRuntime } from "../../dist/platform/telemetry-tracing.mjs";
 import { TelemetrySpool } from "../../dist/platform/telemetry-spool.mjs";
 
-const testManagedCli = () => ({ command: { command: "/test/official-lark-cli", argsPrefix: [], version: "1.0.79" }, env: {} });
+const testManagedCli = () => ({ command: { command: "/test/official-lark-cli", argsPrefix: [], version: "1.0.80" }, env: {} });
 
 function callbackValue(card, index = 0) {
   const button = card.body.elements.filter((item) => item.tag === "button")[index];
@@ -23,10 +23,15 @@ function callbackValue(card, index = 0) {
 
 class FakeNativeSession {
   listeners = new Set(); prompts = []; busyInputs = []; closes = []; sessionId;
+  replayStore = null;
   constructor(runtime) { this.sessionId = `${runtime}-session`; }
   subscribe(listener) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   emit(event) { for (const listener of this.listeners) listener(event); }
-  async prompt(input) { this.prompts.push(input); return { status: "accepted", inputId: input.inputId }; }
+  async prompt(input) {
+    this.prompts.push(input);
+    if (this.replayStore) setTimeout(() => { this.emit({ type: "turn-start" }); this.replayStore.pollInbox({ limit: 1 }); this.emit({ type: "turn-end" }); }, 0);
+    return { status: "accepted", inputId: input.inputId };
+  }
   async busyInput(input) { this.busyInputs.push(input); return { status: "accepted", inputId: input.inputId }; }
   async cancel() {} async close(reason) { this.closes.push(reason); }
 }
@@ -167,6 +172,71 @@ test("production HostShell fresh reset blocks issue-14 backlog, then preserves d
     target.writeJson = originalWriteJson;
   } finally {
     await host.shutdown("reset Mock E2E complete");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("production HostShell context-overflow recovery replays eight retained deliveries through RuntimeHost", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-production-context-recovery-"));
+  const agentId = "cli_contextMockA1";
+  const store = createAgentStateStore(root, agentId);
+  const recoveryRows = [
+    ...[1, 2, 3, 4, 5, 6].map((index) => ({ message_id: `om_context_mock_${index}`, target: "chat:oc_context_mock" })),
+    { message_id: "rem_context_mock", kind: "reminder", target: "runtime:reminder" },
+    { message_id: "redeliver_context_mock", kind: "redelivery", target: "runtime:redelivery" },
+  ];
+  const messageIds = recoveryRows.map((row) => row.message_id);
+  for (const row of recoveryRows) store.appendNdjson("inbox", { ...row, content: "synthetic" });
+  const originalRecords = messageIds.map((messageId, index) => ({ deliveryId: `context-delivery-${index}`, messageId,
+    status: "error", retryable: false,
+    reason: index < 6
+      ? "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again."
+      : "provider rejected the input because the context window was exceeded",
+    ...(index >= 6 ? { errorCategory: "context_window" } : {}),
+    input: { inputId: `context-input-${index}`, deliveryId: `context-delivery-${index}`, kind: "wake", text: "redacted", attempt: 0 }, updatedAt: "before" }));
+  originalRecords.push({ deliveryId: "context-unrelated", messageId: "om_context_unrelated", status: "error", errorCategory: "quota",
+    input: { inputId: "context-unrelated-input", deliveryId: "context-unrelated", kind: "wake", text: "redacted", attempt: 0 }, updatedAt: "before" });
+  store.writeJson("runtimeDeliveries", { version: 1, records: originalRecords });
+  const sessions = [];
+  const adapter = { id: "pi", capabilities: {}, async createSession(input) {
+    const session = new FakeNativeSession("pi"); session.sessionId = `${agentId}-private-session-${sessions.length + 1}`;
+    session.replayStore = store;
+    sessions.push({ session, input }); return session;
+  } };
+  const runtimeHost = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(),
+    stateStoreFor: () => store, assertOfficialCliReady: () => {} });
+  const agent = { agentId, name: agentId, runtime: "pi", model: "mock", feishuAppId: agentId,
+    feishuProfile: agentId, feishuAppSecret: "fixture-secret", feishuDomain: "https://open.feishu.cn",
+    workspaceDir: path.join(root, "agents", agentId), stateDir: store.paths.root };
+  const host = createHostShell({ env: { LARKIN_HOME: root, LARKIN_CONFIG_DIR: root, LARKIN_SERVER_ID: "server-context-mock",
+    LARKIN_AGENTS_CONFIG: JSON.stringify([agent]), LARKIN_INBOUND_DROUGHT_SEC: "0" }, runtimeHost,
+    stateStoreForImpl: () => store, managedCliForAgent: testManagedCli, eventSourceStartDelayMs: 60_000,
+    channelPackage: { createLarkChannel() { throw new Error("event source must not start in recovery fixture"); } } });
+  try {
+    await host.start();
+    const connectedAt = new Date().toISOString();
+    store.writeJson("status", { ...store.readJson("status", {}), connectedAt, connectedVia: "mock" });
+    const recovery = await host.recoverSession(agentId, "context-overflow", 0);
+    assert.equal(recovery.recoveryCommitted, true);
+    assert.equal(recovery.rearmedCount, 8);
+    assert.equal(recovery.remainingPendingCount, 8);
+    assert.equal(sessions[1].input.resumeSessionId, null, "the recovery session is created without a resume pointer");
+    assert.deepEqual(sessions[0].session.closes, ["context-window recovery committed"]);
+    const replayDeadline = Date.now() + 3_000;
+    while ((sessions[1]?.session.prompts.length || 0) < 8 && Date.now() < replayDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(sessions[1].session.prompts.map((input) => input.deliveryId).sort(), messageIds.map((_, index) => `context-delivery-${index}`).sort());
+    while (store.readNdjson("inbox").length !== 0 && Date.now() < replayDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    const after = store.readJson("runtimeDeliveries", { records: [] });
+    const recovered = after.records.filter((record) => messageIds.includes(record.messageId));
+    assert.deepEqual(recovered.map((record) => record.status), Array(8).fill("consumed"));
+    assert.deepEqual(recovered.map((record) => [record.deliveryId, record.input.inputId]).sort(), messageIds.map((_, index) => [
+      `context-delivery-${index}`, `context-input-${index}`,
+    ]).sort());
+    assert.equal(after.records.find((record) => record.messageId === "om_context_unrelated").status, "error");
+    assert.equal(store.readNdjson("inbox").length, 0);
+    assert.doesNotMatch(JSON.stringify(recovery), /private-session|delivery|message|stateDir/);
+  } finally {
+    await host.shutdown("context recovery Mock E2E complete");
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
@@ -384,7 +454,7 @@ test("production HostShell startup zero-unread one-shot cannot redeliver post-re
   }
 });
 
-test("member parser accepts the real lark-cli 1.0.79 get/bots shapes", () => {
+test("member parser accepts the real lark-cli 1.0.80 get/bots shapes", () => {
   assert.deepEqual(memberNamesFromPayloads([
     { ok: true, data: { items: [{ member_id: "ou_user", name: "User" }] } },
     { ok: true, data: { items: [{ bot_id: "cli_bot", bot_name: "Bot" }] } },
@@ -533,7 +603,7 @@ for (const runtime of ["codex", "claude", "pi"]) {
       env.LARKIN_TELEMETRY_SPOOL_DIR = telemetryConfig.spoolDir;
       const fakeCliRoot = path.join(root, "fake-official-lark-cli"); const binDir = path.join(fakeCliRoot, "bin"); fs.mkdirSync(binDir, { recursive: true });
       fs.writeFileSync(path.join(fakeCliRoot, "package.json"), JSON.stringify({
-        name: "@larksuite/cli", version: "1.0.79", bin: { "lark-cli": "bin/lark-cli" },
+        name: "@larksuite/cli", version: "1.0.80", bin: { "lark-cli": "bin/lark-cli" },
       }));
       const sourceDir = path.join(stateDir, "lark-channel-source");
       const channelConfigDir = path.join(agent.larkConfigDir, "lark-channel");
@@ -550,7 +620,7 @@ for (const runtime of ["codex", "claude", "pi"]) {
       }] }), { mode: 0o600 });
       fs.writeFileSync(path.join(binDir, "lark-cli"), `#!/usr/bin/env bun
 const args=process.argv.slice(2);
-if(args[0]==="--version")process.stdout.write("1.0.79");
+if(args[0]==="--version")process.stdout.write("1.0.80");
 else if(args[0]==="config"&&args[1]==="bind"&&args[2]==="--help")process.stdout.write("--source lark-channel --identity bot");
 else process.stdout.write(JSON.stringify({ok:true,data:{users:[],bots:[],message_id:"om_mock_sent"}}));
 `, { mode: 0o755 });
@@ -608,7 +678,7 @@ else process.stdout.write(JSON.stringify({ok:true,data:{users:[],bots:[],message
       let guardedStdout = "", guardedStderr = "";
       const guardedDependencies = {
         stateStore: store,
-        nativeCommand: { command: "/fixture/@larksuite/cli/scripts/run.js", argsPrefix: [], version: "1.0.79" },
+        nativeCommand: { command: "/fixture/@larksuite/cli/scripts/run.js", argsPrefix: [], version: "1.0.80" },
         spawn(command, args, options) {
           if (["+chat-messages-list", "+threads-messages-list"].includes(args[1])
               || (args[0] === "api" && args[1] === "GET" && args[2] === "/open-apis/im/v1/messages")) {
@@ -712,7 +782,7 @@ else process.stdout.write(JSON.stringify({ok:true,data:{users:[],bots:[],message
         assert.doesNotMatch(JSON.stringify(failedStatus.runtimeReadiness) + JSON.stringify(failedStatus.recentErrors),
           /Users\/example|cc-switch-token|fixture-secret|unsafe raw action/);
 
-        const authRetry = await runtimeHost.deliver(agentId, { message_id: "om_pi_auth" });
+        const authRetry = await runtimeHost.deliver(agentId, { message_id: "om_pi_auth", chat_id: "oc_pi" });
         assert.equal(authRetry.status, "accepted");
         session.emit({ type: "turn-start", turnId: "pi-auth-aborted" });
         session.emit({ type: "activity", activity: "text" });
