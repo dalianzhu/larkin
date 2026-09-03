@@ -16,12 +16,14 @@ export interface InboxEnvelope {
 
 export const RUNTIME_REMINDER_TARGET = "runtime:reminder" as const;
 export const RUNTIME_REDELIVERY_TARGET = "runtime:redelivery" as const;
+export const RUNTIME_EXTERNAL_TARGET = "runtime:external" as const;
 
 const CHAT_TARGET_PREFIX = "chat:";
 const THREAD_TARGET_PREFIX = "thread:";
 const DOCUMENT_COMMENT_TARGET_PREFIX = "document-comment:";
 const REMINDER_MESSAGE_PREFIX = "rem_";
 const REDELIVERY_MESSAGE_PREFIX = "redeliver_";
+const EXTERNAL_MESSAGE_PREFIX = "external_";
 
 function hasNonemptySuffix(value: string, prefix: string): boolean {
   return value.startsWith(prefix) && value.length > prefix.length;
@@ -31,14 +33,18 @@ function internalTargetOfInboxEnvelope(envelope: InboxEnvelope): string | null {
   const messageId = typeof envelope.message_id === "string" ? envelope.message_id : "";
   const reminderKind = envelope.kind === "reminder";
   const redeliveryKind = envelope.kind === "redelivery";
+  const externalKind = envelope.kind === "external";
   const reminderMarker = messageId.startsWith(REMINDER_MESSAGE_PREFIX);
   const redeliveryMarker = messageId.startsWith(REDELIVERY_MESSAGE_PREFIX);
+  const externalMarker = messageId.startsWith(EXTERNAL_MESSAGE_PREFIX);
   const reminderId = hasNonemptySuffix(messageId, REMINDER_MESSAGE_PREFIX);
   const redeliveryId = hasNonemptySuffix(messageId, REDELIVERY_MESSAGE_PREFIX);
-  const hasInternalMarker = reminderKind || redeliveryKind || reminderMarker || redeliveryMarker;
+  const externalId = hasNonemptySuffix(messageId, EXTERNAL_MESSAGE_PREFIX);
+  const hasInternalMarker = reminderKind || redeliveryKind || externalKind || reminderMarker || redeliveryMarker || externalMarker;
   if (!hasInternalMarker) return null;
-  if (reminderKind && reminderId && !redeliveryKind && !redeliveryMarker) return RUNTIME_REMINDER_TARGET;
-  if (redeliveryKind && redeliveryId && !reminderKind && !reminderMarker) return RUNTIME_REDELIVERY_TARGET;
+  if (reminderKind && reminderId && !redeliveryKind && !externalKind && !redeliveryMarker && !externalMarker) return RUNTIME_REMINDER_TARGET;
+  if (redeliveryKind && redeliveryId && !reminderKind && !externalKind && !reminderMarker && !externalMarker) return RUNTIME_REDELIVERY_TARGET;
+  if (externalKind && externalId && !reminderKind && !redeliveryKind && !reminderMarker && !redeliveryMarker) return RUNTIME_EXTERNAL_TARGET;
   throw new Error(`Inbox internal source requires matching kind and message_id prefix; received kind=${JSON.stringify(envelope.kind ?? null)} message_id=${JSON.stringify(envelope.message_id ?? null)}`);
 }
 
@@ -59,6 +65,7 @@ export function isCanonicalInboxTarget(target: string): boolean {
     || isThreadTarget(target)
     || target === RUNTIME_REMINDER_TARGET
     || target === RUNTIME_REDELIVERY_TARGET
+    || target === RUNTIME_EXTERNAL_TARGET
     || isDocumentCommentTarget(target);
 }
 
@@ -68,7 +75,7 @@ export function isUserDeliveryTarget(target: string): boolean {
 }
 
 function invalidTarget(target: string): Error {
-  return new Error(`Invalid canonical Inbox target ${JSON.stringify(target)}; expected chat:<nonempty>, thread:<nonempty>, runtime:reminder, runtime:redelivery, or document-comment:<nonempty>`);
+  return new Error(`Invalid canonical Inbox target ${JSON.stringify(target)}; expected chat:<nonempty>, thread:<nonempty>, runtime:reminder, runtime:redelivery, runtime:external, or document-comment:<nonempty>`);
 }
 
 function optionalLocator(envelope: InboxEnvelope, key: "chat_id" | "thread_id"): string {
@@ -99,7 +106,7 @@ export function targetKeyOfInboxEnvelope(envelope: InboxEnvelope | null | undefi
       }
       return target;
     }
-    if (target === RUNTIME_REMINDER_TARGET || target === RUNTIME_REDELIVERY_TARGET) {
+    if (target === RUNTIME_REMINDER_TARGET || target === RUNTIME_REDELIVERY_TARGET || target === RUNTIME_EXTERNAL_TARGET) {
       if (locatorTarget) throw new Error(`Inbox runtime target cannot carry chat_id/thread_id locators`);
       if (internalTarget !== target) throw new Error(`Inbox target ${target} requires exact matching kind and message_id prefix`);
       return target;

@@ -17,6 +17,7 @@ Larkin is a local Runtime Host that connects Codex, Claude Code, and Pi agent ru
 - `eddiearc/larkin` 是上游核心，负责纯粹、通用的飞书能力，包括飞书 API 适配、Runtime Host 核心架构、消息安全边界和通用交互能力。
 - `dalianzhu/larkin` 是可构建、安装和实际运行的下游发行版。在上游核心之上维护本地业务所需的通用扩展，例如经认证的 external agent enqueue。
 - 上游坚持“所有 Agent 数据源来自飞书”；下游允许受认证的本地自动化向 Agent 投递通用消息。这是双方已确认的产品边界，不以合入上游为目标。
+- 下游 external enqueue 使用 `runtime:external` 作为 canonical Runtime wake target；它不是用户消息回复目标，必须保留 source kind、message ID 前缀和无 chat/thread locator 的一致性校验。
 - 业务语义应尽量留在调用方。例如 Quality Gate 负责在消息正文中提供 flow、任务和目标信息；Larkin 的 enqueue 只负责可靠投递任意消息，不理解 Quality Gate 或特定飞书路由。
 - `origin/main` 代表下游可发布版本，可以有意领先并偏离上游；`upstream/main` 始终代表官方核心，不在本仓库另建“纯净 main”副本。
 
@@ -82,7 +83,7 @@ git push origin main
 - release commit 必须保持工作树干净、已推送，并通过 typecheck、build、测试、license 和 publication checks；安装工件必须显示 `sourceDirty: false`。
 - 发现上下游使用了相同版本号时，不覆盖、不移动已有 tag；下游直接递增到新的未使用版本，并从明确的上游 commit 重新构建。
 
-当前发行关系：上游基线为 `eddiearc/larkin@71f188f`（`0.3.0`），下游 external enqueue 发行版为 `0.3.1`。后续同步时以实际的 `upstream/main` 和下游最新 release 为准，不把本段中的 commit 当作永久固定基线。
+当前发行关系：下游已同步上游 `eddiearc/larkin@d95cb75`（`0.4.25`），external enqueue 修复版本为 `0.4.26`。后续同步时以实际的 `upstream/main` 和下游最新 release 为准，不把本段中的 commit 当作永久固定基线。
 
 ## Requirements
 

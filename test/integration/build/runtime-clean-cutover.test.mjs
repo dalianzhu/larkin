@@ -41,8 +41,8 @@ test("authored source and generated runtime use the seven-domain mirrored layout
 
 test("production build, start, and Agent CLI graph contain only current entries", () => {
   const packageJson = JSON.parse(source("package.json"));
-  assert.equal(packageJson.private, false, "the source checkout must remain publishable to the npm registry");
-  assert.equal(packageJson.larkinPackageRole, "npm-published");
+  assert.equal(packageJson.private, true, "the downstream source checkout must not publish over the upstream npm package");
+  assert.equal(packageJson.larkinPackageRole, "development-source-checkout");
   assert.deepEqual(packageJson.files, [
     "dist/",
     "patches/",

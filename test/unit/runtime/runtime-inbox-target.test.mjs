@@ -9,6 +9,7 @@ import {
   RUNTIME_REDELIVERY_TARGET,
   RUNTIME_REMINDER_TARGET,
   isCanonicalInboxTarget,
+  isUserDeliveryTarget,
   projectInboxCheck,
   targetKeyOfInboxEnvelope,
 } from "../../../dist/agent/inbox-projection.mjs";
@@ -42,6 +43,7 @@ test("canonical Inbox target derivation validates namespace and source coherence
     [{ chat_id: "群/聊:✨", thread_id: "话题?! / ü" }, "thread:群/聊:✨:话题?! / ü"],
     [{ target: RUNTIME_REMINDER_TARGET, kind: "reminder", message_id: "rem_标点 !?/✨" }, RUNTIME_REMINDER_TARGET],
     [{ target: RUNTIME_REDELIVERY_TARGET, kind: "redelivery", message_id: "redeliver_标点 !?/✨" }, RUNTIME_REDELIVERY_TARGET],
+    [{ target: "runtime:external", kind: "external", message_id: "external_标点 !?/✨" }, "runtime:external"],
   ];
   for (const [envelope, expected] of valid) {
     assert.equal(targetKeyOfInboxEnvelope(envelope), expected);
@@ -51,6 +53,7 @@ test("canonical Inbox target derivation validates namespace and source coherence
   for (const target of ["chat:", "thread:", "document-comment:", "dm:@system", "#c123", "runtime:system", "runtime:unknown", "runtime:other", "unknown:value"]) {
     assert.equal(isCanonicalInboxTarget(target), false);
   }
+  assert.equal(isUserDeliveryTarget("runtime:external"), false, "external automation is a Runtime wake target, not a reply destination");
   for (const envelope of [
     null,
     undefined,
@@ -75,6 +78,11 @@ test("canonical Inbox target derivation validates namespace and source coherence
     { kind: "redelivery", message_id: "redeliver_targetless_both" },
     { target: RUNTIME_REMINDER_TARGET, kind: "reminder", message_id: "rem_" },
     { target: RUNTIME_REDELIVERY_TARGET, kind: "redelivery", message_id: "redeliver_" },
+    { target: "runtime:external", message_id: "external_missing_kind" },
+    { target: "runtime:external", kind: "external", message_id: "om_wrong_prefix" },
+    { target: "runtime:external", kind: "external", message_id: "external_" },
+    { target: "runtime:external", kind: "external", message_id: "external_with_chat", chat_id: "任意" },
+    { kind: "external", message_id: "external_targetless" },
     { target: RUNTIME_REDELIVERY_TARGET, kind: "redelivery", message_id: "redeliver_with_chat", chat_id: "任意" },
     { target: RUNTIME_REMINDER_TARGET, kind: "reminder", message_id: "rem_with_thread", thread_id: "孤立线程" },
     { target: "chat:expected", chat_id: "different" },

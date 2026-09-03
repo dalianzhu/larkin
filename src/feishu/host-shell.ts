@@ -18,7 +18,7 @@ import {
   shouldPreventiveReconnect,
 } from "./host-business-state.js";
 import { ProcessingEyeOrchestrator } from "./host-processing-eye.js";
-import { projectInboxEnvelope, targetKeyOfInboxEnvelope } from "../agent/inbox-projection.js";
+import { RUNTIME_EXTERNAL_TARGET, projectInboxEnvelope, targetKeyOfInboxEnvelope } from "../agent/inbox-projection.js";
 import { HostReminderOrchestrator } from "../agent/host-reminder-orchestrator.js";
 import { InboxAuditHeartbeat } from "../agent/inbox-audit-heartbeat.js";
 import { inboxAuditRegistryFile, observeInboxAuditTarget } from "../agent/missed-outbound-scan.js";
@@ -1417,9 +1417,9 @@ export function createHostShell({
         store.writeJson("externalEnqueue", external);
       }
 
-      const target = "runtime:external";
+      const target = RUNTIME_EXTERNAL_TARGET;
       const envelope: Record<string, unknown> = {
-        message_id: messageId, seq: Date.now(), sender_id: "external_enqueue",
+        message_id: messageId, seq: Date.now(), kind: "external", sender_id: "external_enqueue",
         sender_name: "External automation", sender_type: "system",
         channel_type: "runtime", channel_name: "external",
         content: request.content, timestamp: now, thread_id: null, chat_id: null,
