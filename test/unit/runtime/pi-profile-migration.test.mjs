@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -19,7 +20,26 @@ function fixture({ target = false } = {}) {
   fs.mkdirSync(bin, { recursive: true, mode: 0o700 });
   fs.mkdirSync(config, { recursive: true, mode: 0o700 });
   const version = path.join(bin, "pi");
-  fs.writeFileSync(version, `#!${process.execPath}\nconsole.log("0.84.2")\n`, { mode: 0o700 });
+  const probeLog = path.join(bin, "probe.ndjson");
+  fs.writeFileSync(probeLog, "");
+  fs.writeFileSync(version, `#!${process.execPath}
+const fs = require("node:fs");
+const path = require("node:path");
+try {
+  fs.appendFileSync(path.join(path.dirname(process.argv[1]), "probe.ndjson"), JSON.stringify({
+    packageDir: process.env.PI_PACKAGE_DIR || null,
+    cwd: process.cwd(),
+    path: process.env.PATH || null,
+    command: process.env.LARKIN_PI_COMMAND || null,
+    codingAgentDir: process.env.PI_CODING_AGENT_DIR || null,
+    offline: process.env.PI_OFFLINE || null,
+    skipVersion: process.env.PI_SKIP_VERSION_CHECK || null,
+    distribution: process.env.LARKIN_PI_DISTRIBUTION || null,
+    configDir: process.env.LARKIN_CONFIG_DIR || null,
+  }) + "\\n");
+} catch {}
+console.log("0.84.2");
+`, { mode: 0o700 });
   fs.chmodSync(version, 0o700);
   const auth = Buffer.from('{"fixture":{"type":"api_key","key":"PRIVATE_FIXTURE_SECRET"}}\n');
   const models = Buffer.from('{"providers":{"fixture":{"models":[{"id":"fixture-model","contextWindow":272000}]}}}\n');
@@ -36,10 +56,153 @@ function fixture({ target = false } = {}) {
     fs.writeFileSync(path.join(targetDir, "unrelated.txt"), "must-survive", { mode: 0o600 });
   }
   const env = { HOME: root, PATH: `${bin}:/usr/bin:/bin`, PI_CODING_AGENT_DIR: source };
-  return { root, source, config, targetDir, agent, env, auth, models };
+  return { root, source, config, targetDir, agent, env, auth, models, probeLog };
 }
 
 function clean(f) { fs.rmSync(f.root, { recursive: true, force: true }); }
+
+test("profile apply does not inherit a later ambient package root when the plan had none", () => {
+  const f = fixture();
+  const minimal = path.join(f.root, ".larkin-official-pi-package");
+  fs.mkdirSync(path.join(minimal, "theme"), { recursive: true });
+  fs.writeFileSync(path.join(minimal, "theme", "dark.json"), "{}\n");
+  const later = path.join(f.root, "later-root");
+  fs.mkdirSync(path.join(later, "dist", "modes", "interactive", "theme"), { recursive: true });
+  fs.writeFileSync(path.join(later, "dist", "modes", "interactive", "theme", "dark.json"), "{}\n");
+  const previous = {
+    PI_PACKAGE_DIR: process.env.PI_PACKAGE_DIR,
+    PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
+    PI_OFFLINE: process.env.PI_OFFLINE,
+    PI_SKIP_VERSION_CHECK: process.env.PI_SKIP_VERSION_CHECK,
+    LARKIN_PI_DISTRIBUTION: process.env.LARKIN_PI_DISTRIBUTION,
+    LARKIN_CONFIG_DIR: process.env.LARKIN_CONFIG_DIR,
+  };
+  try {
+    fs.writeFileSync(f.probeLog, "");
+    const plan = migration.preparePiProfileMigration({ ...f.env, PI_PACKAGE_DIR: minimal }, f.config, f.agent, "external");
+    assert.equal(plan.sourceEnvironment.PI_PACKAGE_DIR, undefined);
+    const prepareProbes = fs.readFileSync(f.probeLog, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
+    assert.ok(prepareProbes.length >= 1);
+    assert.equal(prepareProbes.every((row) => row.packageDir == null), true, JSON.stringify(prepareProbes));
+    process.env.PI_CODING_AGENT_DIR = "/tmp/polluted-agent";
+    process.env.PI_OFFLINE = "1";
+    process.env.PI_SKIP_VERSION_CHECK = "1";
+    process.env.LARKIN_PI_DISTRIBUTION = "builtin";
+    process.env.LARKIN_CONFIG_DIR = "/tmp/polluted-config";
+    fs.writeFileSync(f.probeLog, "");
+    migration.applyPiProfileMigration(plan);
+    const applyProbes = fs.readFileSync(f.probeLog, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
+    assert.equal(applyProbes.length, 1, JSON.stringify(applyProbes));
+    assert.equal(applyProbes[0].packageDir, null);
+    assert.equal(applyProbes[0].codingAgentDir, null);
+    assert.equal(applyProbes[0].offline, null);
+    assert.equal(applyProbes[0].skipVersion, null);
+    assert.equal(applyProbes[0].distribution, null);
+    assert.equal(applyProbes[0].configDir, null);
+    assert.equal(applyProbes[0].command, "pi");
+    assert.equal(fs.realpathSync(applyProbes[0].cwd), fs.realpathSync(plan.state.sourceDir));
+    assert.equal(applyProbes[0].path, plan.sourceEnvironment.PATH);
+    assert.equal(fs.existsSync(path.join(f.targetDir, "auth.json")), true);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    clean(f);
+  }
+});
+
+test("prepare/apply/rollback probes ignore a later ambient package root", () => {
+  const f = fixture();
+  const planned = path.join(f.root, "planned-root");
+  const later = path.join(f.root, "later-valid");
+  for (const root of [planned, later]) {
+    fs.mkdirSync(path.join(root, "dist", "modes", "interactive", "theme"), { recursive: true });
+    fs.writeFileSync(path.join(root, "dist", "modes", "interactive", "theme", "dark.json"), `${JSON.stringify({ root: path.basename(root) })}\n`);
+  }
+  const previous = process.env.PI_PACKAGE_DIR;
+  const lock = path.join(f.config, "providers", "pi", `${f.agent}.larkin-pi-import.lock`);
+  const readProbes = () => fs.readFileSync(f.probeLog, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
+  try {
+    fs.writeFileSync(f.probeLog, "");
+    const plan = migration.preparePiProfileMigration({ ...f.env, PI_PACKAGE_DIR: planned }, f.config, f.agent, "external");
+    const prepareProbes = readProbes();
+    assert.equal(prepareProbes.length, 1, JSON.stringify(prepareProbes));
+    assert.equal(fs.realpathSync(prepareProbes[0].packageDir), fs.realpathSync(planned));
+    process.env.PI_PACKAGE_DIR = later;
+    fs.writeFileSync(f.probeLog, "");
+    migration.applyPiProfileMigration(plan);
+    const applyProbes = readProbes();
+    assert.equal(applyProbes.length, 1, JSON.stringify(applyProbes));
+    assert.equal(fs.realpathSync(applyProbes[0].packageDir), fs.realpathSync(planned));
+    assert.equal(applyProbes[0].packageDir.includes("later-valid"), false);
+    fs.writeFileSync(f.probeLog, "");
+    migration.rollbackPiProfileMigration(plan.state);
+    const rollbackProbes = readProbes();
+    assert.ok(rollbackProbes.length > 0, JSON.stringify(rollbackProbes));
+    assert.equal(rollbackProbes.every((row) => !String(row.packageDir || "").includes("later-valid")), true, JSON.stringify(rollbackProbes));
+    assert.equal(fs.realpathSync(rollbackProbes[0].packageDir), fs.realpathSync(planned));
+    assert.equal(fs.existsSync(f.targetDir), false);
+    assert.equal(fs.existsSync(lock), false);
+  } finally {
+    if (previous === undefined) delete process.env.PI_PACKAGE_DIR;
+    else process.env.PI_PACKAGE_DIR = previous;
+    clean(f);
+  }
+});
+
+test("profile apply rejects symlink retarget and theme content mutation", () => {
+  const f = fixture();
+  const pkg = path.join(f.root, "planned-root");
+  const alt = path.join(f.root, "alternate-root");
+  fs.mkdirSync(path.join(pkg, "dist", "modes", "interactive", "theme"), { recursive: true });
+  fs.writeFileSync(path.join(pkg, "dist", "modes", "interactive", "theme", "dark.json"), "{}\n");
+  fs.mkdirSync(path.join(alt, "dist", "modes", "interactive", "theme"), { recursive: true });
+  fs.writeFileSync(path.join(alt, "dist", "modes", "interactive", "theme", "dark.json"), "{\"alt\":true}\n");
+  try {
+    const plan = migration.preparePiProfileMigration({ ...f.env, PI_PACKAGE_DIR: pkg }, f.config, f.agent, "external");
+    fs.rmSync(pkg, { recursive: true, force: true });
+    fs.symlinkSync(alt, pkg);
+    assert.throws(() => migration.applyPiProfileMigration(plan), /package root changed/);
+    assert.equal(fs.existsSync(path.join(f.targetDir, "auth.json")), false);
+  } finally { clean(f); }
+  const g = fixture();
+  const live = path.join(g.root, "live-root");
+  fs.mkdirSync(path.join(live, "dist", "modes", "interactive", "theme"), { recursive: true });
+  const theme = path.join(live, "dist", "modes", "interactive", "theme", "dark.json");
+  fs.writeFileSync(theme, "{}\n");
+  try {
+    const plan = migration.preparePiProfileMigration({ ...g.env, PI_PACKAGE_DIR: live }, g.config, g.agent, "external");
+    fs.writeFileSync(theme, "{\"mutated\":true}\n");
+    assert.throws(() => migration.applyPiProfileMigration(plan), /package root changed/);
+    assert.equal(fs.existsSync(path.join(g.targetDir, "auth.json")), false);
+  } finally { clean(g); }
+});
+
+test("profile apply fails closed when the planned package root becomes stale", () => {
+  const f = fixture();
+  const pkg = path.join(f.root, "planned-root");
+  fs.mkdirSync(path.join(pkg, "dist", "modes", "interactive", "theme"), { recursive: true });
+  fs.writeFileSync(path.join(pkg, "dist", "modes", "interactive", "theme", "dark.json"), "{}\n");
+  try {
+    const plan = migration.preparePiProfileMigration({ ...f.env, PI_PACKAGE_DIR: pkg }, f.config, f.agent, "external");
+    assert.equal(plan.sourceEnvironment.PI_PACKAGE_DIR, fs.realpathSync(pkg));
+    fs.rmSync(pkg, { recursive: true, force: true });
+    assert.throws(() => migration.applyPiProfileMigration(plan), /package root changed/);
+    assert.equal(fs.existsSync(path.join(f.targetDir, "auth.json")), false);
+  } finally { clean(f); }
+});
+
+test("profile migration plan persists a canonical external package root", () => {
+  const f = fixture();
+  const pkg = path.join(f.root, "nix", "store", "hash-pi");
+  fs.mkdirSync(path.join(pkg, "dist", "modes", "interactive", "theme"), { recursive: true });
+  fs.writeFileSync(path.join(pkg, "dist", "modes", "interactive", "theme", "dark.json"), "{}\n");
+  try {
+    const plan = migration.preparePiProfileMigration({ ...f.env, PI_PACKAGE_DIR: pkg }, f.config, f.agent, "external");
+    assert.equal(plan.sourceEnvironment.PI_PACKAGE_DIR, fs.realpathSync(pkg));
+  } finally { clean(f); }
+});
 
  test("imports only auth/models/settings, preserves provider bytes, owns modes, and rolls back an absent target", () => {
   const f = fixture();
@@ -197,5 +360,118 @@ test("refuses target content or mode tampering during rollback", () => {
       fs.chmodSync(path.join(second.targetDir, "models.json"), 0o644);
       assert.throws(() => migration.rollbackPiProfileMigration(secondPlan.state), /changed/);
     } finally { clean(second); }
+  } finally { clean(f); }
+});
+
+function lockPath(config, agent) {
+  return path.join(config, "providers", "pi", `${agent}.larkin-pi-import.lock`);
+}
+
+function writeLock(config, agent, body, mode = 0o600) {
+  const file = lockPath(config, agent);
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, body, { mode });
+  fs.chmodSync(file, mode);
+  return file;
+}
+
+async function deadPid() {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  const pid = child.pid;
+  assert.equal(typeof pid, "number");
+  child.kill("SIGKILL");
+  await new Promise((resolve) => child.once("exit", resolve));
+  return pid;
+}
+
+test("reclaims a stale lock whose recorded pid is dead", async () => {
+  const f = fixture();
+  try {
+    const file = writeLock(f.config, f.agent, `${await deadPid()}\n`);
+    migration.clearStalePiProfileMigrationLock(f.config, f.agent);
+    assert.equal(fs.existsSync(file), false);
+  } finally { clean(f); }
+});
+
+test("refuses to reclaim a lock owned by the current live pid", () => {
+  const f = fixture();
+  try {
+    const file = writeLock(f.config, f.agent, `${process.pid}\n`);
+    assert.throws(() => migration.clearStalePiProfileMigrationLock(f.config, f.agent), /Pi provider target is busy/);
+    assert.equal(fs.existsSync(file), true);
+  } finally { clean(f); }
+});
+
+test("treats EPERM as a possibly live lock and refuses reclaim", async () => {
+  const f = fixture();
+  try {
+    const file = writeLock(f.config, f.agent, `${await deadPid()}\n`);
+    const kill = () => {
+      const error = new Error("EPERM");
+      error.code = "EPERM";
+      throw error;
+    };
+    assert.throws(() => migration.clearStalePiProfileMigrationLock(f.config, f.agent, { kill }), /Pi provider target is busy/);
+    assert.equal(fs.existsSync(file), true);
+  } finally { clean(f); }
+});
+
+test("refuses malformed lock pid lines", () => {
+  const f = fixture();
+  try {
+    for (const body of ["", "not-a-pid\n", "0\n", "-3\n", "12\n34\n", "12 34\n"]) {
+      const file = writeLock(f.config, f.agent, body);
+      assert.throws(() => migration.clearStalePiProfileMigrationLock(f.config, f.agent), /Pi provider target is busy/, body);
+      assert.equal(fs.existsSync(file), true, body);
+    }
+  } finally { clean(f); }
+});
+
+test("refuses symlink or hardlinked lock metadata", async () => {
+  const f = fixture();
+  try {
+    const pid = await deadPid();
+    const file = lockPath(f.config, f.agent);
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const target = path.join(f.config, "providers", "pi", "lock-target");
+    fs.writeFileSync(target, `${pid}\n`, { mode: 0o600 });
+    fs.symlinkSync(target, file);
+    assert.throws(() => migration.clearStalePiProfileMigrationLock(f.config, f.agent), /Pi provider target is busy/);
+    fs.unlinkSync(file);
+    writeLock(f.config, f.agent, `${pid}\n`, 0o644);
+    assert.throws(() => migration.clearStalePiProfileMigrationLock(f.config, f.agent), /Pi provider target is busy/);
+    fs.unlinkSync(file);
+    writeLock(f.config, f.agent, `${pid}\n`);
+    fs.linkSync(file, `${file}.hard`);
+    assert.throws(() => migration.clearStalePiProfileMigrationLock(f.config, f.agent), /Pi provider target is busy/);
+  } finally { clean(f); }
+});
+
+test("concurrent stale-lock reclaimers leave the lock path empty without stealing a live lock", async () => {
+  const f = fixture();
+  try {
+    const file = writeLock(f.config, f.agent, `${await deadPid()}\n`);
+    const script = path.join(f.root, "reclaim.mjs");
+    fs.writeFileSync(script, `import { pathToFileURL } from "node:url";
+const migration = await import(pathToFileURL(${JSON.stringify(path.join(ROOT, "dist/runtime/pi-profile-migration.mjs"))}).href);
+try {
+  migration.clearStalePiProfileMigrationLock(process.env.LOCK_CONFIG, process.env.LOCK_AGENT);
+  process.stdout.write("ok\\n");
+} catch (error) {
+  process.stdout.write(String(error && error.message || error) + "\\n");
+  process.exit(2);
+}
+`);
+    const env = { ...process.env, LOCK_CONFIG: f.config, LOCK_AGENT: f.agent };
+    const first = spawn(process.execPath, [script], { env, encoding: "utf8" });
+    const second = spawn(process.execPath, [script], { env, encoding: "utf8" });
+    const results = await Promise.all([first, second].map((child) => new Promise((resolve) => {
+      let stdout = ""; let stderr = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      child.once("exit", (status) => resolve({ status, stdout, stderr }));
+    })));
+    assert.equal(results.every((result) => result.status === 0 && result.stdout.includes("ok")), true, JSON.stringify(results));
+    assert.equal(fs.existsSync(file), false);
   } finally { clean(f); }
 });
