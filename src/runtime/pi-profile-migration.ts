@@ -3,6 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
+import processInspect from "../platform/process-inspect.cjs";
+import { applyPiPackageDirForChild } from "./builtin-pi-assets.js";
 import { resolveRuntimeExecutable } from "./runtime-readiness.js";
 import { mergeOwnedPiSettings, parsePiExecutableVersion } from "./pi-compaction-recovery.js";
 import { BUNDLED_PI_VERSION } from "./pi-provider-config.js";
@@ -34,16 +36,60 @@ export interface PiProfileMigrationState {
   targetEntries: string[];
   priorFiles: Record<FileName, FileState>;
   afterFiles: Record<FileName, FileState>;
+  sourcePath?: string;
+  sourcePackageDir?: string;
+  sourcePackageDev?: number;
+  sourcePackageIno?: number;
+  sourcePackageThemeSha256?: string;
 }
 
 export interface PiProfileMigrationPlan {
   state: PiProfileMigrationState;
   sourceBytes: Record<FileName, Buffer>;
-  sourceEnvironment: { PATH?: string; LARKIN_PI_COMMAND?: string };
+  sourceEnvironment: { PATH?: string; LARKIN_PI_COMMAND?: string; PI_PACKAGE_DIR?: string };
 }
 
 const TARGET_LOCK_SUFFIX = ".larkin-pi-import.lock";
 function hash(bytes: Buffer): string { return crypto.createHash("sha256").update(bytes).digest("hex"); }
+function isPiOrLarkinEnvKey(key: string): boolean {
+  return key === "PATH" || key.startsWith("PI_") || key.startsWith("LARKIN_");
+}
+function isolatePlannedReplayEnv(source: { PATH?: string; LARKIN_PI_COMMAND?: string; PI_PACKAGE_DIR?: string }): NodeJS.ProcessEnv {
+  const next: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (isPiOrLarkinEnvKey(key)) continue;
+    next[key] = value;
+  }
+  if (source.PATH) next.PATH = source.PATH;
+  if (source.LARKIN_PI_COMMAND) next.LARKIN_PI_COMMAND = source.LARKIN_PI_COMMAND;
+  if (source.PI_PACKAGE_DIR) next.PI_PACKAGE_DIR = source.PI_PACKAGE_DIR;
+  return next;
+}
+function capturePackageRootProof(directory: string): { dir: string; dev: number; ino: number; themeSha256: string } {
+  const resolved = fs.realpathSync(directory);
+  const rootStat = fs.statSync(resolved);
+  const theme = path.join(resolved, "dist", "modes", "interactive", "theme", "dark.json");
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(theme, fs.constants.O_RDONLY);
+    const themeStat = fs.fstatSync(fd);
+    if (!themeStat.isFile()) throw new Error("external Pi package root changed; refusing migration");
+    const bytes = fs.readFileSync(fd);
+    return { dir: resolved, dev: rootStat.dev, ino: rootStat.ino, themeSha256: hash(bytes) };
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* ignore */ }
+  }
+}
+function assertPackageRootProof(state: PiProfileMigrationState): void {
+  if (!state.sourcePackageDir) return;
+  let current: ReturnType<typeof capturePackageRootProof>;
+  try { current = capturePackageRootProof(state.sourcePackageDir); }
+  catch { throw new Error("external Pi package root changed; refusing migration"); }
+  if (current.dir !== state.sourcePackageDir || current.dev !== state.sourcePackageDev
+      || current.ino !== state.sourcePackageIno || current.themeSha256 !== state.sourcePackageThemeSha256) {
+    throw new Error("external Pi package root changed; refusing migration");
+  }
+}
 function targetLockFile(state: PiProfileMigrationState): string { return path.join(path.dirname(state.targetDir), `${state.agentId}${TARGET_LOCK_SUFFIX}`); }
 function acquireTargetLock(state: PiProfileMigrationState): void {
   const file = targetLockFile(state);
@@ -61,6 +107,91 @@ function acquireTargetLock(state: PiProfileMigrationState): void {
 export function releasePiProfileMigrationLock(state: PiProfileMigrationState): void {
   try { fs.unlinkSync(targetLockFile(state)); fsyncDirectory(path.dirname(targetLockFile(state))); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+}
+const TARGET_BUSY = "Pi provider target is busy";
+export interface ClearStalePiProfileMigrationLockOptions {
+  kill?: typeof process.kill;
+}
+function migrationLockPath(configDir: string, agentId: string): string {
+  if (!AGENT_ID.test(agentId)) throw new Error("Pi Agent ID 格式无效");
+  return path.join(path.resolve(configDir), "providers", "pi", `${agentId}${TARGET_LOCK_SUFFIX}`);
+}
+function lockPidFromBytes(bytes: Buffer): number | null {
+  const text = bytes.toString("utf8");
+  if (text.endsWith("\n") ? text.slice(0, -1).includes("\n") : text.includes("\n")) return null;
+  const line = text.endsWith("\n") ? text.slice(0, -1) : text;
+  if (!/^[1-9][0-9]*$/.test(line)) return null;
+  const pid = Number(line);
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+}
+function inspectOwnedLock(file: string): { pid: number; dev: number; ino: number } | null {
+  let fd: number | undefined;
+  try {
+    const initial = fs.lstatSync(file);
+    if (initial.isSymbolicLink() || !initial.isFile() || initial.nlink !== 1 || (initial.mode & 0o777) !== 0o600) {
+      throw new Error(TARGET_BUSY);
+    }
+    assertOwner(initial, "Pi provider lock");
+    const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+    fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow);
+    const before = fs.fstatSync(fd);
+    if (!before.isFile() || before.nlink !== 1 || (before.mode & 0o777) !== 0o600) throw new Error(TARGET_BUSY);
+    assertOwner(before, "Pi provider lock");
+    const bytes = Buffer.allocUnsafe(before.size);
+    let offset = 0;
+    while (offset < before.size) {
+      const read = fs.readSync(fd, bytes, offset, before.size - offset, null);
+      if (read === 0) throw new Error(TARGET_BUSY);
+      offset += read;
+    }
+    const after = fs.fstatSync(fd);
+    if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size || after.nlink !== before.nlink
+        || after.uid !== before.uid || (after.mode & 0o777) !== 0o600) throw new Error(TARGET_BUSY);
+    const pid = lockPidFromBytes(bytes.subarray(0, after.size));
+    if (pid === null) throw new Error(TARGET_BUSY);
+    return { pid, dev: after.dev, ino: after.ino };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    if ((error as NodeJS.ErrnoException).code === "ELOOP") throw new Error(TARGET_BUSY);
+    if (error instanceof Error && error.message === TARGET_BUSY) throw error;
+    if (error instanceof Error && /unsafe/.test(error.message)) throw new Error(TARGET_BUSY);
+    throw new Error(TARGET_BUSY);
+  } finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+/** Reclaim a credential-adjacent import lock only when it is a proven-dead owned regular file. */
+export function clearStalePiProfileMigrationLock(
+  configDir: string,
+  agentId: string,
+  options: ClearStalePiProfileMigrationLockOptions = {},
+): void {
+  const file = migrationLockPath(configDir, agentId);
+  assertNoSymlinkAncestors(path.dirname(file));
+  const inspected = inspectOwnedLock(file);
+  if (!inspected) return;
+  const kill = options.kill ?? process.kill;
+  if (processInspect.pidAlive(inspected.pid, kill)) throw new Error(TARGET_BUSY);
+  const quarantine = `${file}.stale-${process.pid}-${crypto.randomUUID()}`;
+  try { fs.renameSync(file, quarantine); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw new Error(TARGET_BUSY);
+  }
+  fsyncDirectory(path.dirname(file));
+  try {
+    const quarantined = fs.lstatSync(quarantine);
+    if (quarantined.isSymbolicLink() || !quarantined.isFile() || quarantined.nlink !== 1
+        || (quarantined.mode & 0o777) !== 0o600 || quarantined.dev !== inspected.dev || quarantined.ino !== inspected.ino) {
+      throw new Error(TARGET_BUSY);
+    }
+    assertOwner(quarantined, "Pi provider lock");
+    const bytes = fs.readFileSync(quarantine);
+    if (lockPidFromBytes(bytes) !== inspected.pid || processInspect.pidAlive(inspected.pid, kill)) {
+      throw new Error(TARGET_BUSY);
+    }
+  } finally {
+    try { fs.unlinkSync(quarantine); } catch { /* quarantine is not the live lock path */ }
+    fsyncDirectory(path.dirname(file));
+  }
 }
 function isKnownSystemSymlink(value: string): boolean {
   return value === "/tmp" || value === "/private/tmp" || value === "/var" || value === "/private/var"
@@ -148,12 +279,19 @@ function targetDirectory(configDir: string, agentId: string): string {
   if (!AGENT_ID.test(agentId)) throw new Error("Pi Agent ID 格式无效");
   return path.join(path.resolve(configDir), "providers", "pi", agentId);
 }
-function sourceVersion(env: NodeJS.ProcessEnv, cwd: string): ExecutableState {
+function sourceVersion(env: NodeJS.ProcessEnv, cwd: string, alreadySanitized = false): ExecutableState {
   const command = String(env.LARKIN_PI_COMMAND || "pi");
   const executable = resolveRuntimeExecutable(command, env);
   if (!executable) throw new Error("外部 Pi 0.84.2 profile import requires an installed Pi executable");
   const executableState = readExecutable(executable, "external Pi executable");
-  const result = spawnSync(executableState.path, ["--version"], { cwd, env, encoding: "utf8", timeout: 5_000, maxBuffer: 64 * 1024 });
+  const probeEnv = alreadySanitized ? env : applyPiPackageDirForChild(env, { distribution: "external" });
+  const result = spawnSync(executableState.path, ["--version"], {
+    cwd,
+    env: probeEnv,
+    encoding: "utf8",
+    timeout: 5_000,
+    maxBuffer: 64 * 1024,
+  });
   if (result.status !== 0) throw new Error("external Pi version probe failed");
   try { parsePiExecutableVersion(String(result.stdout || result.stderr || "").trim()); }
   catch { throw new Error(`external Pi must be exactly ${BUNDLED_PI_VERSION}`); }
@@ -188,12 +326,13 @@ function targetPrior(directory: string): { stat: fs.Stats | null; entries: strin
 }
 
 export function preparePiProfileMigration(env: NodeJS.ProcessEnv, configDir: string, agentId: string, distribution: "builtin" | "external" = "builtin"): PiProfileMigrationPlan {
-  const sourceDir = sourceDirectory(env);
+  const sanitized = applyPiPackageDirForChild({ ...env }, { distribution: "external" });
+  const sourceDir = sourceDirectory(sanitized);
   verifySourceProfile(sourceDir);
   const sourceDirectoryState = assertDirectory(sourceDir, "external Pi profile") as fs.Stats;
-  const sourceExecutable = sourceVersion(env, sourceDir);
+  const sourceExecutable = sourceVersion(sanitized, sourceDir, true);
   const sourceFiles = Object.fromEntries(FILES.map((name) => {
-    const file = readRegular(path.join(sourceDir, name), `external Pi ${name}`);
+    const file = readRegular(path.join(sourceDir, name), `external Pi ${name}`, false);
     if (!file) throw new Error(`external Pi ${name} is required`);
     if (name === "auth.json" && file.mode !== 0o600) throw new Error("external Pi auth.json has an unsafe mode");
     if (name !== "auth.json" && !SOURCE_MODES.has(file.mode)) throw new Error(`external Pi ${name} has an unsafe mode`);
@@ -210,14 +349,28 @@ export function preparePiProfileMigration(env: NodeJS.ProcessEnv, configDir: str
   const afterFiles = Object.fromEntries(FILES.map((name) => [name, safeState({ bytes: imported[name], mode: 0o600 }, false)])) as Record<FileName, FileState>;
   return {
     state: { version: 1, agentId, sourceDir, sourceDirMode: sourceDirectoryState.mode & 0o777,
-      sourceCommand: String(env.LARKIN_PI_COMMAND || "pi"), sourceExecutable,
+      sourceCommand: String(sanitized.LARKIN_PI_COMMAND || "pi"), sourceExecutable,
       sourceFiles: Object.fromEntries(FILES.map((name) => [name, safeState(sourceFiles[name], false)])) as Record<FileName, FileState>,
       targetDir, targetDirExisted: Boolean(target.stat), targetDirMode: target.stat ? target.stat.mode & 0o777 : 0o700,
       ...(target.stat ? { targetDirDevice: target.stat.dev, targetDirInode: target.stat.ino } : {}), targetEntries: target.entries,
-      priorFiles: target.files, afterFiles },
+      priorFiles: target.files, afterFiles,
+      ...(sanitized.PATH ? { sourcePath: sanitized.PATH } : {}),
+      ...(sanitized.PI_PACKAGE_DIR ? (() => {
+        const proof = capturePackageRootProof(sanitized.PI_PACKAGE_DIR);
+        return {
+          sourcePackageDir: proof.dir,
+          sourcePackageDev: proof.dev,
+          sourcePackageIno: proof.ino,
+          sourcePackageThemeSha256: proof.themeSha256,
+        };
+      })() : {}) },
     sourceBytes: { "auth.json": sourceFiles["auth.json"].bytes, "models.json": sourceFiles["models.json"].bytes,
       "settings.json": imported["settings.json"] },
-    sourceEnvironment: { PATH: env.PATH, LARKIN_PI_COMMAND: env.LARKIN_PI_COMMAND },
+    sourceEnvironment: {
+      PATH: sanitized.PATH,
+      LARKIN_PI_COMMAND: String(sanitized.LARKIN_PI_COMMAND || "pi"),
+      ...(sanitized.PI_PACKAGE_DIR ? { PI_PACKAGE_DIR: capturePackageRootProof(sanitized.PI_PACKAGE_DIR).dir } : {}),
+    },
   };
 }
 
@@ -254,11 +407,25 @@ export function validatePiProfileMigrationState(value: unknown): asserts value i
   }
 }
 
+function replayExternalPiPackageEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const next = { ...env };
+  const planned = env.PI_PACKAGE_DIR;
+  if (!planned) {
+    delete next.PI_PACKAGE_DIR;
+    return next;
+  }
+  const resolved = applyPiPackageDirForChild({ PI_PACKAGE_DIR: planned }, { distribution: "external", explicitPackageDir: planned }).PI_PACKAGE_DIR;
+  if (!resolved) throw new Error("external Pi package root changed; refusing migration");
+  next.PI_PACKAGE_DIR = resolved;
+  return next;
+}
+
 function assertSourceUnchanged(state: PiProfileMigrationState, resolutionEnvironment: NodeJS.ProcessEnv = process.env, verifyResolution = true): void {
   const directory = assertDirectory(state.sourceDir, "external Pi profile");
   if ((directory!.mode & 0o777) !== state.sourceDirMode) throw new Error("external Pi profile changed; refusing migration");
   verifySourceProfile(state.sourceDir);
-  const probeEnvironment = { ...process.env, ...resolutionEnvironment };
+  assertPackageRootProof(state);
+  const probeEnvironment = replayExternalPiPackageEnv(resolutionEnvironment);
   const resolved = verifyResolution ? resolveRuntimeExecutable(state.sourceCommand, probeEnvironment) : state.sourceExecutable.path;
   if (!resolved) throw new Error("external Pi executable changed; refusing migration");
   const executable = readExecutable(resolved, "external Pi executable");
@@ -266,7 +433,13 @@ function assertSourceUnchanged(state: PiProfileMigrationState, resolutionEnviron
       || executable.bytes !== state.sourceExecutable.bytes || executable.mode !== state.sourceExecutable.mode) {
     throw new Error("external Pi executable changed; refusing migration");
   }
-  const result = spawnSync(executable.path, ["--version"], { cwd: state.sourceDir, env: probeEnvironment, encoding: "utf8", timeout: 5_000, maxBuffer: 64 * 1024 });
+  const result = spawnSync(executable.path, ["--version"], {
+    cwd: state.sourceDir,
+    env: probeEnvironment,
+    encoding: "utf8",
+    timeout: 5_000,
+    maxBuffer: 64 * 1024,
+  });
   if (result.status !== 0) throw new Error("external Pi version probe failed");
   try { parsePiExecutableVersion(String(result.stdout || result.stderr || "").trim()); }
   catch { throw new Error(`external Pi must be exactly ${BUNDLED_PI_VERSION}`); }
@@ -337,9 +510,8 @@ function restoreFile(file: string, prior: FileState): void {
 }
 
 export function applyPiProfileMigration(plan: PiProfileMigrationPlan): void {
-  const sameEnvironment = process.env.PATH === plan.sourceEnvironment.PATH
-    && process.env.LARKIN_PI_COMMAND === plan.sourceEnvironment.LARKIN_PI_COMMAND;
-  assertSourceUnchanged(plan.state, sameEnvironment ? process.env : plan.sourceEnvironment);
+  const replayEnv = isolatePlannedReplayEnv(plan.sourceEnvironment);
+  assertSourceUnchanged(plan.state, replayEnv);
   const parent = path.dirname(plan.state.targetDir); assertNoSymlinkAncestors(parent); fs.mkdirSync(parent, { recursive: true, mode: 0o700 }); fs.chmodSync(parent, 0o700);
   acquireTargetLock(plan.state);
   assertTargetUnchanged(plan.state);
@@ -366,7 +538,12 @@ function fsyncDirectory(directory: string): void {
 }
 
 export function rollbackPiProfileMigration(state: PiProfileMigrationState): void {
-  validatePiProfileMigrationState(state); assertSourceUnchanged(state, process.env, false);
+  validatePiProfileMigrationState(state);
+  assertSourceUnchanged(state, isolatePlannedReplayEnv({
+    PATH: state.sourcePath,
+    LARKIN_PI_COMMAND: state.sourceCommand,
+    ...(state.sourcePackageDir ? { PI_PACKAGE_DIR: state.sourcePackageDir } : {}),
+  }), false);
   const target = assertDirectory(state.targetDir, "Pi provider target", false);
   if (!target) {
     if (state.targetDirExisted) throw new Error("Pi provider target disappeared during rollback");

@@ -18,11 +18,14 @@ import {
   shouldPreventiveReconnect,
 } from "./host-business-state.js";
 import { ProcessingEyeOrchestrator } from "./host-processing-eye.js";
-import { projectInboxEnvelope, targetKeyOfInboxEnvelope } from "../agent/inbox-projection.js";
+import { RUNTIME_EXTERNAL_TARGET, projectInboxEnvelope, targetKeyOfInboxEnvelope } from "../agent/inbox-projection.js";
 import { HostReminderOrchestrator } from "../agent/host-reminder-orchestrator.js";
+import { InboxAuditHeartbeat } from "../agent/inbox-audit-heartbeat.js";
+import { inboxAuditRegistryFile, observeInboxAuditTarget } from "../agent/missed-outbound-scan.js";
 import { HostChannelBusiness } from "./host-channel-business.js";
 import { HostInteractionOrchestrator } from "./interaction-orchestrator.js";
 import { slug10, targetFor, type FeishuInboundEvent } from "./message-policy.js";
+import type { PreviousSessionRef } from "../agent/context-prompt.js";
 import type { RuntimeHost, RuntimeHostEvent, RuntimeSessionRecoveryResult } from "../runtime/runtime-host.js";
 import { providerAuthenticationFailureReadiness, RuntimePrerequisiteError } from "../runtime/runtime-readiness.js";
 import { readDocumentCommentSubscription, verifyCallbackProbe, type EffectiveDocumentCommentSubscription } from "../platform/callback-capability.js";
@@ -61,7 +64,11 @@ interface ConfiguredAgent {
   botName?: string | null;
 }
 
-interface AgentState { agentId?: string; sessions: Record<string, string> }
+interface AgentState {
+  agentId?: string;
+  sessions: Record<string, string>;
+  previousSessions?: Record<string, PreviousSessionRef>;
+}
 interface PendingDocumentComment {
   messageId: string;
   fileToken: string;
@@ -314,7 +321,16 @@ export function createHostShell({
   };
   const agentStates = new Map<string, AgentStateRecord>();
   const saveAgentState = (record: AgentStateRecord): void => {
-    try { record.store.writeJson("agentState", record.state); }
+    try {
+      const latest = record.store.readJson<Partial<AgentState>>("agentState", {});
+      if (isRecord(latest.previousSessions)) {
+        record.state.previousSessions = {
+          ...latest.previousSessions,
+          ...(record.state.previousSessions ?? {}),
+        };
+      }
+      record.store.writeJson("agentState", record.state);
+    }
     catch (error) { log(`agent-state 写失败: ${errorMessage(error)}`); }
   };
   const initializeAgentState = (agent: ConfiguredAgent): AgentStateRecord => {
@@ -324,7 +340,11 @@ export function createHostShell({
     let state: AgentState;
     try {
       const loaded = store.readJson<Partial<AgentState>>("agentState", {});
-      state = { ...loaded, sessions: isRecord(loaded.sessions) ? loaded.sessions as Record<string, string> : {} };
+      state = {
+        ...loaded,
+        sessions: isRecord(loaded.sessions) ? loaded.sessions as Record<string, string> : {},
+        ...(isRecord(loaded.previousSessions) ? { previousSessions: loaded.previousSessions as AgentState["previousSessions"] } : {}),
+      };
     } catch { state = { sessions: {} }; }
     state.agentId = agent.agentId;
     const record = { store, state };
@@ -421,6 +441,13 @@ export function createHostShell({
   };
   for (const agent of agents) prepareAgentState(agent);
   const reminder = new HostReminderOrchestrator({ agents, stateStore, envelopeProjector, deliveryTarget: runtimeHost, log });
+  const inboxAudit = new InboxAuditHeartbeat({
+    agents,
+    stateStore,
+    runtimeHost,
+    log,
+  });
+  const auditRegistry = inboxAuditRegistryFile(larkinHome);
   const seenEventIds = new Set<string>();
   const inFlightEventIds = new Set<string>();
   const onFeishuMessage = async (agent: ConfiguredAgent, event: FeishuInboundEvent, options?: { wake?: boolean }): Promise<void> => {
@@ -455,6 +482,11 @@ export function createHostShell({
         // An event becomes permanently transport-seen only after the canonical
         // append/dedupe decision is durable. Agent model-seen state is untouched.
         if (event.event_id) seenEventIds.add(eventKey);
+        try {
+          observeInboxAuditTarget(auditRegistry, agent.agentId, event);
+        } catch (error) {
+          log(`inbox audit target 未持久化: ${(error as Error).message}`);
+        }
         if (append.status === "duplicate_consumed") return null;
         const inboxEnvelope = append.envelope;
         if (append.status === "appended") hostState.appendConversation(agent, {
@@ -1278,11 +1310,19 @@ export function createHostShell({
     }
     if (message.type === "session") {
       const record = agentStates.get(agent.agentId);
-      if (record && record.state.sessions[message.runtime] !== message.sessionId) {
-        if (message.sessionId) record.state.sessions[message.runtime] = message.sessionId;
-        else delete record.state.sessions[message.runtime];
-        saveAgentState(record);
-        log(`持久化 agent=${agent.name} runtime=${message.runtime} sessionId=${message.sessionId}`);
+      if (record) {
+        const sessionChanged = record.state.sessions[message.runtime] !== message.sessionId;
+        if (sessionChanged) {
+          if (message.sessionId) record.state.sessions[message.runtime] = message.sessionId;
+          else delete record.state.sessions[message.runtime];
+        }
+        if (message.previousSession) {
+          record.state.previousSessions = { ...(record.state.previousSessions ?? {}), [message.runtime]: message.previousSession };
+        }
+        if (sessionChanged || message.previousSession) {
+          saveAgentState(record);
+          log(`持久化 agent=${agent.name} runtime=${message.runtime} sessionId=${message.sessionId}`);
+        }
       }
       hostState.updateStatus(agent, projectSessionStatus(hostState.readStatus(agent), message.runtime, message.sessionId, message.launchId, new Date(), {
         ...(message.model ? { model: message.model } : {}),
@@ -1315,6 +1355,7 @@ export function createHostShell({
       eventSourceStartTimer = null;
       await Promise.resolve(eventSourceStop());
       reminder.stopSync();
+      inboxAudit.stop();
       interaction.stopSync();
       await runtimeHost.shutdown(reason);
     })();
@@ -1376,9 +1417,9 @@ export function createHostShell({
         store.writeJson("externalEnqueue", external);
       }
 
-      const target = "runtime:external";
+      const target = RUNTIME_EXTERNAL_TARGET;
       const envelope: Record<string, unknown> = {
-        message_id: messageId, seq: Date.now(), sender_id: "external_enqueue",
+        message_id: messageId, seq: Date.now(), kind: "external", sender_id: "external_enqueue",
         sender_name: "External automation", sender_type: "system",
         channel_type: "runtime", channel_name: "external",
         content: request.content, timestamp: now, thread_id: null, chat_id: null,
@@ -1578,8 +1619,10 @@ export function createHostShell({
         await runtimeHost.start(agents.map((agent) => ({
           ...agent,
           sessionId: agentStates.get(agent.agentId)?.state.sessions[agent.runtime] || null,
+          previousSession: agentStates.get(agent.agentId)?.state.previousSessions?.[agent.runtime] ?? null,
         })));
         reminder.startSync();
+        inboxAudit.start();
         interaction.startSync();
         eventSourceStartTimer = setTimeout(() => { eventSourceStartTimer = null; startEventSource(); }, eventSourceStartDelayMs);
       } catch (error) {

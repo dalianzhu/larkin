@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -219,21 +220,41 @@ test("local control keeps upsert ID idempotency and coalesces only concurrent re
 
     const enqueueInput = { larkinHome: root, agentId: "cli_newA1", idempotencyKey: "quality-gate:flow-42",
       content: "inspect release 42" };
-    const enqueued = await requestAgentEnqueue(enqueueInput);
+    const enqueueStore = createAgentStateStore(root, "cli_newA1");
+    const preFixMessageId = `external_${crypto.createHash("sha256")
+      .update(`${enqueueInput.agentId}\0${enqueueInput.idempotencyKey}`).digest("hex").slice(0, 32)}`;
+    const preFixFingerprint = crypto.createHash("sha256")
+      .update(JSON.stringify({ content: enqueueInput.content })).digest("hex");
+    enqueueStore.writeJson("externalEnqueue", { version: 1, records: [{
+      messageId: preFixMessageId, fingerprint: preFixFingerprint,
+      createdAt: "2026-09-01T00:00:00.000Z", updatedAt: "2026-09-01T00:00:00.000Z",
+    }] });
+    const publicEnqueue = spawnSync(process.execPath, [path.join(ROOT, "dist/app/cli.mjs"), "agent", "enqueue",
+      "--agent", enqueueInput.agentId, "--idempotency-key", enqueueInput.idempotencyKey, "--content-file", "-", "--json"], {
+      cwd: ROOT, encoding: "utf8", input: enqueueInput.content,
+      env: { ...process.env, LARKIN_CONFIG_DIR: root },
+    });
+    assert.equal(publicEnqueue.status, 0, publicEnqueue.stderr || publicEnqueue.stdout);
+    const enqueued = JSON.parse(publicEnqueue.stdout);
     assert.equal(enqueued.ok, true);
     assert.equal(enqueued.status, "accepted");
-    assert.match(enqueued.messageId, /^external_[a-f0-9]{32}$/);
+    assert.equal(enqueued.message_id, preFixMessageId, "retry reuses the stable ID left by a pre-fix failed enqueue");
     const duplicate = await requestAgentEnqueue(enqueueInput);
     assert.equal(duplicate.ok, true);
     assert.equal(duplicate.status, "duplicate");
-    assert.equal(duplicate.messageId, enqueued.messageId);
+    assert.equal(duplicate.messageId, enqueued.message_id);
     const conflict = await requestAgentEnqueue({ ...enqueueInput, content: "different payload" });
     assert.equal(conflict.ok, false);
     assert.equal(conflict.code, "idempotency_conflict");
-    const enqueueStore = createAgentStateStore(root, "cli_newA1");
     const enqueueRecords = enqueueStore.readJson("externalEnqueue", { records: [] }).records;
     assert.equal(enqueueRecords.length, 1);
     assert.equal(enqueueRecords[0].status, "accepted", "duplicate must be answered from the durable enqueue ledger");
+    const externalInbox = enqueueStore.readNdjson("inbox").filter((row) => row.message_id === enqueued.message_id);
+    assert.equal(externalInbox.length, 1, "accepted enqueue persists exactly one canonical Inbox envelope");
+    assert.deepEqual({ target: externalInbox[0].target, kind: externalInbox[0].kind,
+      chat_id: externalInbox[0].chat_id, thread_id: externalInbox[0].thread_id }, {
+      target: "runtime:external", kind: "external", chat_id: null, thread_id: null,
+    });
     assert.equal(enqueueStore.readJson("map", {})["#cualitygate:7dd72d8f"], undefined);
     assert.equal(enqueueStore.readJson("replyctx", {})["#cualitygate:7dd72d8f"], undefined);
     assert.equal(fs.readFileSync(calls, "utf8").split("\n").filter((line) => line === "enqueue:cli_newA1:quality-gate:flow-42").length, 3);

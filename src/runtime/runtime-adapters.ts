@@ -15,6 +15,7 @@ import type {
   StandingPrompt,
   UpstreamProviderError,
 } from "./runtime-contracts.js";
+import { applyPiPackageDirForChild, piChildDistributionFromOverrides } from "./builtin-pi-assets.js";
 import { isPiThinkingLevel } from "./pi-model-catalog.js";
 import { PiRpcClient, type PiRpcClientOptions } from "./pi-rpc-client.js";
 import { internalCommandSpec } from "../app/internal-command.js";
@@ -22,7 +23,12 @@ import { BUNDLED_PI_VERSION, piAgentDirectory } from "./pi-provider-config.js";
 import { recordPiRuntimeArtifactProvenance } from "./pi-artifact-provenance.js";
 import { traceProcessBoundary } from "../platform/process-boundary-trace.js";
 import { resolvePiSubagentExtensionArg } from "./pi-subagent-injection.js";
-import { extractCanonicalPiSubagentCompletionKeyFromMessages } from "./pi-subagents-notification.js";
+import {
+  extractCanonicalPiSubagentNotification,
+  ledgerStatusFromPiNotificationStatus,
+} from "./pi-subagents-notification.js";
+import { resolvePiSubagentRecordWatchdogExtensionArg } from "./pi-subagent-record-watchdog-injection.js";
+import { effectivePiStateDir, extractBackgroundPiSubagentDispatch } from "./pi-subagent-ledger.js";
 import { resolvePiBashTimeoutExtensionArg } from "./pi-bash-timeout-injection.js";
 import {
   classifyRuntimePrerequisite,
@@ -66,6 +72,7 @@ interface ProcessLike {
 export interface PiSessionProcessLike {
   readonly policyManaged?: boolean;
   readonly sessionId?: string | null;
+  readonly sessionFile?: string | null;
   readonly model?: { provider: string; id: string; reasoning?: boolean; thinkingLevelMap?: Record<string, unknown> };
   readonly thinkingLevel?: string;
   prompt(text: string): Promise<unknown>;
@@ -525,6 +532,7 @@ class PiSession extends EventSession {
   private readonly observedCompletedEpochs = new Set<number>();
   private readonly observedBackgroundCompletionKeys = new Set<string>();
   private readonly pendingUnownedCompletionKeys = new Set<string>();
+  private readonly pendingUnownedCompletionStatuses = new Map<string, Record<string, "completed" | "failed" | "cancelled" | "timed_out">>();
   private readonly observedAgentEndEpochs = new Set<number>();
   private firstOutputObserved = false;
   private toolCallOpen = false;
@@ -542,6 +550,7 @@ class PiSession extends EventSession {
     }));
   }
   get sessionId(): string | null { return this.sdk.sessionId ?? null; }
+  get sessionFile(): string | null { return this.sdk.sessionFile ?? null; }
   get effectiveModel(): string | null { return this.sdk.model ? `${this.sdk.model.provider}/${this.sdk.model.id}` : null; }
   get effectiveReasoningEffort(): string | null { return this.sdk.thinkingLevel ?? null; }
   async prompt(input: RuntimeInput): Promise<RuntimeInputResult> { return this.enqueue(input, () => this.sdk.prompt(input.text)); }
@@ -618,6 +627,7 @@ class PiSession extends EventSession {
       this.observedCompletedEpochs.clear();
       this.observedBackgroundCompletionKeys.clear();
       this.pendingUnownedCompletionKeys.clear();
+      this.pendingUnownedCompletionStatuses.clear();
       this.observedAgentEndEpochs.clear();
       this.activeEpoch = null;
       this.settleArmedEpoch = null;
@@ -662,13 +672,33 @@ class PiSession extends EventSession {
         this.observedCompletedEpochs.add(this.activeEpoch);
         this.emitObservation("completed");
       }
-      const completionNotificationKey = extractCanonicalPiSubagentCompletionKeyFromMessages(event.messages);
-      if (completionNotificationKey
-        && this.activeEpoch === null
-        && !this.observedBackgroundCompletionKeys.has(completionNotificationKey)) {
-        // agent_end can still have an active Pi session. Prompting before
-        // unowned agent_settled is rejected as "Agent is already processing".
-        this.pendingUnownedCompletionKeys.add(completionNotificationKey);
+      const completionNotification = extractCanonicalPiSubagentNotification(event.messages);
+      if (completionNotification && !this.observedBackgroundCompletionKeys.has(completionNotification.key)) {
+        const completionStatuses = Object.fromEntries(completionNotification.notifications.map((notification) => [
+          notification.taskId,
+          ledgerStatusFromPiNotificationStatus(notification.status),
+        ]));
+        const owningTurnFailed = event.willRetry === true
+          || this.finalAssistantStopReason === "error"
+          || this.finalAssistantStopReason === "aborted";
+        if (this.activeEpoch === null || owningTurnFailed) {
+          // Unowned agent_end still has an active Pi session, so prompting
+          // before settle is rejected as "Agent is already processing".
+          // A failed or retrying owned turn also did not process the
+          // notification; do not emit handledInTurn so RuntimeHost can still
+          // wake after input-error, retry, or restart.
+          this.pendingUnownedCompletionKeys.add(completionNotification.key);
+          this.pendingUnownedCompletionStatuses.set(completionNotification.key, completionStatuses);
+        } else {
+          // Already visible in the owned turn. Persist as acknowledged; do not
+          // schedule another wake after the parent turn settles.
+          this.observedBackgroundCompletionKeys.add(completionNotification.key);
+          this.emitObservation("completed", {
+            completionKey: completionNotification.key,
+            completionStatuses,
+            handledInTurn: true,
+          });
+        }
       }
     } else if (event?.type === "agent_settled") {
       const epoch = this.activeEpoch;
@@ -731,6 +761,13 @@ class PiSession extends EventSession {
         this.toolCallOpen = false;
         this.emit({ type: "runtime-observation", runtime: "pi", distribution: this.distribution, phase: "tool_result" });
       }
+      const dispatched = extractBackgroundPiSubagentDispatch(event);
+      if (dispatched) {
+        this.emitObservation("background_dispatched", {
+          taskId: dispatched.taskId,
+          ...(dispatched.outputFile ? { outputFile: dispatched.outputFile } : {}),
+        });
+      }
     }
     else if (event?.type === "message_update" && event.assistantMessageEvent?.delta) {
       if (!this.firstOutputObserved) {
@@ -746,13 +783,21 @@ class PiSession extends EventSession {
     for (const completionKey of this.pendingUnownedCompletionKeys) {
       if (this.observedBackgroundCompletionKeys.has(completionKey)) continue;
       this.observedBackgroundCompletionKeys.add(completionKey);
-      this.emitObservation("completed", { completionKey });
+      const completionStatuses = this.pendingUnownedCompletionStatuses.get(completionKey);
+      this.emitObservation("completed", {
+        completionKey,
+        ...(completionStatuses ? { completionStatuses } : {}),
+      });
     }
     this.pendingUnownedCompletionKeys.clear();
+    this.pendingUnownedCompletionStatuses.clear();
   }
 
   private emitObservation(phase: Extract<NormalizedRuntimeEvent, { type: "runtime-observation" }>['phase'], fields: {
     reason?: "manual" | "threshold" | "overflow"; willRetry?: boolean; success?: boolean; completionKey?: string;
+    completionStatuses?: Record<string, "completed" | "failed" | "cancelled" | "timed_out">;
+    handledInTurn?: boolean;
+    taskId?: string; outputFile?: string;
   } = {}): void {
     const inputId = this.oldestOwnedInput();
     const observation = { type: "runtime-observation" as const, runtime: "pi" as const,
@@ -948,12 +993,14 @@ function writePrivateAtomic(file: string, content: string): void {
 class PiRpcBackend implements PiSessionProcessLike {
   readonly policyManaged: boolean;
   sessionId: string | null;
+  sessionFile: string | null;
   model?: { provider: string; id: string; reasoning?: boolean; thinkingLevelMap?: Record<string, unknown> };
   thinkingLevel?: string;
   constructor(private readonly client: PiRpcClient, state: PiRpcState,
     private readonly policy?: { model: string; contextWindow: number; ownedPiDirectory: string }) {
     this.policyManaged = Boolean(policy);
     this.sessionId = state.sessionId ?? null;
+    this.sessionFile = typeof state.sessionFile === "string" && state.sessionFile ? state.sessionFile : null;
     if (state.model?.provider && state.model.id) this.model = {
       provider: state.model.provider, id: state.model.id,
       ...(state.model.reasoning !== undefined ? { reasoning: state.model.reasoning } : {}),
@@ -973,12 +1020,20 @@ class PiRpcBackend implements PiSessionProcessLike {
     if (effectiveModel !== this.policy.model || state.model?.contextWindow !== this.policy.contextWindow) {
       throw new Error("Pi model or context window changed after startup; compaction policy is no longer safe");
     }
-    const ownedSettings = readOwnedPiSettings(this.policy.ownedPiDirectory);
-    assertEffectivePiCompactionSettings({ contextWindow: state.model?.contextWindow, compaction: {
-      enabled: state.autoCompactionEnabled,
-      reserveTokens: ownedSettings.compaction?.reserveTokens,
-      keepRecentTokens: ownedSettings.compaction?.keepRecentTokens,
-    } });
+    if (typeof state.sessionFile === "string" && state.sessionFile) this.sessionFile = state.sessionFile;
+    if (typeof state.sessionId === "string" && state.sessionId) this.sessionId = state.sessionId;
+    // Use the live process handshake, not a disk re-read of owned settings.json.
+    // Disk reserveTokens can drift after startup; that must not reject prompt.
+    const handshake = state.compactionCapabilities;
+    if (typeof handshake?.reserveTokens === "number" && typeof handshake?.keepRecentTokens === "number") {
+      assertEffectivePiCompactionSettings({ contextWindow: state.model?.contextWindow, compaction: {
+        enabled: state.autoCompactionEnabled,
+        reserveTokens: handshake.reserveTokens,
+        keepRecentTokens: handshake.keepRecentTokens,
+      } });
+      return;
+    }
+    if (state.autoCompactionEnabled !== true) throw new Error("Pi native compaction must be enabled");
   }
   getState(): Promise<Record<string, unknown>> { return this.client.request("get_state"); }
   dispose(): Promise<void> { return this.client.close(); }
@@ -997,12 +1052,17 @@ export function resolvePiProcessExtensionArgs(input: {
 }, resolvers: {
   subagents?: typeof resolvePiSubagentExtensionArg;
   bashTimeout?: typeof resolvePiBashTimeoutExtensionArg;
+  recordWatchdog?: typeof resolvePiSubagentRecordWatchdogExtensionArg;
 } = {}): string[] {
   // Builtin factories are passed directly to Pi main on every platform. The platform
   // field makes that invariant explicit and testable without changing process.platform.
   if (input.distribution === "builtin") return [];
   const resolverInput = { distribution: "external" as const, piCommand: input.piCommand, env: input.env };
   const args: string[] = [];
+  // Watchdog must load before the subagent extension so session_shutdown still
+  // sees AgentManager.getRecord and can bridge consumed or terminal state.
+  const recordWatchdog = (resolvers.recordWatchdog ?? resolvePiSubagentRecordWatchdogExtensionArg)(resolverInput);
+  if (recordWatchdog) args.push("-e", recordWatchdog);
   const subagents = (resolvers.subagents ?? resolvePiSubagentExtensionArg)(resolverInput);
   if (subagents) args.push("-e", subagents);
   const bashTimeout = (resolvers.bashTimeout ?? resolvePiBashTimeoutExtensionArg)(resolverInput);
@@ -1013,7 +1073,7 @@ export function resolvePiProcessExtensionArgs(input: {
 async function createPiRpcBackend(input: RuntimeSessionCreate, dependencies: NativeRuntimeAdapterDependencies,
   spawn: (command: string, args: readonly string[], options: Record<string, unknown>) => ProcessLike,
   productionSpawn = true): Promise<PiSessionProcessLike> {
-  const stateRoot = input.stateDir ?? path.join(input.workspaceDir, ".larkin");
+  const stateRoot = effectivePiStateDir(input);
   const mergedEnv: NodeJS.ProcessEnv = { ...globalThis.process.env, ...dependencies.env, ...input.env, NO_COLOR: "1" };
   assertNoProjectPiCompactionOverride(input.workspaceDir);
   const ownedPiDirectory = mergedEnv.LARKIN_CONFIG_DIR
@@ -1033,22 +1093,27 @@ async function createPiRpcBackend(input: RuntimeSessionCreate, dependencies: Nat
     ...(session.sessionFile ? ["--session", session.sessionFile] : []),
     ...(requestedModel ? ["--model", requestedModel] : []),
     ...(requestedEffort ? ["--thinking", requestedEffort] : [])];
-  const builtin = mergedEnv.LARKIN_PI_DISTRIBUTION === "builtin";
+  const builtin = piChildDistributionFromOverrides(dependencies.env, input.env) === "builtin";
+  if (!builtin && mergedEnv.LARKIN_PI_DISTRIBUTION === "builtin") delete mergedEnv.LARKIN_PI_DISTRIBUTION;
   const builtinSpec = builtin ? internalCommandSpec("pi-rpc", [], mergedEnv) : null;
   const command = builtinSpec?.command ?? dependencies.piCommand ?? dependencies.env?.LARKIN_PI_COMMAND ?? process.env.LARKIN_PI_COMMAND ?? "pi";
   const commandPrefix = builtinSpec?.args ?? dependencies.piCommandArgs ?? [];
   const commandArgs = [...commandPrefix, ...args];
-  const reportedVersion = productionSpawn && !builtin
-    ? parsePiExecutableVersion(String(spawnSync(command, [...commandPrefix, "--version"], {
-      cwd: input.workspaceDir, env: mergedEnv, encoding: "utf8", timeout: 5_000,
-    }).stdout || ""))
-    : BUNDLED_PI_VERSION;
   mergedEnv.PI_CODING_AGENT_DIR = ownedPiDirectory;
   if (builtin) mergedEnv.PI_TELEMETRY = "0";
+  const childEnv = applyPiPackageDirForChild(mergedEnv, {
+    distribution: builtin ? "builtin" : "external",
+    explicitPackageDir: input.env?.PI_PACKAGE_DIR ?? dependencies.env?.PI_PACKAGE_DIR,
+  });
+  const reportedVersion = productionSpawn && !builtin
+    ? parsePiExecutableVersion(String(spawnSync(command, [...commandPrefix, "--version"], {
+      cwd: input.workspaceDir, env: childEnv, encoding: "utf8", timeout: 5_000,
+    }).stdout || ""))
+    : BUNDLED_PI_VERSION;
   const extensionArgs = (dependencies.resolvePiProcessExtensionArgs ?? resolvePiProcessExtensionArgs)({
     distribution: builtin ? "builtin" : "external",
     piCommand: command,
-    env: mergedEnv,
+    env: childEnv,
     platform: process.platform,
   });
   commandArgs.push(...extensionArgs);
@@ -1060,7 +1125,7 @@ async function createPiRpcBackend(input: RuntimeSessionCreate, dependencies: Nat
     // is loaded by the probe.
     probedModel = await discoverEffectivePiContextWindow(
       input, command, commandPrefix, requestedModel,
-      mergedEnv, spawn, dependencies.piRpcClientOptions,
+      childEnv, spawn, dependencies.piRpcClientOptions,
     );
     writeOwnedPiSettings(ownedPiDirectory, calculatePiCompactionSettings(probedModel.contextWindow));
   }
@@ -1068,7 +1133,7 @@ async function createPiRpcBackend(input: RuntimeSessionCreate, dependencies: Nat
   const artifactSpawnBoundary = Date.now();
   const child = spawn(command, commandArgs, {
     cwd: input.workspaceDir,
-    env: mergedEnv,
+    env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
   });
   traceProcessBoundary(mergedEnv, "pi-rpc:child-spawned", { configDir: mergedEnv.LARKIN_CONFIG_DIR, agentId: input.agentId, targetDir: ownedPiDirectory, childPid: (child as unknown as { pid?: number }).pid ?? null });
@@ -1220,8 +1285,7 @@ export function createNativeRuntimeAdapter(id: RuntimeId | string, dependencies:
         if (readiness.state !== "ready") throw new RuntimePrerequisiteError(readiness);
       }
       if (id === "pi") {
-        const distribution = ({ ...globalThis.process.env, ...dependencies.env, ...input.env }).LARKIN_PI_DISTRIBUTION === "builtin"
-          ? "builtin" : "external";
+        const distribution = piChildDistributionFromOverrides(dependencies.env, input.env);
         return new PiSession(await (dependencies.createPiSession
         ? dependencies.createPiSession(input)
         : createPiRpcBackend(input, { ...dependencies, piCommand: resolvedExecutable! }, spawn, productionSpawn)), distribution);
