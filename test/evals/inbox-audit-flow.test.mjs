@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { test } from "bun:test";
 import { gradeInboxAuditFlowTrace, loadInboxAuditFlowEval } from "../support/inbox-audit-flow-grader.mjs";
+import { parsePublicCliJson } from "../support/inbox-audit-flow-json.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "../..");
 const DATASET = loadInboxAuditFlowEval(path.join(ROOT, "evals/inbox-audit-flow/scenarios.json"));
@@ -16,6 +17,14 @@ test("inbox audit flow dataset is versioned with four fixed synthetic scenarios"
   assert.equal(DATASET.version, 1);
   assert.deepEqual(DATASET.scenarios.map((scenario) => scenario.id), ["no-finding", "handled-finding", "failure-after-read", "stale-receipt"]);
   assert.equal(DATASET.grader.threshold, 1);
+});
+
+test("gateway parses complete pretty JSON stdout and records malformed output explicitly", () => {
+  assert.deepEqual(parsePublicCliJson("{\n  \"version\": 4,\n  \"receipt\": \"synthetic\"\n}\n"), {
+    ok: true, value: { version: 4, receipt: "synthetic" },
+  });
+  assert.deepEqual(parsePublicCliJson("{not-json}"), { ok: false, error: "invalid_json" });
+  assert.deepEqual(parsePublicCliJson("\n  \n"), { ok: false, error: "empty_stdout" });
 });
 
 test("grader accepts no-finding and handled synthetic CLI traces", () => {

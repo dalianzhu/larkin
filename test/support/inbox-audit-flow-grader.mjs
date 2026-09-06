@@ -44,6 +44,7 @@ export function gradeInboxAuditFlowTrace(dataset, scenario, trace) {
     if (!object(event) || !known.has(event.action)) fail("known_action", `trace event ${index}`);
     if (["audit_read", "audit_complete", "verification_audit_read"].includes(event.action)) {
       if (event.surface !== "public-cli" || event.exit_code !== 0) fail("public_cli_boundary", `event ${index}`);
+      if (event.output_parse_error) fail("public_cli_json", `event ${index}: ${event.output_parse_error}`);
       if (!Array.isArray(event.argv) || event.argv[0] !== "inbox" || event.argv[1] !== "audit") fail("public_cli_argv", `event ${index}`);
       if (event.action === "audit_read" && event.argv.at(-1) !== "--json") fail("public_cli_read", `event ${index}`);
       if (event.action === "audit_complete" && (!event.argv.includes("complete") || event.argv.at(-1) !== "--json")) fail("public_cli_complete", `event ${index}`);

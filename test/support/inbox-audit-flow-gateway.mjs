@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { parsePublicCliJson } from "./inbox-audit-flow-json.mjs";
 
 const argv = process.argv.slice(2);
 const action = argv.shift() || "";
@@ -24,12 +25,6 @@ function record(event) {
   fs.appendFileSync(traceFile, `${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`, { mode: 0o600 });
 }
 
-function parsedOutput(stdout) {
-  const line = String(stdout || "").trim().split("\n").filter(Boolean).at(-1);
-  if (!line) return null;
-  try { return JSON.parse(line); } catch { return null; }
-}
-
 function runPublicCli(traceAction, cliArgs) {
   const sourceRoot = required("--source-root");
   const command = path.join(sourceRoot, "dist", "app", "cli.mjs");
@@ -46,9 +41,10 @@ function runPublicCli(traceAction, cliArgs) {
     encoding: "utf8",
     timeout: 30_000,
   });
+  const parsed = parsePublicCliJson(result.stdout);
   record({ action: traceAction, surface: "public-cli", argv: cliArgs, exit_code: result.status ?? 1,
     ...(traceAction === "audit_complete" ? { requested_outcome: value("--outcome"), requested_receipt: value("--receipt") } : {}),
-    result: parsedOutput(result.stdout) });
+    ...(parsed.ok ? { result: parsed.value } : { output_parse_error: parsed.error }) });
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
   process.exit(result.status ?? 1);
