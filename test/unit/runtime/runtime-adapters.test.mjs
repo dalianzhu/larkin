@@ -192,6 +192,7 @@ test("default context prompt consumes the Agent CLI manifest", () => {
   assert.match(prompt.content, /Never infer recipients from a reminder title/);
   assert.doesNotMatch(prompt.content, /at most one bounded wait call per turn/);
   assert.doesNotMatch(prompt.content, /do not loop or call wait again in the same turn/);
+  assert.match(prompt.content, /tmux-backed bash.*wait timeout|wait timeout.*not process failure/);
   assert.match(prompt.content, /larkin reminder cancel/);
   assert.match(prompt.content, /larkin interaction resolve/);
   assert.match(prompt.content, /larkin comment reply --message-id/);
@@ -578,11 +579,15 @@ test("Pi initialization caps eight concurrent adapters and releases a failed per
   assert.equal(results.filter((result) => result.status === "fulfilled").length, 7);
 });
 
-test.each(["win32", "linux"])("Pi does not inject Larkin -e extensions on simulated %s", (platform) => {
-  const args = resolvePiProcessExtensionArgs({
-    distribution: "external", piCommand: "external-pi", env: {}, platform,
+test("Pi injects the Larkin tmux extension on unix and skips it on win32", () => {
+  const linux = resolvePiProcessExtensionArgs({
+    distribution: "external", piCommand: "external-pi", env: {}, platform: "linux",
   });
-  assert.deepEqual(args, []);
+  assert.equal(linux[0], "-e");
+  assert.match(linux[1], /pi-tmux\.bundle\.js$/);
+  assert.deepEqual(resolvePiProcessExtensionArgs({
+    distribution: "external", piCommand: "external-pi", env: {}, platform: "win32",
+  }), []);
 });
 
 test("Pi launches one shared append standing-prompt path without replacement", async () => {
@@ -670,7 +675,8 @@ test("inherited PI_PACKAGE_DIR does not drop production extension version probes
     for (let index = 0; index < sessionLaunch.args.length; index += 1) {
       if (sessionLaunch.args[index] === "-e") extensionPaths.push(sessionLaunch.args[index + 1]);
     }
-    assert.deepEqual(extensionPaths, [], JSON.stringify(sessionLaunch.args));
+    assert.equal(extensionPaths.length, 1, JSON.stringify(sessionLaunch.args));
+    assert.match(extensionPaths[0], /pi-tmux\.bundle\.js$/);
     assert.equal(session.effectiveModel, "test-provider/test-model");
   } finally {
     await session?.close("inherited extension probe test complete").catch(() => {});

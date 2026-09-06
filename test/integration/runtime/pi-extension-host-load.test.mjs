@@ -6,12 +6,20 @@ import { resolvePiProcessExtensionArgs } from "../../../dist/runtime/runtime-ada
 
 const ROOT = path.resolve(import.meta.dirname, "../../..");
 
-test("Pi process extension args stay empty so user-installed packages load through normal discovery", () => {
+test("Pi process extension args inject only the Larkin tmux bundle off Windows", () => {
+  const unix = resolvePiProcessExtensionArgs({
+    distribution: "external",
+    piCommand: "pi",
+    env: {},
+    platform: "linux",
+  });
+  assert.equal(unix[0], "-e");
+  assert.match(unix[1], /pi-tmux\.bundle\.js$/);
   assert.deepEqual(resolvePiProcessExtensionArgs({
     distribution: "external",
     piCommand: "pi",
     env: {},
-    platform: process.platform,
+    platform: "win32",
   }), []);
   for (const name of [
     "pi-bash-timeout.bundle.js",

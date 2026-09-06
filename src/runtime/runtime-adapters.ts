@@ -18,7 +18,8 @@ import type {
 import { isPiThinkingLevel } from "./pi-model-catalog.js";
 import { PiRpcClient, type PiRpcClientOptions } from "./pi-rpc-client.js";
 import { traceProcessBoundary } from "../platform/process-boundary-trace.js";
-import { effectivePiStateDir } from "./pi-state-dir.js";
+import { effectivePiStateDir, writePrivateAtomic } from "./pi-state-dir.js";
+import { resolvePiTmuxExtensionArg } from "./pi-tmux-injection.js";
 import {
   classifyPiMissingCredentialRejection,
   classifyRuntimePrerequisite,
@@ -956,17 +957,6 @@ async function discoverEffectivePiContextWindow(input: RuntimeSessionCreate, com
   }
 }
 
-function writePrivateAtomic(file: string, content: string): void {
-  try { if (fs.lstatSync(file).isSymbolicLink()) throw new Error("standing prompt must not be a symlink"); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${crypto.randomUUID()}.tmp`);
-  try {
-    fs.writeFileSync(temporary, content, { mode: 0o600, flag: "wx" });
-    fs.renameSync(temporary, file);
-    fs.chmodSync(file, 0o600);
-  } finally { try { fs.unlinkSync(temporary); } catch { /* renamed or absent */ } }
-}
-
 class PiRpcBackend implements PiSessionProcessLike {
   readonly policyManaged: boolean;
   sessionId: string | null;
@@ -1015,14 +1005,15 @@ class PiRpcBackend implements PiSessionProcessLike {
   }
 }
 
-/** Larkin no longer injects Pi extensions; user-installed packages load through normal Pi discovery. */
-export function resolvePiProcessExtensionArgs(_input?: {
+/** Inject only the Larkin-owned tmux extension. Skip native Windows so stock Pi bash remains. */
+export function resolvePiProcessExtensionArgs(input: {
   distribution?: "external";
   piCommand: string;
   env: NodeJS.ProcessEnv;
   platform: NodeJS.Platform;
 }): string[] {
-  return [];
+  const bundle = resolvePiTmuxExtensionArg({ env: input.env, platform: input.platform });
+  return bundle ? ["-e", bundle] : [];
 }
 
 async function createPiRpcBackend(input: RuntimeSessionCreate, dependencies: NativeRuntimeAdapterDependencies,
@@ -1031,6 +1022,9 @@ async function createPiRpcBackend(input: RuntimeSessionCreate, dependencies: Nat
   const stateRoot = effectivePiStateDir(input);
   const mergedEnv = stripPiCodingAgentDir({ ...globalThis.process.env, ...dependencies.env, ...input.env, NO_COLOR: "1" });
   if (mergedEnv.LARKIN_PI_DISTRIBUTION === "builtin") delete mergedEnv.LARKIN_PI_DISTRIBUTION;
+  mergedEnv.LARKIN_AGENT_ID = input.agentId;
+  mergedEnv.LARKIN_STATE_DIR = stateRoot;
+  if (!mergedEnv.LARKIN_TMUX_INSTANCE_ID) mergedEnv.LARKIN_TMUX_INSTANCE_ID = crypto.randomUUID();
   const projectSettings = projectPiSettingsFile(input.workspaceDir);
   traceProcessBoundary(mergedEnv, "pi-rpc:child-env", { configDir: mergedEnv.LARKIN_CONFIG_DIR, agentId: input.agentId, targetDir: projectSettings, childEnvConfigDir: mergedEnv.LARKIN_CONFIG_DIR || null, childEnvHome: mergedEnv.HOME || null });
   const runtimeDir = path.join(stateRoot, "runtime");

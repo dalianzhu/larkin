@@ -1,0 +1,254 @@
+import assert from "node:assert/strict";
+import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, test } from "bun:test";
+import {
+  createLarkinTmux,
+  ForeignTmuxTaskError,
+  formatTmuxTaskText,
+  tmuxAvailable,
+} from "../../../src/runtime/pi-tmux.ts";
+
+const leftovers = [];
+
+afterEach(() => {
+  for (const session of leftovers.splice(0)) {
+    spawnSync("tmux", ["kill-session", "-t", session], { encoding: "utf8", timeout: 5_000 });
+  }
+});
+
+function track(tmux, snapshot) {
+  const meta = JSON.parse(fs.readFileSync(path.join(tmux.root, snapshot.taskId, "meta.json"), "utf8"));
+  leftovers.push(meta.session);
+  return snapshot;
+}
+
+function makeTmux(root, instanceId, agentId = "cli_tmuxSameA1") {
+  return createLarkinTmux({
+    stateDir: path.join(root, "state"),
+    agentId,
+    instanceId,
+    env: process.env,
+  });
+}
+
+test("tmuxAvailable is false when PATH has no tmux binary", () => {
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-no-tmux-"));
+  try {
+    assert.equal(tmuxAvailable({ ...process.env, PATH: empty }, "linux"), false);
+    assert.equal(tmuxAvailable(process.env, "win32"), false);
+  } finally {
+    fs.rmSync(empty, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(!tmuxAvailable())("owned bash keeps a spaced non-git cwd and records a real exit", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-cwd-"));
+  const cwd = path.join(root, "work dir");
+  fs.mkdirSync(cwd, { recursive: true });
+  const tmux = makeTmux(root, "inst-cwd");
+  try {
+    const started = track(tmux, tmux.start("pwd; printf '%s\\n' \"$PWD\" > marker.txt", cwd));
+    const done = await tmux.wait(started.taskId, 5);
+    assert.equal(done.status, "completed");
+    assert.equal(done.exitCode, 0);
+    assert.match(done.output, /work dir/);
+    assert.equal(fs.readFileSync(path.join(cwd, "marker.txt"), "utf8").trim(), cwd);
+    assert.equal(fs.existsSync(path.join(cwd, ".git")), false);
+    assert.match(formatTmuxTaskText(done), /taskId=/);
+    assert.match(formatTmuxTaskText(done), /status=completed/);
+    assert.ok(done.startedAt);
+    assert.ok(done.endedAt);
+    const dir = path.join(tmux.root, started.taskId);
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(path.join(dir, "run.sh")).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(path.join(dir, "env.sh")).mode & 0o777, 0o600);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(!tmuxAvailable())("user command keeps Bash arrays, [[, and pipefail", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-bash-"));
+  const tmux = makeTmux(root, "inst-bash");
+  try {
+    const arrays = track(tmux, tmux.start("arr=(alpha beta)\n[[ ${arr[1]} == beta ]] && printf '%s\\n' \"${arr[0]}\"", root));
+    const done = await tmux.wait(arrays.taskId, 5);
+    assert.equal(done.status, "completed");
+    assert.match(done.output, /alpha/);
+    const piped = track(tmux, tmux.start("false | true", root));
+    const failed = await tmux.wait(piped.taskId, 5);
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.exitCode, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(!tmuxAvailable())("wait timeout hands off a still-running job without killing it", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-handoff-"));
+  const tmux = makeTmux(root, "inst-handoff");
+  try {
+    const started = track(tmux, tmux.start("sleep 2; printf '%s\\n' handed-off", root));
+    const waiting = await tmux.wait(started.taskId, 0.4);
+    assert.equal(waiting.status, "running");
+    assert.equal(waiting.exitCode, null);
+    const done = await tmux.wait(started.taskId, 5);
+    assert.equal(done.status, "completed");
+    assert.match(done.output, /handed-off/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(!tmuxAvailable())("kill proves the owned session is gone and rejects foreign ids", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-kill-"));
+  const tmux = makeTmux(root, "inst-kill");
+  const otherAgent = createLarkinTmux({
+    stateDir: path.join(root, "state"),
+    agentId: "cli_tmuxOtherA1",
+    instanceId: "inst-kill",
+    env: process.env,
+  });
+  try {
+    const started = track(tmux, tmux.start("sleep 30", root));
+    const running = await tmux.wait(started.taskId, 0.3);
+    assert.equal(running.status, "running");
+    const killed = tmux.kill(started.taskId);
+    assert.equal(killed.status, "cancelled");
+    const meta = JSON.parse(fs.readFileSync(path.join(tmux.root, started.taskId, "meta.json"), "utf8"));
+    assert.notEqual(spawnSync("tmux", ["has-session", "-t", meta.session], { encoding: "utf8", timeout: 5_000 }).status, 0);
+    assert.throws(() => tmux.peek("deadbeefdeadbeef"), ForeignTmuxTaskError);
+    assert.throws(() => otherAgent.peek(started.taskId), ForeignTmuxTaskError);
+    assert.throws(() => otherAgent.kill(started.taskId), ForeignTmuxTaskError);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(!tmuxAvailable())("kill ends a Bash command that ignores TERM and HUP", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-trap-"));
+  const cwd = path.join(root, "ordinary folder");
+  fs.mkdirSync(cwd, { recursive: true });
+  const tmux = makeTmux(root, "inst-trap");
+  try {
+    const started = track(tmux, tmux.start("trap '' HUP TERM\nprintf '%s\\n' \"$BASHPID\" > cancelled.pid\nsleep 120", cwd));
+    const pidFile = path.join(cwd, "cancelled.pid");
+    let cancelPid = NaN;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        cancelPid = Number(fs.readFileSync(pidFile, "utf8").trim());
+        if (Number.isInteger(cancelPid) && cancelPid > 1) break;
+      } catch { /* 尚未落盘 */ }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(Number.isInteger(cancelPid) && cancelPid > 1);
+    const cancelled = tmux.kill(started.taskId);
+    assert.equal(cancelled.status, "cancelled");
+    const gone = spawnSync("ps", ["-p", String(cancelPid), "-o", "stat="], { encoding: "utf8", timeout: 5_000 });
+    assert.ok(gone.status !== 0 || !gone.stdout.trim() || gone.stdout.trim().startsWith("Z"));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}, { timeout: 15_000 });
+
+test.skipIf(!tmuxAvailable())("same-agent instances cannot peek or kill one another", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-inst-"));
+  const first = makeTmux(root, "inst-one");
+  const second = makeTmux(root, "inst-two");
+  try {
+    const started = track(first, first.start("sleep 30", root));
+    assert.throws(() => second.peek(started.taskId), ForeignTmuxTaskError);
+    assert.throws(() => second.kill(started.taskId), ForeignTmuxTaskError);
+    assert.deepEqual(second.list(), []);
+    const killed = first.kill(started.taskId);
+    assert.equal(killed.status, "cancelled");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(!tmuxAvailable())("external tmux disappearance is failed, not running", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-gone-"));
+  const tmux = makeTmux(root, "inst-gone");
+  try {
+    const started = track(tmux, tmux.start("sleep 30", root));
+    const running = await tmux.wait(started.taskId, 0.3);
+    assert.equal(running.status, "running");
+    const meta = JSON.parse(fs.readFileSync(path.join(tmux.root, started.taskId, "meta.json"), "utf8"));
+    assert.equal(spawnSync("tmux", ["kill-session", "-t", meta.session], { encoding: "utf8", timeout: 5_000 }).status, 0);
+    const gone = tmux.peek(started.taskId);
+    assert.equal(gone.status, "failed");
+    assert.equal(gone.exitCode, null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(!tmuxAvailable())("kill of a completed task does not signal a reused pid file", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-pidreuse-"));
+  const tmux = makeTmux(root, "inst-pid");
+  const decoy = spawn("sleep", ["60"], { stdio: "ignore" });
+  try {
+    const started = track(tmux, tmux.start("printf done\\n", root));
+    const done = await tmux.wait(started.taskId, 5);
+    assert.equal(done.status, "completed");
+    fs.writeFileSync(path.join(tmux.root, started.taskId, "pid"), `${decoy.pid}\n`);
+    const after = tmux.kill(started.taskId);
+    assert.equal(after.status, "completed");
+    process.kill(decoy.pid, 0);
+  } finally {
+    try { process.kill(decoy.pid, "SIGKILL"); } catch { /* already gone */ }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(!tmuxAvailable())("symlink env script is rejected as foreign", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-link-"));
+  const tmux = makeTmux(root, "inst-link");
+  try {
+    const started = track(tmux, tmux.start("printf linked\\n", root));
+    await tmux.wait(started.taskId, 5);
+    const envFile = path.join(tmux.root, started.taskId, "env.sh");
+    const decoy = path.join(root, "decoy-env.sh");
+    fs.writeFileSync(decoy, "export LEAK=1\n");
+    fs.rmSync(envFile);
+    fs.symlinkSync(decoy, envFile);
+    assert.throws(() => tmux.peek(started.taskId), ForeignTmuxTaskError);
+    assert.throws(() => tmux.kill(started.taskId), ForeignTmuxTaskError);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(!tmuxAvailable())("child env is applied without inherited TMUX coordinates or secrets on argv", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-env-"));
+  const secret = "larkin-tmux-secret-value";
+  const inherited = "inherited-parent-socket,1,0";
+  const env = { ...process.env, LARKIN_TMUX_TEST_SECRET: secret, TMUX: inherited, TMUX_PANE: "%99" };
+  const tmux = createLarkinTmux({
+    stateDir: path.join(root, "state"),
+    agentId: "cli_tmuxSameA1",
+    instanceId: "inst-env",
+    env,
+  });
+  try {
+    const started = track(tmux, tmux.start("printf '%s\\n' \"$LARKIN_TMUX_TEST_SECRET\"; printf 'TMUX=%s\\n' \"${TMUX-}\"", root));
+    const done = await tmux.wait(started.taskId, 5);
+    assert.equal(done.status, "completed");
+    assert.match(done.output, new RegExp(secret));
+    assert.doesNotMatch(done.output, /inherited-parent-socket/);
+    const envScript = fs.readFileSync(path.join(tmux.root, started.taskId, "env.sh"), "utf8");
+    assert.doesNotMatch(envScript, /inherited-parent-socket/);
+    assert.match(envScript, new RegExp(secret));
+    const run = fs.readFileSync(path.join(tmux.root, started.taskId, "run.sh"), "utf8");
+    assert.match(run, /\/bin\/bash -o pipefail/);
+    assert.doesNotMatch(run, new RegExp(secret));
+    const argv = spawnSync("ps", ["-ax", "-o", "command="], { encoding: "utf8", timeout: 5_000 });
+    assert.doesNotMatch(argv.stdout || "", new RegExp(secret));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

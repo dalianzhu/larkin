@@ -217,6 +217,32 @@ function buildDashboardWeb(outDir) {
 
 class CompilationFailed extends Error {}
 
+function bundlePiTmuxExtension(outFile) {
+  const entry = path.join(ROOT, "src", "runtime", "pi-tmux-extension.ts");
+  if (!fs.existsSync(entry)) {
+    process.stderr.write(`[build] pi-tmux extension entry missing: ${entry}\n`);
+    process.exitCode = 1;
+    return false;
+  }
+  const result = spawnSync("bun", [
+    "build", entry, "--outfile", outFile,
+    "--external", "@earendil-works/pi-*",
+    "--external", "typebox",
+    "--target", "bun",
+  ], {
+    cwd: ROOT,
+    encoding: "utf8",
+  });
+  if (result.error || result.status !== 0) {
+    process.stderr.write(result.stderr || result.stdout || `[build] pi-tmux bundle failed: ${result.error?.message || result.status}\n`);
+    process.exitCode = 1;
+    return false;
+  }
+  process.stderr.write(result.stderr || result.stdout || "");
+  console.error(`[build] pi-tmux bundle → ${path.relative(process.cwd(), outFile) || outFile}`);
+  return true;
+}
+
 const rewriteSpecifiers = (file, code, extension) => {
   const { sourceFile, nodes } = moduleSpecifierNodes(file);
   const replacements = [];
@@ -263,6 +289,8 @@ try {
     fs.writeFileSync(destination, data, { mode: ["app/cli.mjs", "app/lark-cli.mjs"].includes(name) ? 0o755 : 0o644 });
   }
   if (!buildDashboardWeb(path.join(outputStage, "dashboard", "web"))) throw new CompilationFailed();
+  fs.mkdirSync(path.join(outputStage, "runtime"), { recursive: true });
+  if (!bundlePiTmuxExtension(path.join(outputStage, "runtime", "pi-tmux.bundle.js"))) throw new CompilationFailed();
 
   // Materialize the whole graph before touching the active dist tree. Failed builds
   // preserve the prior output; successful builds replace it wholesale, removing stale files.
