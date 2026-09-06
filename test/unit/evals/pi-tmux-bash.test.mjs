@@ -194,7 +194,7 @@ test("synthetic grader fixtures are unit checks, not model-eval evidence", () =>
       { type: "agent_end" },
     ],
     "completion-stays-in-originating-target": [
-      { type: "tool_execution_start", toolName: "bash", args: { command: "sleep 6 && echo larkin-tmux-eval-done" } },
+      { type: "tool_execution_start", toolName: "bash", args: { command: "sleep 40 && echo larkin-tmux-eval-done", background: true } },
       { type: "tool_execution_end", toolName: "bash", result: bashResult("task-12") },
       { type: "agent_end" },
       { type: "turn_start" },

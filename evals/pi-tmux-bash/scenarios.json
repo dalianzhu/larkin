@@ -133,8 +133,8 @@
     {
       "id": "completion-stays-in-originating-target",
       "kind": "prescribed",
-      "prompt": "Run exactly this local command with the available bash tool: `sleep 6 && echo larkin-tmux-eval-done`. If a wait timeout returns first, leave the process running and end the turn. When a completion notification arrives in this same conversation, reply here with the command output. Do not start a new conversation or DM, do not use an Agent/subagent, and do not send Feishu messages.",
-      "task_bash": "sleep 6 && echo larkin-tmux-eval-done",
+      "prompt": "Start exactly `sleep 40 && echo larkin-tmux-eval-done` with the available bash tool and background:true. Report the taskId briefly and immediately end this turn. When the completion notification arrives, reply here with the command output including larkin-tmux-eval-done. Do not start another conversation, use an Agent/subagent, or send Feishu messages.",
+      "task_bash": "sleep 40 && echo larkin-tmux-eval-done",
       "marker": "larkin-tmux-eval-done",
       "wait_for_completion": true,
       "expectations": {
