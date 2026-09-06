@@ -82,6 +82,23 @@ test("dashboard config API is sanitized, same-origin/CSRF protected, bounded, an
     assert.equal(stored.mentionPolicy, "free");
     assert.deepEqual(stored.agents[APP].chatMentionPolicies, { oc_legacy: "free" });
 
+    const savedGapOnly = await fetch(`${base}/api/config`, {
+      method: "PATCH", headers: { "Content-Type": "application/json", Origin: base, "X-Larkin-CSRF": csrf },
+      body: JSON.stringify({ operation: "set-global-inbox-audit", intervalMs: 90_000 }),
+    });
+    assert.equal(savedGapOnly.status, 200);
+    const savedAgentAudit = await fetch(`${base}/api/config`, {
+      method: "PATCH", headers: { "Content-Type": "application/json", Origin: base, "X-Larkin-CSRF": csrf },
+      body: JSON.stringify({ operation: "set-agent-inbox-audit", agentId: APP, enabled: true, intervalMs: 30 * 60_000 }),
+    });
+    assert.equal(savedAgentAudit.status, 200);
+    const auditView = await fetch(`${base}/api/config`, { headers: privateHeaders }).then((response) => response.json());
+    assert.deepEqual(auditView.inboxAudit, { enabled: false, intervalMs: 90_000 }, "saving only the global gap must not enable audit");
+    assert.deepEqual(auditView.agents[0].inboxAudit, {
+      override: { enabled: "on", intervalMs: 30 * 60_000 }, effective: { enabled: true, intervalMs: 30 * 60_000 },
+      source: { enabled: "agent", intervalMs: "agent" },
+    });
+
     const inherit = await fetch(`${base}/api/config`, { method: "PATCH", headers: { "Content-Type": "application/json", Origin: base, "X-Larkin-CSRF": csrf }, body: JSON.stringify({ operation: "set-chat-mention", agentId: APP, chatId: "oc_legacy", value: "inherit" }) });
     assert.equal(inherit.status, 200);
     const afterInherit = await fetch(`${base}/api/config`, { headers: privateHeaders }).then((response) => response.json());
