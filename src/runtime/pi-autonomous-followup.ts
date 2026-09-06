@@ -38,7 +38,7 @@ function collectFollowUps(node: unknown, found: AutonomousPiFollowUp[] = [], see
 
 /**
  * Native Pi triggerTurn/followUp custom messages occupy an autonomous turn.
- * Canonical subagent-notification stays on the historical host-wake path.
+ * Exclude subagent-notification so completion is never translated into a host wake.
  */
 export function extractAutonomousPiFollowUp(messages: unknown): AutonomousPiFollowUp | null {
   const found = collectFollowUps(messages);

@@ -18,12 +18,8 @@ import type {
 import { isPiThinkingLevel } from "./pi-model-catalog.js";
 import { PiRpcClient, type PiRpcClientOptions } from "./pi-rpc-client.js";
 import { traceProcessBoundary } from "../platform/process-boundary-trace.js";
-import {
-  extractCanonicalPiSubagentNotification,
-  ledgerStatusFromPiNotificationStatus,
-} from "./pi-subagents-notification.js";
-import { effectivePiStateDir, extractBackgroundPiSubagentDispatch } from "./pi-subagent-ledger.js";
 import { extractAutonomousPiFollowUp } from "./pi-autonomous-followup.js";
+import { effectivePiStateDir } from "./pi-state-dir.js";
 import {
   classifyPiMissingCredentialRejection,
   classifyRuntimePrerequisite,
@@ -556,9 +552,6 @@ class PiSession extends EventSession {
   private readonly observedSubmitEpochs = new Set<number>();
   private readonly observedAcceptedEpochs = new Set<number>();
   private readonly observedCompletedEpochs = new Set<number>();
-  private readonly observedBackgroundCompletionKeys = new Set<string>();
-  private readonly pendingUnownedCompletionKeys = new Set<string>();
-  private readonly pendingUnownedCompletionStatuses = new Map<string, Record<string, "completed" | "failed" | "cancelled" | "timed_out">>();
   private readonly observedAutonomousFollowUpKeys = new Set<string>();
   private readonly observedAgentEndEpochs = new Set<number>();
   private firstOutputObserved = false;
@@ -666,9 +659,6 @@ class PiSession extends EventSession {
       this.observedSubmitEpochs.clear();
       this.observedAcceptedEpochs.clear();
       this.observedCompletedEpochs.clear();
-      this.observedBackgroundCompletionKeys.clear();
-      this.pendingUnownedCompletionKeys.clear();
-      this.pendingUnownedCompletionStatuses.clear();
       this.observedAutonomousFollowUpKeys.clear();
       this.observedAgentEndEpochs.clear();
       this.activeEpoch = null;
@@ -723,48 +713,14 @@ class PiSession extends EventSession {
       if (autonomousFollowUp && !this.observedAutonomousFollowUpKeys.has(autonomousFollowUp.key)) {
         this.observedAutonomousFollowUpKeys.add(autonomousFollowUp.key);
         // Pi already triggerTurn'd this followUp. Account for the notification
-        // turn, but never emit a host-wake completionKey.
+        // turn; never translate it into a legacy subagent host-wake.
         if (this.activeEpoch === null) this.beginAutonomousFollowUpTurn();
         if (this.settleArmedEpoch === null) this.settleArmedEpoch = this.activeEpoch;
       }
-      const completionNotification = extractCanonicalPiSubagentNotification(event.messages);
-      if (completionNotification && !this.observedBackgroundCompletionKeys.has(completionNotification.key)) {
-        const completionStatuses = Object.fromEntries(completionNotification.notifications.map((notification) => [
-          notification.taskId,
-          ledgerStatusFromPiNotificationStatus(notification.status),
-        ]));
-        const owningTurnFailed = event.willRetry === true
-          || this.finalAssistantStopReason === "error"
-          || this.finalAssistantStopReason === "aborted";
-        if (this.activeEpoch === null || owningTurnFailed) {
-          // Unowned agent_end still has an active Pi session, so prompting
-          // before settle is rejected as "Agent is already processing".
-          // A failed or retrying owned turn also did not process the
-          // notification; do not emit handledInTurn so RuntimeHost can still
-          // wake after input-error, retry, or restart.
-          this.pendingUnownedCompletionKeys.add(completionNotification.key);
-          this.pendingUnownedCompletionStatuses.set(completionNotification.key, completionStatuses);
-        } else {
-          // Already visible in the owned turn. Persist as acknowledged; do not
-          // schedule another wake after the parent turn settles.
-          this.observedBackgroundCompletionKeys.add(completionNotification.key);
-          this.emitObservation("completed", {
-            completionKey: completionNotification.key,
-            completionStatuses,
-            handledInTurn: true,
-          });
-        }
-      }
     } else if (event?.type === "agent_settled") {
       const epoch = this.activeEpoch;
-      if (epoch === null) {
-        this.flushPendingUnownedCompletions();
-        return;
-      }
-      if (this.settleArmedEpoch !== epoch) {
-        this.flushPendingUnownedCompletions();
-        return;
-      }
+      if (epoch === null) return;
+      if (this.settleArmedEpoch !== epoch) return;
       this.activeEpoch = null;
       this.settleArmedEpoch = null;
       const error = this.finalAssistantError;
@@ -798,7 +754,6 @@ class PiSession extends EventSession {
       this.observedAcceptedEpochs.delete(epoch);
       this.observedCompletedEpochs.delete(epoch);
       this.observedAgentEndEpochs.delete(epoch);
-      this.flushPendingUnownedCompletions();
     }
     else if (event?.type === "tool_execution_start") {
       if (!this.firstOutputObserved) {
@@ -816,13 +771,6 @@ class PiSession extends EventSession {
         this.toolCallOpen = false;
         this.emit({ type: "runtime-observation", runtime: "pi", distribution: this.distribution, phase: "tool_result" });
       }
-      const dispatched = extractBackgroundPiSubagentDispatch(event);
-      if (dispatched) {
-        this.emitObservation("background_dispatched", {
-          taskId: dispatched.taskId,
-          ...(dispatched.outputFile ? { outputFile: dispatched.outputFile } : {}),
-        });
-      }
     }
     else if (event?.type === "message_update" && event.assistantMessageEvent?.delta) {
       if (!this.firstOutputObserved) {
@@ -834,25 +782,8 @@ class PiSession extends EventSession {
     }
   }
 
-  private flushPendingUnownedCompletions(): void {
-    for (const completionKey of this.pendingUnownedCompletionKeys) {
-      if (this.observedBackgroundCompletionKeys.has(completionKey)) continue;
-      this.observedBackgroundCompletionKeys.add(completionKey);
-      const completionStatuses = this.pendingUnownedCompletionStatuses.get(completionKey);
-      this.emitObservation("completed", {
-        completionKey,
-        ...(completionStatuses ? { completionStatuses } : {}),
-      });
-    }
-    this.pendingUnownedCompletionKeys.clear();
-    this.pendingUnownedCompletionStatuses.clear();
-  }
-
   private emitObservation(phase: Extract<NormalizedRuntimeEvent, { type: "runtime-observation" }>['phase'], fields: {
-    reason?: "manual" | "threshold" | "overflow"; willRetry?: boolean; success?: boolean; completionKey?: string;
-    completionStatuses?: Record<string, "completed" | "failed" | "cancelled" | "timed_out">;
-    handledInTurn?: boolean;
-    taskId?: string; outputFile?: string;
+    reason?: "manual" | "threshold" | "overflow"; willRetry?: boolean; success?: boolean;
   } = {}): void {
     const inputId = this.oldestOwnedInput();
     const observation = { type: "runtime-observation" as const, runtime: "pi" as const,
@@ -860,7 +791,6 @@ class PiSession extends EventSession {
     // Correlation is host-internal metadata, not telemetry payload.
     if (this.sessionId) Object.defineProperty(observation, "sessionId", { value: this.sessionId, enumerable: false });
     if (inputId) Object.defineProperty(observation, "inputId", { value: inputId, enumerable: false });
-    if (fields.completionKey) Object.defineProperty(observation, "completionKey", { value: fields.completionKey, enumerable: false });
     this.emit(observation as NormalizedRuntimeEvent);
   }
 
