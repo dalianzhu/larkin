@@ -17,6 +17,7 @@ import { RuntimePrerequisiteError } from "../../../dist/runtime/runtime-readines
 import { calculatePiCompactionSettings } from "../../../dist/runtime/pi-compaction-recovery.mjs";
 import { createAgentStateStore } from "../../../dist/agent/agent-state-store.mjs";
 import { ProcessingEyeOrchestrator } from "../../../dist/feishu/host-processing-eye.mjs";
+import { createNativeRuntimeAdapter } from "../../../dist/runtime/runtime-adapters.mjs";
 
 function cleanupSharedImplicitPiState() {
   const implicit = path.join("/tmp", ".larkin");
@@ -200,7 +201,11 @@ test("RuntimeHost does not proactively compact at the strict threshold", async (
   }
   const session = new EqualSession();
   const adapter = { id: "pi", capabilities: {}, async createSession() { return session; } };
-  const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder() });
+  const host = createRuntimeHost({
+    adapterFor: () => adapter,
+    promptBuilder: new ContextPromptBuilder(),
+    assertOfficialCliReady: async () => {},
+  });
   try {
     await host.start([{ agentId: "cli_piProactiveEqualA1", name: "equal", runtime: "pi", model: "model", workspaceDir: "/tmp", stateDir: root }]);
     session.emit({ type: "turn-end" });
@@ -1046,6 +1051,38 @@ test("RuntimeHost retries unavailable readiness through bounded recreate instead
   assert.equal(probes, 2);
   assert.equal((await host.deliver("cli_transientPiA1", { message_id: "om_after_retry" })).status, "accepted");
   await host.shutdown("done");
+});
+
+test("RuntimeHost shutdown drains queued Pi initializers and closes every late session", async () => {
+  let active = 0;
+  let maximum = 0;
+  const closed = [];
+  const nativeAdapter = createNativeRuntimeAdapter("pi", { createPiSession: async (input) => {
+    active += 1;
+    maximum = Math.max(maximum, active);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    active -= 1;
+    return {
+      sessionId: input.agentId,
+      prompt: async () => {}, steer: async () => {}, abort: async () => {},
+      dispose: async () => { closed.push(input.agentId); },
+    };
+  } });
+  const adapter = { ...nativeAdapter, async probe() { return { runtime: "pi", state: "ready" }; } };
+  const host = createRuntimeHost({
+    adapterFor: () => adapter,
+    promptBuilder: new ContextPromptBuilder(),
+    assertOfficialCliReady: async () => {},
+  });
+  const configs = Array.from({ length: 8 }, (_, index) => ({
+    agentId: `cli_shutdownPi${index}`, name: `shutdown-${index}`, runtime: "pi", model: "model", workspaceDir: "/tmp",
+  }));
+  const startup = host.start(configs);
+  await new Promise((resolve) => setImmediate(resolve));
+  await host.shutdown("test shutdown");
+  await assert.rejects(startup, /No runtime Agent started/);
+  assert.equal(maximum, 2);
+  assert.deepEqual(closed.sort(), configs.map((config) => config.agentId).sort());
 });
 
 test("RuntimeHost stops recreate when the latest probe changes from unavailable to fatal", async () => {

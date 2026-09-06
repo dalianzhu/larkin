@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.3
+
+External Pi initialization now runs with bounded concurrency and recovers from isolated startup-probe timeouts through the existing retry policy. Shutdown waits for pending initialization and closes late sessions. Generic Runtime and delivery failures show unavailable instead of incompatible, while explicit prerequisite failures and useful provider diagnostics are preserved. Recovery workflow tests wait for delivery consumption and Inbox watermarks to converge and isolate temporary state.
+
 ## 0.5.2
 
 External pi now runs with the user's own Pi home; compaction settings move to the Agent workspace's `.pi/settings.json`; 0.5.0/0.5.1 started external pi with an empty agent dir and saw no logins. Stock pi 0.84.x does not emit `get_state.compactionCapabilities` (that handshake only existed for the bundled build); Larkin accepts the absence and keeps native compaction via the workspace settings file, while a present handshake must still match exactly.

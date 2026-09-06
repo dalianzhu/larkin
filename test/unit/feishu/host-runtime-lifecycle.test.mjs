@@ -264,6 +264,11 @@ test("HostShell keeps durable missing-key auth across ready status and reset", a
     assert.match(store.readJson("status", {}).runtimeReadiness.nextAction, /external `pi` CLI/);
     assert.match(store.readJson("status", {}).runtimeReadiness.nextAction, /zai-coding-cn/);
     assert.doesNotMatch(store.readJson("status", {}).runtimeReadiness.nextAction, /pi-auth|Provider Credentials/);
+    listener({ type: "agent-status", agentId, status: "error", error: "provider request failed with HTTP 403", readiness: { runtime: "pi", state: "ready" } });
+    const terminal = store.readJson("status", {}).runtimeReadiness;
+    assert.equal(terminal.state, "unauthenticated", "a scoped persisted auth failure must not fall back to generic availability");
+    assert.match(terminal.nextAction, /zai-coding-cn/);
+    assert.match(JSON.stringify(store.readJson("status", {}).recentErrors), /HTTP 403/);
     const reset = await host.resetSession(agentId, 0);
     assert.equal(reset.resetCommitted, true);
     assert.equal(store.readJson("status", {}).runtimeReadiness.state, "unauthenticated");
@@ -768,9 +773,33 @@ test("production HostShell clears eyes on inactive/error and ignores heartbeat a
 
     await ingest("error");
     listener({ type: "agent-status", agentId, status: "active" });
-    listener({ type: "agent-status", agentId, status: "error", error: "runtime failed", readiness: { runtime: "pi", state: "ready" } });
+    listener({ type: "agent-status", agentId, status: "error", error: "provider request failed with HTTP 403", readiness: { runtime: "pi", state: "ready" } });
     assert.equal(deletes().length, 2);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(agent.stateDir, "status.json"), "utf8")).runtimeReadiness.state, "incompatible");
+    const runtimeFailure = JSON.parse(fs.readFileSync(path.join(agent.stateDir, "status.json"), "utf8")).runtimeReadiness;
+    assert.equal(runtimeFailure.state, "unavailable");
+    assert.match(runtimeFailure.reason, /HTTP 403/);
+    assert.match(runtimeFailure.nextAction, /inspect.*retry/i);
+
+    for (const readiness of [
+      { runtime: "pi", state: "missing", reason: "pi executable is absent", nextAction: "Install pi." },
+      { runtime: "pi", state: "unauthenticated", reason: "provider login expired", nextAction: "Log in again." },
+      { runtime: "pi", state: "incompatible", reason: "pi version is unsupported", nextAction: "Upgrade pi." },
+    ]) {
+      listener({ type: "agent-status", agentId, status: "error", error: "generic terminal error", readiness });
+      const explicit = JSON.parse(fs.readFileSync(path.join(agent.stateDir, "status.json"), "utf8")).runtimeReadiness;
+      assert.equal(explicit.state, readiness.state);
+      assert.equal(explicit.reason, readiness.reason);
+      assert.equal(explicit.nextAction, readiness.nextAction);
+    }
+
+    const statusPath = path.join(agent.stateDir, "status.json");
+    const staleStatus = JSON.parse(fs.readFileSync(statusPath, "utf8"));
+    staleStatus.runtimeReadiness = { runtime: "pi", state: "unauthenticated", reason: "stale provider login", observedAt: "2000-01-01T00:00:00.000Z" };
+    fs.writeFileSync(statusPath, JSON.stringify(staleStatus));
+    listener({ type: "agent-status", agentId, status: "error", error: "current Runtime failure", readiness: { runtime: "pi", state: "ready" } });
+    const currentFallback = JSON.parse(fs.readFileSync(statusPath, "utf8")).runtimeReadiness;
+    assert.equal(currentFallback.state, "unavailable");
+    assert.equal(currentFallback.reason, "current Runtime failure");
 
     await ingest("heartbeat");
     listener({ type: "activity", agentId, activity: "idle", activityKind: "idle", isHeartbeat: true });

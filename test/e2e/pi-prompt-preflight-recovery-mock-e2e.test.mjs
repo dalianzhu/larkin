@@ -14,6 +14,10 @@ import { createNativeRuntimeAdapter } from "../../dist/runtime/runtime-adapters.
 import { PiCompactionBreaker } from "../../dist/runtime/pi-compaction-recovery.mjs";
 import { createRuntimeHost } from "../../dist/runtime/runtime-host.mjs";
 
+function isolatedPiInput(input, root) {
+  return { ...input, env: { ...input.env, LARKIN_CONFIG_DIR: root, LARKIN_HOME: root, HOME: path.join(root, "home") } };
+}
+
 class PreflightPiProcess extends EventEmitter {
   stdout = new PassThrough();
   stderr = new PassThrough();
@@ -139,7 +143,7 @@ test("production-shaped Pi RPC Mock proves native retry lifecycle is correlated 
     return true;
   }, end() {} };
   const native = createNativeRuntimeAdapter("pi", { spawn: () => child });
-  const adapter = { id: native.id, capabilities: native.capabilities, probe: async () => ({ runtime: "pi", state: "ready" }), createSession: (input) => native.createSession(input) };
+  const adapter = { id: native.id, capabilities: native.capabilities, probe: async () => ({ runtime: "pi", state: "ready" }), createSession: (input) => native.createSession(isolatedPiInput(input, root)) };
   const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store,
     assertOfficialCliReady: () => {}, retryPolicy: { baseDelayMs: 2, maxDelayMs: 2, maxAttempts: 1 } });
   const target = "chat:oc_native_retry";
@@ -208,7 +212,7 @@ function recoveryHost(root, scenario, sessions, store, target = `chat:oc_${scena
     const child = new RecoveryPiProcess(sessions.length, scenario, () => store.pollInbox({ target })); sessions.push(child); return child;
   }, piRpcClientOptions: { requestTimeoutMs: 50, inputTimeoutMs: 100, inputProgressTimeoutMs: 100, inputMaxTimeoutMs: 500 } });
   const adapter = { id: native.id, capabilities: native.capabilities, probe: async () => ({ runtime: "pi", state: "ready" }),
-    createSession: (input) => native.createSession(input) };
+    createSession: (input) => native.createSession(isolatedPiInput(input, root)) };
   return createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store,
     assertOfficialCliReady: () => {}, retryPolicy: { baseDelayMs: 2, maxDelayMs: 2, maxAttempts: 1 } });
 }
@@ -297,7 +301,7 @@ test("external Pi production-order preflight timeout stays bounded, pending, obs
     piRpcClientOptions: { requestTimeoutMs: 5, inputTimeoutMs: 15, inputProgressTimeoutMs: 25, inputMaxTimeoutMs: 50 },
   });
   const adapter = { id: native.id, capabilities: native.capabilities,
-    probe: async () => ({ runtime: "pi", state: "ready" }), createSession: (input) => native.createSession(input) };
+    probe: async () => ({ runtime: "pi", state: "ready" }), createSession: (input) => native.createSession(isolatedPiInput(input, root)) };
   const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(),
     stateStoreFor: () => store, telemetry, retryPolicy: { baseDelayMs: 2, maxDelayMs: 2, maxAttempts: 0 },
     assertOfficialCliReady: () => {} });

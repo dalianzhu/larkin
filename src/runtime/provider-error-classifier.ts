@@ -20,6 +20,20 @@ export const CANONICAL_CONTEXT_WINDOW_MESSAGE =
 export const INTERNAL_CONTEXT_WINDOW_PROJECTION_REASON =
   "provider rejected the input because the context window was exceeded";
 
+/** Redact credentials and local filesystem locations from provider diagnostics kept in status. */
+export function safeProviderDiagnostic(value: unknown, fallback: string, max = 2_000): string {
+  const source = typeof value === "string" ? value : fallback;
+  return source
+    .replace(/\b(?:authorization|proxy-authorization)\s*[:=]\s*(?:Bearer\s+)?[^\s,;]+/gi, (match) => `${match.split(/[:=]/, 1)[0]}=[redacted]`)
+    .replace(/\b(?:cookie|set-cookie)\s*[:=]\s*(?:[^;\s,]+(?:\s*;\s*[^;\s,]+)*)/gi, (match) => `${match.split(/[:=]/, 1)[0]}=[redacted]`)
+    .replace(/\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|secret|password)\s*[:=]\s*[^\s,;]+/gi, (match) => `${match.split(/[:=]/, 1)[0]}=[redacted]`)
+    .replace(/(["'](?:authorization|cookie|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)["']\s*:\s*)["'][^"']*["']/gi, "$1\"[redacted]\"")
+    .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, "Bearer [redacted]")
+    .replace(/\b(?:sk|ghp|github_pat)-?[A-Za-z0-9_-]{8,}\b/g, "[redacted]")
+    .replace(/(^|[\s"'=])(?:\/(?:Users|home|private|var|tmp|etc)\/[^\s"']+|[A-Za-z]:[\\/][^\s"']+)/g, "$1[redacted-path]")
+    .replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim().slice(0, max) || fallback;
+}
+
 /** Build the one structured provider-error shape shared by ingestion and recovery. */
 export function buildStrictProviderErrorInput(source: ProviderErrorSource): StrictProviderErrorInput {
   const upstream = source.upstream && typeof source.upstream === "object" && !Array.isArray(source.upstream)

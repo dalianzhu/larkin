@@ -34,6 +34,7 @@ import {
   RuntimePrerequisiteError,
   type PersistedAuthFailure,
 } from "../runtime/runtime-readiness.js";
+import { safeProviderDiagnostic } from "../runtime/provider-error-classifier.js";
 import { readDocumentCommentSubscription, verifyCallbackProbe, type EffectiveDocumentCommentSubscription } from "../platform/callback-capability.js";
 import { loadConfig, resolveMentionPolicy } from "../platform/config.js";
 import { processCommandToken } from "../app/internal-command.js";
@@ -197,6 +198,9 @@ export function memberNamesFromPayloads(payloads: readonly unknown[]): Record<st
 }
 
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+function safeRuntimeStatusDiagnostic(error: unknown): string {
+  return safeProviderDiagnostic(error, "Runtime entered an error state", 500);
+}
 function agentConfigSignature(agent: ConfiguredAgent): string {
   return JSON.stringify({
     agentId: agent.agentId, runtime: agent.runtime, model: agent.model, effort: agent.effort ?? null,
@@ -330,6 +334,38 @@ export function createHostShell({
     }
     hostState.updateStatus(agent, { runtimeReadiness: { runtime: agent.runtime, state: "ready", observedAt } });
   };
+  const projectFallbackRuntimeReadiness = (
+    agent: ConfiguredAgent,
+    observedAt: string,
+    fallback: { state: "missing" | "unavailable"; reason: string; nextAction?: string },
+    preserveCurrentUnavailableDiagnostic = false,
+  ): void => {
+    const failure = unresolvedCurrentAuth(agent);
+    if (failure) {
+      hostState.updateStatus(agent, {
+        runtimeReadiness: { ...readinessForPersistedAuthFailure(failure), observedAt },
+      });
+      return;
+    }
+    const currentReadiness = hostState.readStatus(agent).runtimeReadiness as {
+      runtime?: string; state?: string; observedAt?: string; reason?: unknown; nextAction?: unknown;
+    } | undefined;
+    const observedMs = Date.parse(String(currentReadiness?.observedAt || ""));
+    const daemonStartedMs = Date.parse(daemonStartedAt);
+    const currentEpoch = currentReadiness?.runtime === agent.runtime
+      && Number.isFinite(observedMs) && Number.isFinite(daemonStartedMs) && observedMs >= daemonStartedMs;
+    if (currentEpoch && (currentReadiness?.state === "missing" || currentReadiness?.state === "unauthenticated" || currentReadiness?.state === "incompatible")) return;
+    if (currentEpoch && preserveCurrentUnavailableDiagnostic && currentReadiness?.state === "unavailable"
+      && typeof currentReadiness.reason === "string" && currentReadiness.reason.trim()) {
+      hostState.updateStatus(agent, {
+        runtimeReadiness: { ...currentReadiness, runtime: agent.runtime, state: "unavailable", observedAt },
+      });
+      return;
+    }
+    hostState.updateStatus(agent, {
+      runtimeReadiness: { runtime: agent.runtime, ...fallback, observedAt },
+    });
+  };
   const recordInboundDeliveryFailure = (
     agent: ConfiguredAgent,
     code: "non_retryable_receipt" | "runtime_delivery_exception" | "runtime_delivery_event",
@@ -337,13 +373,10 @@ export function createHostShell({
     const at = new Date().toISOString();
     const reason = "Inbound Runtime delivery failed non-retryably; durable Inbox/ledger state is retained for recovery.";
     const nextAction = "Inspect the delivery/status error, correct the Runtime or canonical Inbox state, then restart to replay safely.";
-    const currentReadiness = hostState.readStatus(agent).runtimeReadiness as { state?: string } | undefined;
     hostState.updateStatus(agent, {
       inboundDeliveryHealth: { state: "error", code, at, reason, nextAction },
-      ...(currentReadiness?.state === "unauthenticated" ? {} : {
-        runtimeReadiness: { runtime: agent.runtime, state: "incompatible" as const, reason, nextAction },
-      }),
     });
+    projectFallbackRuntimeReadiness(agent, at, { state: "unavailable", reason, nextAction }, true);
     hostState.recordStatusError(agent, `${reason} ${nextAction} code=${code}`);
   };
   const agentStates = new Map<string, AgentStateRecord>();
@@ -1305,14 +1338,20 @@ export function createHostShell({
     if (message.type === "agent-status") {
       log("agent:status", message.agentId, message.status);
       const observedAt = new Date().toISOString();
-      if (message.status === "error" || message.status === "inactive") hostState.updateStatus(agent, {
-        runtimeReadiness: message.readiness?.state && message.readiness.state !== "ready" ? { ...message.readiness, observedAt } : {
-          runtime: agent.runtime,
-          state: message.status === "error" ? "incompatible" : "missing",
-          reason: message.status === "error" ? message.error || "Runtime entered an error state" : "Runtime is inactive",
-          observedAt,
-        },
-      });
+      if (message.status === "error" || message.status === "inactive") {
+        if (message.readiness?.state && message.readiness.state !== "ready") {
+          hostState.updateStatus(agent, { runtimeReadiness: { ...message.readiness, observedAt } });
+        } else {
+          projectFallbackRuntimeReadiness(agent, observedAt, message.status === "error" ? {
+            state: "unavailable",
+            reason: safeRuntimeStatusDiagnostic(message.error),
+            nextAction: "Inspect the Runtime status error, correct the Runtime availability issue, then retry.",
+          } : {
+            state: "missing",
+            reason: "Runtime is inactive",
+          });
+        }
+      }
       else if (message.readiness) {
         if (message.readiness.state === "ready" && unresolvedCurrentAuth(agent)) {
           projectReadyUnlessUnresolvedAuth(agent, observedAt);
@@ -1327,7 +1366,7 @@ export function createHostShell({
         }, 5_000);
         redeliveryTimer.unref?.();
       }
-      if (message.status === "error" && message.error) hostState.recordStatusError(agent, message.error);
+      if (message.status === "error" && message.error) hostState.recordStatusError(agent, safeRuntimeStatusDiagnostic(message.error));
       if (message.status === "error" || message.status === "inactive") {
         processingEyes.clear(agent, `agent-status:${message.status}`);
       }
