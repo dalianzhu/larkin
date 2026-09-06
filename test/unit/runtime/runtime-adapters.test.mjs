@@ -16,7 +16,6 @@ import {
   requirePiResumeSessionFile,
   resolvePiProcessExtensionArgs,
 } from "../../../dist/runtime/runtime-adapters.mjs";
-import { buildAutonomousFollowUpMessage, buildTmuxBashFollowUpMessage } from "../../../dist/runtime/pi-autonomous-followup.mjs";
 import { classifyStrictProviderError } from "../../../dist/runtime/provider-error-classifier.mjs";
 import { RuntimePrerequisiteError } from "../../../dist/runtime/runtime-readiness.mjs";
 
@@ -395,7 +394,7 @@ test("Codex native notifications normalize start, intermediate output, and termi
   ["turn-start", "activity:thinking", "activity:text", "turn-end"]);
 });
 
-test("Pi unowned turn_start occupies an autonomous turn without a host-wake key", async () => {
+test("Pi unowned turn_start occupies busy and settles on agent_settled", async () => {
   let listener;
   const sdk = {
     sessionId: "pi-native-followup", prompt() {}, steer() {}, abort() {},
@@ -408,104 +407,17 @@ test("Pi unowned turn_start occupies an autonomous turn without a host-wake key"
   const events = [];
   session.subscribe((event) => events.push(event));
   listener({ type: "turn_start", turnIndex: 3 });
-  listener({ type: "agent_end", willRetry: false, messages: [] });
   listener({ type: "agent_settled" });
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(events.filter((event) => event.type === "turn-start" || event.type === "turn-end").map((event) => event.type),
     ["turn-start", "turn-end"]);
-  assert.deepEqual(events.filter((event) => event.type === "runtime-observation" && event.completionKey), []);
 });
 
-test("Pi generic custom followUp without turn_start still accounts busy then settles once", async () => {
-  let listener;
-  const sdk = {
-    sessionId: "pi-generic-followup", prompt() {}, steer() {}, abort() {},
-    subscribe(next) { listener = next; return () => {}; },
-  };
-  const session = await createNativeRuntimeAdapter("pi", {
-    createPiSession: async () => sdk,
-    env: { LARKIN_PI_DISTRIBUTION: "builtin" },
-  }).createSession(create());
-  const events = [];
-  session.subscribe((event) => events.push(event));
-  listener({
-    type: "agent_end",
-    willRetry: false,
-    messages: [buildAutonomousFollowUpMessage("extension-followup", "Command finished (exit 0)")],
-  });
-  listener({ type: "agent_settled" });
-  listener({
-    type: "agent_end",
-    willRetry: false,
-    messages: [buildAutonomousFollowUpMessage("extension-followup", "Command finished (exit 0)")],
-  });
-  listener({ type: "agent_settled" });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(events.filter((event) => event.type === "turn-start" || event.type === "turn-end").map((event) => event.type),
-    ["turn-start", "turn-end"]);
-  assert.deepEqual(events.filter((event) => event.type === "runtime-observation" && event.completionKey), []);
-});
-
-test("Pi tmux-bash-completion followUp occupies an autonomous turn and does not emit a host-wake key", async () => {
-  let listener;
-  const sdk = {
-    sessionId: "pi-tmux-followup", prompt() {}, steer() {}, abort() {},
-    subscribe(next) { listener = next; return () => {}; },
-  };
-  const session = await createNativeRuntimeAdapter("pi", {
-    createPiSession: async () => sdk,
-    env: { LARKIN_PI_DISTRIBUTION: "builtin" },
-  }).createSession(create());
-  const events = [];
-  session.subscribe((event) => events.push(event));
-  listener({ type: "turn_start", turnIndex: 4 });
-  listener({
-    type: "agent_end",
-    willRetry: false,
-    messages: [buildTmuxBashFollowUpMessage("tmux-bash-completion", "Command finished (exit 0)\n\n```\ndone\n```")],
-  });
-  listener({ type: "agent_settled" });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(events.filter((event) => event.type === "turn-start" || event.type === "turn-end").map((event) => event.type),
-    ["turn-start", "turn-end"]);
-  assert.deepEqual(events.filter((event) => event.type === "runtime-observation" && event.completionKey), []);
-});
-
-test("Pi tmux-bash-completion without turn_start still accounts busy then settles once", async () => {
-  let listener;
-  const sdk = {
-    sessionId: "pi-tmux-late-followup", prompt() {}, steer() {}, abort() {},
-    subscribe(next) { listener = next; return () => {}; },
-  };
-  const session = await createNativeRuntimeAdapter("pi", {
-    createPiSession: async () => sdk,
-    env: { LARKIN_PI_DISTRIBUTION: "builtin" },
-  }).createSession(create());
-  const events = [];
-  session.subscribe((event) => events.push(event));
-  listener({
-    type: "agent_end",
-    willRetry: false,
-    messages: [buildTmuxBashFollowUpMessage("tmux-bash-completion", "Command finished (exit 1)")],
-  });
-  listener({ type: "agent_settled" });
-  listener({
-    type: "agent_end",
-    willRetry: false,
-    messages: [buildTmuxBashFollowUpMessage("tmux-bash-completion", "Command finished (exit 1)")],
-  });
-  listener({ type: "agent_settled" });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(events.filter((event) => event.type === "turn-start" || event.type === "turn-end").map((event) => event.type),
-    ["turn-start", "turn-end"]);
-  assert.deepEqual(events.filter((event) => event.type === "runtime-observation" && event.completionKey), []);
-});
-
-test("Pi busy steer during a tmux followUp turn attaches to that turn instead of opening another epoch", async () => {
+test("Pi busy steer during an unowned turn attaches to that turn instead of opening another epoch", async () => {
   let listener;
   const calls = [];
   const sdk = {
-    sessionId: "pi-tmux-busy-steer",
+    sessionId: "pi-unowned-busy-steer",
     prompt(text) { calls.push(["prompt", text]); },
     steer(text) { calls.push(["steer", text]); },
     abort() {},
@@ -516,11 +428,6 @@ test("Pi busy steer during a tmux followUp turn attaches to that turn instead of
     env: { LARKIN_PI_DISTRIBUTION: "builtin" },
   }).createSession(create());
   listener({ type: "turn_start" });
-  listener({
-    type: "agent_end",
-    willRetry: false,
-    messages: [buildTmuxBashFollowUpMessage("tmux-bash-completion", "still wrapping up")],
-  });
   const result = await session.busyInput({ inputId: "inbox-1", kind: "inbox_update", text: "new inbox", attempt: 0 });
   assert.deepEqual(result, { status: "accepted", inputId: "inbox-1" });
   listener({ type: "agent_settled" });

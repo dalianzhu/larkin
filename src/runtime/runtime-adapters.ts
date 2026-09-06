@@ -18,7 +18,6 @@ import type {
 import { isPiThinkingLevel } from "./pi-model-catalog.js";
 import { PiRpcClient, type PiRpcClientOptions } from "./pi-rpc-client.js";
 import { traceProcessBoundary } from "../platform/process-boundary-trace.js";
-import { extractAutonomousPiFollowUp } from "./pi-autonomous-followup.js";
 import { effectivePiStateDir } from "./pi-state-dir.js";
 import {
   classifyPiMissingCredentialRejection,
@@ -552,7 +551,6 @@ class PiSession extends EventSession {
   private readonly observedSubmitEpochs = new Set<number>();
   private readonly observedAcceptedEpochs = new Set<number>();
   private readonly observedCompletedEpochs = new Set<number>();
-  private readonly observedAutonomousFollowUpKeys = new Set<string>();
   private readonly observedAgentEndEpochs = new Set<number>();
   private firstOutputObserved = false;
   private toolCallOpen = false;
@@ -659,7 +657,6 @@ class PiSession extends EventSession {
       this.observedSubmitEpochs.clear();
       this.observedAcceptedEpochs.clear();
       this.observedCompletedEpochs.clear();
-      this.observedAutonomousFollowUpKeys.clear();
       this.observedAgentEndEpochs.clear();
       this.activeEpoch = null;
       this.settleArmedEpoch = null;
@@ -675,19 +672,21 @@ class PiSession extends EventSession {
       || String(event?.type || "").startsWith("summarization_retry_")) && this.awaitingAcknowledgement.size > 0) {
       this.emitObservation("retry_progress");
     } else if (event?.type === "turn_start") {
-      const epoch = this.oldestOwnedEpoch();
-      if (epoch !== null) {
-        if (this.activeEpoch !== null) return;
-        this.activeEpoch = epoch;
+      if (this.activeEpoch !== null) return;
+      const owned = this.oldestOwnedEpoch();
+      if (owned === null) {
+        // Native Pi triggerTurn / extension follow-up: occupy busy without a host prompt.
+        this.requestEpoch += 1;
+        this.activeEpoch = this.requestEpoch;
+        this.settleArmedEpoch = this.activeEpoch;
+      } else {
+        this.activeEpoch = owned;
         this.settleArmedEpoch = null;
-        this.firstOutputObserved = false;
-        this.toolCallOpen = false;
-        this.emitObservation("turn_start");
-        this.emit({ type: "turn-start", ...(Number.isInteger(event.turnIndex) ? { turnId: `pi-${event.turnIndex}` } : {}) });
-        return;
       }
-      // Native Pi triggerTurn starts a Pi-owned turn with no host prompt.
-      this.beginAutonomousFollowUpTurn(Number.isInteger(event.turnIndex) ? `pi-${event.turnIndex}` : undefined);
+      this.firstOutputObserved = false;
+      this.toolCallOpen = false;
+      this.emitObservation("turn_start");
+      this.emit({ type: "turn-start", ...(Number.isInteger(event.turnIndex) ? { turnId: `pi-${event.turnIndex}` } : {}) });
     }
     else if (event?.type === "agent_end") {
       const assistant = [...(Array.isArray(event.messages) ? event.messages : [])]
@@ -708,14 +707,6 @@ class PiSession extends EventSession {
       if (event.willRetry !== true && this.activeEpoch !== null && !this.observedCompletedEpochs.has(this.activeEpoch)) {
         this.observedCompletedEpochs.add(this.activeEpoch);
         this.emitObservation("completed");
-      }
-      const autonomousFollowUp = extractAutonomousPiFollowUp(event.messages);
-      if (autonomousFollowUp && !this.observedAutonomousFollowUpKeys.has(autonomousFollowUp.key)) {
-        this.observedAutonomousFollowUpKeys.add(autonomousFollowUp.key);
-        // Pi already triggerTurn'd this followUp. Account for the notification
-        // turn; never translate it into a legacy subagent host-wake.
-        if (this.activeEpoch === null) this.beginAutonomousFollowUpTurn();
-        if (this.settleArmedEpoch === null) this.settleArmedEpoch = this.activeEpoch;
       }
     } else if (event?.type === "agent_settled") {
       const epoch = this.activeEpoch;
@@ -792,17 +783,6 @@ class PiSession extends EventSession {
     if (this.sessionId) Object.defineProperty(observation, "sessionId", { value: this.sessionId, enumerable: false });
     if (inputId) Object.defineProperty(observation, "inputId", { value: inputId, enumerable: false });
     this.emit(observation as NormalizedRuntimeEvent);
-  }
-
-  private beginAutonomousFollowUpTurn(turnId?: string): void {
-    if (this.activeEpoch !== null) return;
-    this.requestEpoch += 1;
-    this.activeEpoch = this.requestEpoch;
-    this.settleArmedEpoch = null;
-    this.firstOutputObserved = false;
-    this.toolCallOpen = false;
-    this.emitObservation("turn_start");
-    this.emit({ type: "turn-start", ...(turnId ? { turnId } : {}) });
   }
 
   private oldestOwnedInput(): string | undefined {

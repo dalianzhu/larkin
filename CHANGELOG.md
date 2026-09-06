@@ -2,7 +2,7 @@
 
 ## 0.5.5
 
-Pi no longer injects Larkin-managed `pi-subagents`, the 60-second bash timeout guard, or the supervised-command bundle. User-installed Pi packages load through normal Pi discovery; Larkin does not redistribute `@richardgill/pi-tmux-bash`. Published 0.0.12 of that plugin requires a git working tree, so ordinary Larkin directories remain on native bash until a compatible long-running path is chosen. Autonomous Pi-owned turns occupy Runtime busy state and do not schedule a second host prompt. Historical `pi-subagent-ledger.json` files on disk are left inert and are no longer read.
+Pi no longer injects Larkin-managed `pi-subagents`, the 60-second bash timeout guard, or the supervised-command bundle. User-installed Pi packages load through normal Pi discovery; Larkin does not scan package settings or redistribute `@richardgill/pi-tmux-bash`. Published 0.0.12 of that plugin requires a git working tree, so ordinary Larkin directories remain on native bash until a compatible long-running path is chosen. Unowned Pi `turn_start` / `agent_settled` events occupy Runtime busy state and do not schedule a second host prompt. Historical `pi-subagent-ledger.json` files on disk are left inert and are no longer read.
 
 ## 0.5.4
 

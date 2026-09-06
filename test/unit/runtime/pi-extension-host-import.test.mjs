@@ -13,6 +13,10 @@ const REMOVED = [
   "src/runtime/pi-subagent-record-watchdog.ts",
   "src/runtime/pi-subagent-record-watchdog-injection.ts",
   "src/runtime/pi-extension-api.ts",
+  "src/runtime/pi-tmux-bash-discovery.ts",
+  "src/runtime/pi-autonomous-followup.ts",
+  "src/runtime/pi-subagent-ledger.ts",
+  "src/runtime/pi-subagents-notification.ts",
 ];
 const REMOVED_BUNDLES = [
   "pi-bash-timeout.bundle.js",
