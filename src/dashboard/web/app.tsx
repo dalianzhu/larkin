@@ -229,11 +229,12 @@ function GlobalSettingsSheet({ open, onOpenChange, onSaved }: { open: boolean; o
   };
   const save = async () => {
     const auditChanged = draftAudit.enabled !== serverAudit.enabled || draftAuditGapMinutes !== formatAuditGapMinutes(serverAudit.intervalMs);
-    const intervalMs = auditChanged ? auditGapFromMinutes(draftAuditGapMinutes) : serverAudit.intervalMs;
-    if (auditChanged && intervalMs === null) {
+    const editedIntervalMs = auditChanged ? auditGapFromMinutes(draftAuditGapMinutes) : null;
+    if (auditChanged && editedIntervalMs === null) {
       setFeedback("巡检间隔必须在 1 到 1440 分钟之间。");
       return;
     }
+    const intervalMs = editedIntervalMs ?? serverAudit.intervalMs;
     setLoading(true);
     try {
       let result: { revision: string; applyState: string } | null = null;
