@@ -7,7 +7,7 @@
   },
   "grader": {
     "name": "inbox-audit-flow-trace-grader",
-    "version": 1,
+    "version": 2,
     "threshold": 1,
     "rubric": [
       "audit reads and completions use the actual public candidate CLI",

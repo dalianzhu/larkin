@@ -7,7 +7,7 @@ function object(value) {
 export function loadInboxAuditFlowEval(file) {
   const value = JSON.parse(fs.readFileSync(file, "utf8"));
   if (value.dataset !== "inbox-audit-flow" || value.version !== 1) throw new Error("inbox audit eval dataset/version mismatch");
-  if (value.grader?.name !== "inbox-audit-flow-trace-grader" || value.grader.version !== 1 || value.grader.threshold !== 1) {
+  if (value.grader?.name !== "inbox-audit-flow-trace-grader" || value.grader.version !== 2 || value.grader.threshold !== 1) {
     throw new Error("inbox audit eval grader metadata mismatch");
   }
   if (!Array.isArray(value.grader.rubric) || value.grader.rubric.length < 5) throw new Error("inbox audit eval rubric is incomplete");
@@ -31,6 +31,14 @@ function latestResult(trace, action) {
 
 function readTarget(event) {
   return event?.result?.targets?.[0] || null;
+}
+
+function requireOrder(trace, actions, fail) {
+  const positions = actions.map((action) => trace.findIndex((event) => event.action === action));
+  if (positions.some((position) => position < 0) || positions.some((position, index) => index > 0 && position <= positions[index - 1])) {
+    fail("action_order", `${actions.join(" < ")} required`);
+  }
+  return positions;
 }
 
 export function gradeInboxAuditFlowTrace(dataset, scenario, trace) {
@@ -61,8 +69,9 @@ export function gradeInboxAuditFlowTrace(dataset, scenario, trace) {
   const required = new Set(scenario.required_actions);
   for (const action of required) if (!trace.some((event) => event.action === action)) fail("required_actions", action);
   if (scenario.id === "no-finding") {
-    const history = latestResult(trace, "fake_history");
-    const complete = latestResult(trace, "audit_complete");
+    const history = trace.find((event) => event.action === "fake_history");
+    const complete = trace.find((event) => event.action === "audit_complete");
+    requireOrder(trace, ["audit_read", "fake_history", "audit_complete"], fail);
     if (!history || history.target !== initial?.target || history.anchor !== initial?.anchor) fail("history_target", "history must use the returned target and anchor");
     if (!complete || complete.requested_outcome !== "no-finding" || complete.requested_receipt !== initial?.receipt
         || complete.result?.completed !== true || complete.result?.reason !== "completed") {
@@ -70,17 +79,15 @@ export function gradeInboxAuditFlowTrace(dataset, scenario, trace) {
     }
     if (trace.some((event) => event.action === "fake_send")) fail("no_finding_send", "no-finding must not send");
   } else if (scenario.id === "handled-finding") {
-    const history = latestResult(trace, "fake_history");
-    const send = latestResult(trace, "fake_send");
-    const complete = latestResult(trace, "audit_complete");
+    const history = trace.find((event) => event.action === "fake_history");
+    const send = trace.find((event) => event.action === "fake_send");
+    const complete = trace.find((event) => event.action === "audit_complete");
+    requireOrder(trace, ["audit_read", "fake_history", "fake_send", "audit_complete"], fail);
     if (!history || history.target !== initial?.target || history.anchor !== initial?.anchor) fail("history_target", "history must use the returned target and anchor");
     if (!send || send.target !== initial?.target || send.anchor !== initial?.anchor) fail("reply_anchor", "reply must use the returned target and anchor");
     if (!complete || complete.requested_outcome !== "handled" || complete.requested_receipt !== initial?.receipt
         || complete.result?.completed !== true || complete.result?.reason !== "completed") {
       fail("handled_completion", "handled finding must complete the returned receipt after the reply");
-    }
-    if (trace.findIndex((event) => event.action === "fake_send") > trace.findIndex((event) => event.action === "audit_complete")) {
-      fail("reply_before_completion", "reply must precede completion");
     }
   } else if (scenario.id === "failure-after-read") {
     const verification = latestResult(trace, "verification_audit_read");

@@ -17,6 +17,7 @@ test("inbox audit flow dataset is versioned with four fixed synthetic scenarios"
   assert.equal(DATASET.version, 1);
   assert.deepEqual(DATASET.scenarios.map((scenario) => scenario.id), ["no-finding", "handled-finding", "failure-after-read", "stale-receipt"]);
   assert.equal(DATASET.grader.threshold, 1);
+  assert.equal(DATASET.grader.version, 2);
 });
 
 test("gateway parses complete pretty JSON stdout and records malformed output explicitly", () => {
@@ -86,4 +87,17 @@ test("grader rejects empty runs, direct or failed completion, and wrong target r
       requested_receipt: "receipt-old", requested_outcome: "handled", result: { completed: true, reason: "completed" } },
   ]);
   assert.equal(wrongTarget.passed, false);
+});
+
+test("grader rejects completion before history even when history is appended later", () => {
+  const noFinding = DATASET.scenarios.find((scenario) => scenario.id === "no-finding");
+  const trace = [
+    read(noFinding),
+    { action: "audit_complete", surface: "public-cli", argv: ["inbox", "audit", "complete", "--receipt", "receipt-old", "--outcome", "no-finding", "--json"], exit_code: 0,
+      requested_receipt: "receipt-old", requested_outcome: "no-finding", result: { completed: true, reason: "completed" } },
+    { action: "fake_history", surface: "synthetic-cli-stub", target: noFinding.fixture.target, anchor: noFinding.fixture.anchor },
+  ];
+  const grade = gradeInboxAuditFlowTrace(DATASET, noFinding, trace);
+  assert.equal(grade.passed, false);
+  assert.equal(grade.failures.some((failure) => failure.rule === "action_order"), true);
 });
