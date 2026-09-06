@@ -104,6 +104,22 @@ export function loadPiTmuxBashEval(file) {
   if (typeof raw.model?.selection !== "string" || !raw.model.selection) {
     throw new Error("eval model must be set");
   }
+  if (raw.model.requires_explicit_env !== true) {
+    throw new Error("real Pi runs must require an explicit model env; no silent fallback");
+  }
+  if (!Array.isArray(raw.model.local_available) || raw.model.local_available.length === 0) {
+    throw new Error("eval must record locally available Pi models");
+  }
+  if (!Array.isArray(raw.model.not_available_locally)
+    || !raw.model.not_available_locally.includes("opencode-go/deepseek-v4-flash")) {
+    throw new Error("eval must record that opencode-go/deepseek-v4-flash is not available locally");
+  }
+  if (raw.model.not_available_locally.includes(raw.model.selection)) {
+    throw new Error("dataset.model.selection must be a locally available model, not a silent fallback");
+  }
+  if (!raw.model.local_available.includes(raw.model.selection)) {
+    throw new Error("dataset.model.selection must be one of model.local_available");
+  }
   if (typeof raw.threshold !== "number" || raw.threshold <= 0 || raw.threshold > 1) {
     throw new Error("eval threshold must be in (0, 1]");
   }

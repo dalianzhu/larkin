@@ -24,7 +24,16 @@
     "pi_args": ["--mode", "rpc", "--no-session", "--no-extensions", "-e"]
   },
   "model": {
-    "selection": "opencode-go/deepseek-v4-flash",
+    "selection": "openai-codex/gpt-5.6-luna",
+    "requires_explicit_env": true,
+    "local_available": [
+      "openai-codex/gpt-5.6-sol",
+      "openai-codex/gpt-5.6-luna",
+      "zai-coding-cn/glm5.3"
+    ],
+    "not_available_locally": [
+      "opencode-go/deepseek-v4-flash"
+    ],
     "standing_prompt_version": "larkin-standing-v30"
   },
   "threshold": 0.6,

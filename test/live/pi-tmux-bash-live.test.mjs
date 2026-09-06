@@ -15,22 +15,30 @@ import {
 } from "../support/pi-tmux-bash-grader.mjs";
 import {
   assertHeadlessExtensionFixtureArgs,
+  assertRequestedModelUsed,
   assertUserPiSettingsUnchanged,
   buildPiRpcArgs,
+  buildTimedCommand,
   childEnvForIsolatedPi,
   createIsolatedTmuxWorkspace,
-  discoverIsolatedTmuxWindows,
+  inspectRunningTmuxChild,
+  INTENDED_EVAL_COMMAND,
   INTENDED_EVAL_SCRIPT,
+  LOCAL_PI_MODELS,
   killIsolatedTmuxSession,
   listIsolatedTmuxWindows,
+  parseCommandRuntime,
   prepareIsolatedTmuxBashPackage,
+  requireExplicitEvalModel,
   resolveTmuxBashLoadMode,
   resolveTmuxBashPackagePath,
+  selectedPiModel,
   snapshotUserPiSettings,
   spawnPiRpc,
   standingPromptFile,
   UPSTREAM_NON_GIT_ERROR,
   waitFor,
+  windowIdFromResultOrTmux,
 } from "../support/pi-tmux-bash-live-harness.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -44,7 +52,7 @@ if (!Number.isInteger(repetitions) || repetitions < 1 || repetitions > 3) {
 const scenarioFilter = new Set((process.env.LARKIN_PI_TMUX_BASH_EVAL_SCENARIOS || "")
   .split(",").map((item) => item.trim()).filter(Boolean));
 const threshold = Number.parseFloat(process.env.LARKIN_PI_TMUX_BASH_EVAL_THRESHOLD || String(DATASET.threshold));
-const model = String(process.env.LARKIN_PI_TMUX_BASH_EVAL_MODEL || DATASET.model.selection).trim();
+const requestedModel = (evalEnabled || liveEnabled) ? requireExplicitEvalModel() : null;
 
 const workspaces = [];
 afterAll(() => {
@@ -108,19 +116,20 @@ async function startIsolatedPi({ appendPrompt = true, git = true } = {}) {
     const standing = new ContextPromptBuilder().build({ agentId: "cli_tmux_eval", runtime: "pi" });
     extraArgs.push("--append-system-prompt", standingPromptFile(workspace, standing.content));
   }
+  const model = requireExplicitEvalModel();
   const args = buildPiRpcArgs({ packagePath, loadMode, model, extraArgs });
   const child = spawnPiRpc({ args, cwd: workspace.workDir, env: childEnvForIsolatedPi(workspace) });
   const trace = [];
   const client = new PiRpcClient(child, { requestTimeoutMs: 30_000, inputTimeoutMs: 180_000, inputMaxTimeoutMs: 600_000 });
   subscribeTrace(client, trace);
   const state = await client.request("get_state");
-  const selected = state?.model?.provider && state?.model?.id
-    ? `${state.model.provider}/${state.model.id}`
-    : state?.model?.id || "unknown";
+  const selected = selectedPiModel(state);
+  const modelRecord = assertRequestedModelUsed(model, selected);
   if (loadMode === "extension") assertHeadlessExtensionFixtureArgs(args, packagePath);
-  console.log(`[live] pi ${loadMode} gitFixture=${workspace.gitFixture} package=${packagePath || "discovery"} model=${selected} session=${workspace.sessionName} args=${args.join(" ")}`);
+  console.log(`[live] pi ${loadMode} gitFixture=${workspace.gitFixture} package=${packagePath || "discovery"} requested=${modelRecord.requested} actual=${modelRecord.actual} session=${workspace.sessionName} args=${args.join(" ")}`);
   return {
-    snapshot, workspace, child, client, trace, loadMode, packagePath, state, selectedModel: selected, args, hostPromptCount: 0,
+    snapshot, workspace, child, client, trace, loadMode, packagePath, state,
+    requestedModel: model, selectedModel: selected, args, hostPromptCount: 0,
   };
 }
 
@@ -136,7 +145,17 @@ async function stopIsolatedPi(session) {
 }
 
 test("pi-tmux-bash eval starts from the fixed scenario dataset", () => {
-  assert.equal(DATASET.model.selection, "opencode-go/deepseek-v4-flash");
+  assert.equal(DATASET.model.selection, "openai-codex/gpt-5.6-luna");
+  assert.equal(DATASET.model.requires_explicit_env, true);
+  assert.deepEqual(DATASET.model.local_available, [
+    "openai-codex/gpt-5.6-sol",
+    "openai-codex/gpt-5.6-luna",
+    "zai-coding-cn/glm5.3",
+  ]);
+  assert.deepEqual(DATASET.model.not_available_locally, ["opencode-go/deepseek-v4-flash"]);
+  assert.equal(LOCAL_PI_MODELS.includes(DATASET.model.selection), true);
+  assert.match(INTENDED_EVAL_COMMAND, /LARKIN_PI_TMUX_BASH_EVAL_MODEL=openai-codex\/gpt-5\.6-luna/);
+  if (requestedModel) assert.equal(LOCAL_PI_MODELS.includes(requestedModel), true);
   assert.equal(DATASET.standing_prompt_version, "larkin-standing-v30");
   assert.equal(DATASET.workspace.success_path, "isolated-git-fixture");
   assert.equal(DATASET.workspace.production_claim, "not-assumed");
@@ -178,8 +197,7 @@ async function runScenario(scenario) {
 
 for (const scenario of DATASET.scenarios) {
   if (scenarioFilter.size > 0 && !scenarioFilter.has(scenario.id)) continue;
-  test(`pi-tmux-bash scenario ${scenario.id} (${repetitions}x, threshold ${threshold})`, async () => {
-    if (!evalEnabled) return;
+  test.skipIf(!evalEnabled)(`pi-tmux-bash scenario ${scenario.id} (${repetitions}x, threshold ${threshold})`, async () => {
     const graded = [];
     for (let i = 0; i < repetitions; i++) graded.push(await runScenario(scenario));
     const summary = summarizePiTmuxBashEval(graded);
@@ -192,8 +210,7 @@ for (const scenario of DATASET.scenarios) {
   }, { timeout: 900_000 });
 }
 
-test("opt-in live RPC: isolated git fixture short command (not a production/non-git claim)", async () => {
-  if (!liveEnabled) return;
+test.skipIf(!liveEnabled)("opt-in live RPC: isolated git fixture short command (not a production/non-git claim)", async () => {
   const session = await startIsolatedPi({ git: true });
   try {
     assert.equal(session.workspace.gitFixture, true);
@@ -214,8 +231,7 @@ test("opt-in live RPC: isolated git fixture short command (not a production/non-
   }
 }, { timeout: 300_000 });
 
-test("opt-in live RPC: non-git cwd currently fails with upstream git-root error", async () => {
-  if (!liveEnabled) return;
+test.skipIf(!liveEnabled)("opt-in live RPC: non-git cwd currently fails with upstream git-root error", async () => {
   const session = await startIsolatedPi({ git: false });
   try {
     assert.equal(session.workspace.gitFixture, false);
@@ -230,7 +246,7 @@ test("opt-in live RPC: non-git cwd currently fails with upstream git-root error"
     const bashEnd = session.trace.find((event) => event?.type === "tool_execution_end" && event.toolName === "bash");
     const bashText = bashEnd?.result ? JSON.stringify(bashEnd.result) : String(bashEnd?.resultText || "");
     assert.match(bashText, UPSTREAM_NON_GIT_ERROR);
-    assert.equal(discoverIsolatedTmuxWindows(session.workspace).length, 0);
+    assert.equal(listIsolatedTmuxWindows(session.workspace.sessionName).length, 0);
     assert.equal(session.trace.some((event) =>
       event?.type === "tool_execution_start" && ["Agent", "supervised_start"].includes(event.toolName)), false);
     console.log("[live] non-git cwd currently failed as expected; do not treat this as production support");
@@ -239,44 +255,36 @@ test("opt-in live RPC: non-git cwd currently fails with upstream git-root error"
   }
 }, { timeout: 300_000 });
 
-test("opt-in live RPC: >60s timed-out-background and unprompted tmux-bash-completion turn", async () => {
-  if (!liveEnabled) return;
+test.skipIf(!liveEnabled)("opt-in live RPC: >60s timed-out-background and unprompted tmux-bash-completion turn", async () => {
   const session = await startIsolatedPi({ git: true });
   const marker = `LARKIN_TMUX_LIVE_${Date.now()}`;
-  const startedAt = Date.now();
+  const timedCommand = buildTimedCommand({ sleepSeconds: 65, marker });
   try {
     assertHeadlessExtensionFixtureArgs(session.args, session.packagePath);
+    assert.equal(session.selectedModel, session.requestedModel);
     await hostPrompt(session, [
       "Use only currently available tools and synthetic local commands. No Feishu.",
-      `Start exactly: sleep 65 && echo ${marker}`,
+      `Start exactly: ${timedCommand}`,
       "Use a short wait timeout (2-5 seconds) so the wait returns first. That timeout is not failure.",
       "Report any identifier and end the turn. Do not kill the process. Do not send a second host prompt.",
     ].join(" "));
+    const bashStart = await waitFor(session.trace, (event) =>
+      event?.type === "tool_execution_start" && event.toolName === "bash", 180_000);
+    assert.ok(bashStart, "lifetime is measured from the actual bash tool start, not the pre-model prompt");
     await waitFor(session.trace, (event) => event?.type === "tool_execution_end" && event.toolName === "bash", 180_000);
     const bashEnd = session.trace.find((event) => event?.type === "tool_execution_end" && event.toolName === "bash");
     const bashText = bashEnd?.result ? JSON.stringify(bashEnd.result) : "";
-    console.log(`[live] bash end resultKeys=${Object.keys(bashEnd?.result || {}).join(",") || "none"}`);
     assert.ok(extractTimedOutBackground(bashEnd) || extractTimedOutBackground(session.trace),
       `bash result must carry outcome timed-out-background: ${bashText.slice(0, 400)}`);
-    assert.match(bashText, /still running|background tmux|started in background|timed-out-background/i);
-    let windows = discoverIsolatedTmuxWindows(session.workspace);
-    if (windows.length === 0) {
-      await new Promise((resolve) => setTimeout(resolve, 1_000));
-      windows = discoverIsolatedTmuxWindows(session.workspace);
-    }
-    const windowId = (bashText.match(/@\d+/) || [])[0] || windows[0]?.id;
-    assert.ok(windowId, `must resolve a tmux window id from RPC or isolated session: ${bashText.slice(0, 400)} windows=${JSON.stringify(windows)}`);
-    console.log(`[live] timed-out-background ${windowId}; headless args=${session.args.join(" ")}`);
+    const windowId = windowIdFromResultOrTmux(bashText, session.workspace.sessionName);
+    assert.ok(windowId, `must resolve a tmux window id from RPC text or actual tmux list: ${bashText.slice(0, 400)}`);
+    const child = inspectRunningTmuxChild(session.workspace.sessionName, windowId);
+    assert.equal(child.running, true,
+      `actual child under tmux ${windowId} must still be running after wait timeout: ${JSON.stringify(child.processes)}`);
+    console.log(`[live] timed-out-background ${windowId} childPid=${child.panePid} requested=${session.requestedModel} actual=${session.selectedModel}`);
 
     const firstEnd = await waitFor(session.trace, (event) => event?.type === "agent_end", 180_000);
     assert.equal(session.hostPromptCount, 1, "first turn must be the only host prompt so far");
-
-    const remaining = 61_000 - (Date.now() - startedAt);
-    if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
-    const still = discoverIsolatedTmuxWindows(session.workspace);
-    assert.ok(still.some((window) => window.id === windowId),
-      `tmux window ${windowId} must still exist after 60s in ${session.workspace.sessionName}: ${JSON.stringify(still)}`);
-    assert.ok(Date.now() - startedAt >= 60_000, "process must be observed after 60 seconds");
 
     await waitFor(session.trace, (event) => extractTmuxBashCompletion(event) || extractTmuxBashCompletion(session.trace), 90_000);
     assert.equal(session.hostPromptCount, 1, "tmux-bash-completion must arrive on an unprompted second turn");
@@ -284,8 +292,13 @@ test("opt-in live RPC: >60s timed-out-background and unprompted tmux-bash-comple
     assert.ok(unprompted?.completion, "unprompted second turn must carry tmux-bash-completion");
     assert.ok(unprompted.turnStart || unprompted.agentEnd,
       "headless RPC must emit turn_start or a second agent_end for the completion followUp");
-    assert.match(JSON.stringify(unprompted.completion), new RegExp(marker));
-    console.log("[live] unprompted tmux-bash-completion turn received; TUI was not required");
+    const completionText = JSON.stringify(unprompted.completion);
+    assert.match(completionText, new RegExp(marker));
+    const runtime = parseCommandRuntime(completionText);
+    assert.ok(runtime, `completion must include in-command start/end timestamps: ${completionText.slice(0, 400)}`);
+    assert.ok(runtime.runtimeMs > 60_000,
+      `in-command runtime ${runtime.runtimeMs}ms must exceed 60s (start=${runtime.startSec} end=${runtime.endSec})`);
+    console.log(`[live] in-command runtime ${runtime.runtimeMs}ms; TUI was not required`);
     await waitUntilIdle(session, 60_000).catch(() => {});
 
     if (!session.trace.some((event) =>

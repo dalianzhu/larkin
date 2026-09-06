@@ -18,21 +18,31 @@ import {
 } from "../../support/pi-tmux-bash-grader.mjs";
 import {
   HEADLESS_PI_RPC_PREFIX,
+  INTENDED_EVAL_COMMAND,
   INTENDED_EVAL_SCRIPT,
+  LOCAL_PI_MODELS,
   PINNED_PLUGIN,
+  UNAVAILABLE_PI_MODELS,
   UPSTREAM_NON_GIT_ERROR,
   assertHeadlessExtensionFixtureArgs,
+  assertRequestedModelUsed,
   assertUserPiSettingsUnchanged,
   buildPiRpcArgs,
+  buildTimedCommand,
   createIsolatedTmuxWorkspace,
+  descendantProcesses,
   killIsolatedTmuxSession,
   packageHasResolvableDependencies,
+  parseCommandRuntime,
+  parsePsAxRows,
   prepareIsolatedTmuxBashPackage,
   readPinnedPluginManifest,
+  requireExplicitEvalModel,
   resolveTmuxBashLoadMode,
   resolveTmuxBashPackagePath,
   resolveUserInstalledTmuxBashPackage,
   snapshotUserPiSettings,
+  windowIdFromResultOrTmux,
 } from "../../support/pi-tmux-bash-live-harness.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "../../..");
@@ -65,7 +75,12 @@ test("pi-tmux-bash dataset pins version, threshold, external plugin 0.0.12, and 
   assert.equal(DATASET.harness.tui_independent, true);
   assert.equal(DATASET.harness.intended_script, INTENDED_EVAL_SCRIPT);
   assert.deepEqual(DATASET.harness.pi_args, ["--mode", "rpc", "--no-session", "--no-extensions", "-e"]);
-  assert.equal(DATASET.model.selection, "opencode-go/deepseek-v4-flash");
+  assert.equal(DATASET.model.selection, "openai-codex/gpt-5.6-luna");
+  assert.equal(DATASET.model.requires_explicit_env, true);
+  assert.deepEqual(DATASET.model.local_available, LOCAL_PI_MODELS);
+  assert.deepEqual(DATASET.model.not_available_locally, UNAVAILABLE_PI_MODELS);
+  assert.equal(LOCAL_PI_MODELS.includes(DATASET.model.selection), true);
+  assert.match(INTENDED_EVAL_COMMAND, /LARKIN_PI_TMUX_BASH_EVAL_MODEL=openai-codex\/gpt-5\.6-luna/);
   assert.equal(DATASET.threshold, 0.6);
   assert.equal(DATASET.core_acceptance_rate, 1);
   assert.match(DATASET.threshold_rationale, /natural user request/);
@@ -321,5 +336,66 @@ test("prompt-eval files do not commit machine-specific package paths or a missin
     assert.doesNotMatch(text, /\/tmp\/larkin-tmux-package/);
     assert.doesNotMatch(text, /DEFAULT_EXTRACTED_PACKAGE|DEFAULT_ISOLATED_PACKAGE/);
     assert.doesNotMatch(text, /expected to have no license field/);
+    assert.doesNotMatch(text, /discoverIsolatedTmuxWindows/);
   }
+});
+
+test("real Pi runs require an explicit local model and refuse silent fallback", () => {
+  assert.throws(() => requireExplicitEvalModel({}), /LARKIN_PI_TMUX_BASH_EVAL_MODEL is required/);
+  assert.throws(() => requireExplicitEvalModel({ LARKIN_PI_TMUX_BASH_EVAL_MODEL: "" }), /required/);
+  assert.throws(
+    () => requireExplicitEvalModel({ LARKIN_PI_TMUX_BASH_EVAL_MODEL: "opencode-go/deepseek-v4-flash" }),
+    /not available/,
+  );
+  assert.throws(
+    () => requireExplicitEvalModel({ LARKIN_PI_TMUX_BASH_EVAL_MODEL: "openai-codex/gpt-5.6-terra" }),
+    /not in the recorded local available list/,
+  );
+  assert.equal(
+    requireExplicitEvalModel({ LARKIN_PI_TMUX_BASH_EVAL_MODEL: "openai-codex/gpt-5.6-luna" }),
+    "openai-codex/gpt-5.6-luna",
+  );
+  assert.deepEqual(
+    assertRequestedModelUsed("openai-codex/gpt-5.6-luna", "openai-codex/gpt-5.6-luna"),
+    { requested: "openai-codex/gpt-5.6-luna", actual: "openai-codex/gpt-5.6-luna", recorded: "openai-codex/gpt-5.6-luna", matched: true },
+  );
+  assert.throws(
+    () => assertRequestedModelUsed("openai-codex/gpt-5.6-luna", "openai-codex/gpt-5.6-sol"),
+    /recorded actual=openai-codex\/gpt-5\.6-sol/,
+  );
+});
+
+test("command runtime is taken from in-command timestamps, not leftover tmux windows or .out names", () => {
+  const command = buildTimedCommand({ sleepSeconds: 65, marker: "larkin-runtime-marker" });
+  assert.match(command, /LARKIN_CMD_START=/);
+  assert.match(command, /LARKIN_CMD_END=/);
+  assert.match(command, /LARKIN_CMD_RUNTIME_MS=/);
+  assert.match(command, /time\.sleep\(65\)/);
+  const runtime = parseCommandRuntime("LARKIN_CMD_START=1000.000 LARKIN_CMD_END=1065.250 LARKIN_CMD_RUNTIME_MS=65250 larkin-runtime-marker");
+  assert.deepEqual(runtime, { startSec: 1000, endSec: 1065.25, runtimeMs: 65250 });
+  assert.ok(runtime.runtimeMs > 60_000);
+  assert.equal(parseCommandRuntime("window @9 still exists"), null);
+
+  const rows = parsePsAxRows([
+    "  10   1 /bin/zsh",
+    "  11  10 python3 -c sleep",
+    "  12  11 /bin/sleep 65",
+    "  99  1 leftover-shell",
+  ].join("\n"));
+  assert.deepEqual(descendantProcesses(rows, 10).map((row) => row.pid), ["11", "12"]);
+  assert.equal(descendantProcesses(rows, 99).length, 0);
+
+  const harness = fs.readFileSync(path.join(ROOT, "test/support/pi-tmux-bash-live-harness.mjs"), "utf8");
+  assert.doesNotMatch(harness, /readdirSync\(outputDir\)|readdirSync\(workspace\.outputDir\)/);
+  assert.doesNotMatch(harness, /\.out\b/);
+  assert.doesNotMatch(harness, /command:\s*"output-dir"/);
+  assert.match(harness, /list-windows/);
+  assert.equal(windowIdFromResultOrTmux("Still running in background tmux window @42", "missing-session"), "@42");
+
+  const live = fs.readFileSync(path.join(ROOT, "test/live/pi-tmux-bash-live.test.mjs"), "utf8");
+  assert.match(live, /test\.skipIf\(!evalEnabled\)/);
+  assert.match(live, /test\.skipIf\(!liveEnabled\)/);
+  assert.doesNotMatch(live, /if\s*\(!evalEnabled\)\s*return/);
+  assert.doesNotMatch(live, /if\s*\(!liveEnabled\)\s*return/);
+  assert.doesNotMatch(live, /discoverIsolatedTmuxWindows/);
 });

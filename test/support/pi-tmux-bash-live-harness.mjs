@@ -8,8 +8,14 @@ export const PINNED_PLUGIN = { name: "@richardgill/pi-tmux-bash", version: "0.0.
 export const UPSTREAM_NON_GIT_ERROR = /not in a git repository/i;
 export const INTENDED_EVAL_SCRIPT = "test:eval:pi-tmux-bash";
 export const INTENDED_EVAL_COMMAND =
-  "bun run build && LARKIN_RUN_PI_TMUX_BASH_EVAL=1 bun test --max-concurrency 1 test/live/pi-tmux-bash-live.test.mjs";
+  "bun run build && LARKIN_RUN_PI_TMUX_BASH_EVAL=1 LARKIN_PI_TMUX_BASH_EVAL_MODEL=openai-codex/gpt-5.6-luna bun test --max-concurrency 1 test/live/pi-tmux-bash-live.test.mjs";
 export const HEADLESS_PI_RPC_PREFIX = ["--mode", "rpc", "--no-session", "--no-context-files"];
+export const LOCAL_PI_MODELS = [
+  "openai-codex/gpt-5.6-sol",
+  "openai-codex/gpt-5.6-luna",
+  "zai-coding-cn/glm5.3",
+];
+export const UNAVAILABLE_PI_MODELS = ["opencode-go/deepseek-v4-flash"];
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -210,6 +216,78 @@ export function standingPromptFile(workspace, content) {
   return file;
 }
 
+export function requireExplicitEvalModel(env = process.env) {
+  const model = String(env.LARKIN_PI_TMUX_BASH_EVAL_MODEL || "").trim();
+  if (!model) {
+    throw new Error("LARKIN_PI_TMUX_BASH_EVAL_MODEL is required for real Pi runs; dataset.model.selection is not a silent fallback");
+  }
+  if (UNAVAILABLE_PI_MODELS.includes(model)) {
+    throw new Error(`${model} is not available on this host (pi --list-models); set LARKIN_PI_TMUX_BASH_EVAL_MODEL to one of ${LOCAL_PI_MODELS.join(", ")}`);
+  }
+  if (!LOCAL_PI_MODELS.includes(model)) {
+    throw new Error(`LARKIN_PI_TMUX_BASH_EVAL_MODEL=${model} is not in the recorded local available list (${LOCAL_PI_MODELS.join(", ")}); refusing silent fallback`);
+  }
+  return model;
+}
+
+export function selectedPiModel(state) {
+  if (state?.model?.provider && state?.model?.id) return `${state.model.provider}/${state.model.id}`;
+  return String(state?.model?.id || "");
+}
+
+export function assertRequestedModelUsed(requested, actual) {
+  if (requested && requested === actual) return { requested, actual, recorded: actual, matched: true };
+  throw new Error(`requested model ${requested || "(none)"} but Pi selected ${actual || "(none)"}; recorded actual=${actual || "(none)"}; refusing silent fallback`);
+}
+
+export function buildTimedCommand({ sleepSeconds = 65, marker }) {
+  if (!marker) throw new Error("timed command requires a marker");
+  const safeMarker = String(marker).replace(/'/g, "");
+  return [
+    "python3 -c",
+    `'import time; start=time.time(); print("LARKIN_CMD_START=%.3f"%start, flush=True); time.sleep(${Number(sleepSeconds)}); end=time.time(); print("LARKIN_CMD_END=%.3f"%end, flush=True); print("LARKIN_CMD_RUNTIME_MS=%d"%int((end-start)*1000), flush=True); print("${safeMarker}", flush=True)'`,
+  ].join(" ");
+}
+
+export function parseCommandRuntime(text) {
+  const encoded = String(text || "");
+  const start = /LARKIN_CMD_START=([0-9.]+)/.exec(encoded);
+  const end = /LARKIN_CMD_END=([0-9.]+)/.exec(encoded);
+  const ms = /LARKIN_CMD_RUNTIME_MS=(\d+)/.exec(encoded);
+  if (!start || !end) return null;
+  const startSec = Number(start[1]);
+  const endSec = Number(end[1]);
+  return {
+    startSec,
+    endSec,
+    runtimeMs: ms ? Number(ms[1]) : Math.round((endSec - startSec) * 1000),
+  };
+}
+
+export function parsePsAxRows(text) {
+  return String(text || "").split("\n").map((line) => {
+    const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+    return match ? { pid: match[1], ppid: match[2], command: match[3] } : null;
+  }).filter(Boolean);
+}
+
+export function descendantProcesses(rows, rootPid) {
+  const wanted = new Set([String(rootPid)]);
+  const descendants = [];
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const row of rows) {
+      if (wanted.has(String(row.ppid)) && !wanted.has(String(row.pid))) {
+        wanted.add(String(row.pid));
+        descendants.push(row);
+        grew = true;
+      }
+    }
+  }
+  return descendants;
+}
+
 export function listIsolatedTmuxWindows(sessionName) {
   const listed = spawnSync("tmux", [
     "list-windows", "-t", sessionName, "-F", "#{window_id}\t#{window_name}\t#{pane_pid}\t#{pane_current_command}",
@@ -221,17 +299,22 @@ export function listIsolatedTmuxWindows(sessionName) {
   });
 }
 
-export function discoverIsolatedTmuxWindows(workspace) {
-  const fromSession = listIsolatedTmuxWindows(workspace.sessionName);
-  if (fromSession.length > 0) return fromSession;
-  if (!fs.existsSync(workspace.outputDir)) return [];
-  const names = fs.readdirSync(workspace.outputDir);
-  const ids = new Set();
-  for (const name of names) {
-    const match = /(@\d+)/.exec(name);
-    if (match) ids.add(match[1]);
-  }
-  return [...ids].map((id) => ({ id, name: "", panePid: "", command: "output-dir" }));
+export function windowIdFromResultOrTmux(resultText, sessionName) {
+  const fromResult = String(resultText || "").match(/@\d+/);
+  if (fromResult) return fromResult[0];
+  const windows = listIsolatedTmuxWindows(sessionName);
+  return windows.length === 1 ? windows[0].id : null;
+}
+
+export function inspectRunningTmuxChild(sessionName, windowId) {
+  const windows = listIsolatedTmuxWindows(sessionName);
+  const window = windows.find((item) => item.id === windowId);
+  if (!window?.panePid) return { window: window || null, running: false, processes: [] };
+  const listed = spawnSync("ps", ["-ax", "-o", "pid=,ppid=,command="], { encoding: "utf8" });
+  const processes = descendantProcesses(parsePsAxRows(listed.stdout), window.panePid);
+  const running = processes.some((proc) => /\b(sleep|python3?)\b/.test(proc.command))
+    || /\b(sleep|python3?)\b/.test(window.command || "");
+  return { window, panePid: window.panePid, processes, running };
 }
 
 export function killIsolatedTmuxSession(sessionName) {
