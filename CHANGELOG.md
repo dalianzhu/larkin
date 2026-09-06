@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.5
+
+Pi no longer injects Larkin-managed `pi-subagents`, the 60-second bash timeout guard, or the supervised-command bundle. Long-running commands use a user-installed `@richardgill/pi-tmux-bash` discovered by Pi itself; Larkin does not redistribute that plugin. Autonomous `tmux-bash-completion` follow-up turns occupy Runtime busy state and do not schedule a second host prompt. Historical subagent ledgers remain for recovery compatibility.
+
 ## 0.5.4
 
 Inbox Audit is now optional and off by default. The Dashboard and CLI support global and per-Agent switches and inspection gaps. Saving a gap updates scheduling without replacing Runtime sessions; editing a gap alone does not enable auditing. Only originally wake-eligible human group/topic work is audited.

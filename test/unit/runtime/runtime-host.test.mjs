@@ -2966,6 +2966,34 @@ test("RuntimeHost acknowledges an in-turn completion and does not wake again aft
   }
 });
 
+test("RuntimeHost treats a Pi tmux followUp turn as busy and does not schedule a second prompt", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-host-tmux-followup-"));
+  const session = new FakeSession();
+  const adapter = { id: "pi", capabilities: {}, async createSession() { return session; } };
+  const host = createRuntimeHost({
+    adapterFor: () => adapter,
+    promptBuilder: new ContextPromptBuilder(),
+    subagentReconcileIntervalMs: 0,
+  });
+  try {
+    await host.start([{ agentId: "cli_piTmuxFollowA1", name: "tmux-follow", runtime: "pi", model: "model", workspaceDir: "/tmp", stateDir: root }]);
+    await host.deliver("cli_piTmuxFollowA1", { message_id: "om_pi_tmux_follow", chat_id: "oc_pi_tmux_follow", content: "start" });
+    session.emit({ type: "turn-start" });
+    session.emit({ type: "turn-end" });
+    assert.equal(session.prompts.length, 1);
+    session.emit({ type: "turn-start", turnId: "pi-followup" });
+    assert.equal(host.isBusy("cli_piTmuxFollowA1"), true);
+    assert.equal(session.prompts.length, 1, "followUp turn must not cause a second host prompt");
+    session.emit({ type: "turn-end" });
+    for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(session.prompts.length, 1, "settling the followUp turn must not re-prompt");
+    assert.equal(host.isBusy("cli_piTmuxFollowA1"), false);
+  } finally {
+    await host.shutdown("done");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("RuntimeHost does not ack a completion from a failed owning turn so retry and restart can still wake", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-host-failed-owning-"));
   const session = new FakeSession();

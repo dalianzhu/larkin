@@ -20,6 +20,7 @@ import {
   buildCanonicalPiSubagentAssistantMessage,
   buildCanonicalPiSubagentNotificationContent,
 } from "../../../dist/runtime/pi-subagents-notification.mjs";
+import { buildTmuxBashFollowUpMessage } from "../../../dist/runtime/pi-tmux-bash-followup.mjs";
 import { classifyStrictProviderError } from "../../../dist/runtime/provider-error-classifier.mjs";
 import { RuntimePrerequisiteError } from "../../../dist/runtime/runtime-readiness.mjs";
 
@@ -742,6 +743,88 @@ test("Pi repeated canonical late completion notifications only bridge once", asy
   assert.equal(observations[0].completionKey, "task-bridge-repeat");
 });
 
+test("Pi tmux-bash-completion followUp occupies an autonomous turn and does not emit a host-wake key", async () => {
+  let listener;
+  const sdk = {
+    sessionId: "pi-tmux-followup", prompt() {}, steer() {}, abort() {},
+    subscribe(next) { listener = next; return () => {}; },
+  };
+  const session = await createNativeRuntimeAdapter("pi", {
+    createPiSession: async () => sdk,
+    env: { LARKIN_PI_DISTRIBUTION: "builtin" },
+  }).createSession(create());
+  const events = [];
+  session.subscribe((event) => events.push(event));
+  listener({ type: "turn_start", turnIndex: 4 });
+  listener({
+    type: "agent_end",
+    willRetry: false,
+    messages: [buildTmuxBashFollowUpMessage("tmux-bash-completion", "Command finished (exit 0)\n\n```\ndone\n```")],
+  });
+  listener({ type: "agent_settled" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events.filter((event) => event.type === "turn-start" || event.type === "turn-end").map((event) => event.type),
+    ["turn-start", "turn-end"]);
+  assert.deepEqual(events.filter((event) => event.type === "runtime-observation" && event.completionKey), []);
+});
+
+test("Pi tmux-bash-completion without turn_start still accounts busy then settles once", async () => {
+  let listener;
+  const sdk = {
+    sessionId: "pi-tmux-late-followup", prompt() {}, steer() {}, abort() {},
+    subscribe(next) { listener = next; return () => {}; },
+  };
+  const session = await createNativeRuntimeAdapter("pi", {
+    createPiSession: async () => sdk,
+    env: { LARKIN_PI_DISTRIBUTION: "builtin" },
+  }).createSession(create());
+  const events = [];
+  session.subscribe((event) => events.push(event));
+  listener({
+    type: "agent_end",
+    willRetry: false,
+    messages: [buildTmuxBashFollowUpMessage("tmux-bash-completion", "Command finished (exit 1)")],
+  });
+  listener({ type: "agent_settled" });
+  listener({
+    type: "agent_end",
+    willRetry: false,
+    messages: [buildTmuxBashFollowUpMessage("tmux-bash-completion", "Command finished (exit 1)")],
+  });
+  listener({ type: "agent_settled" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events.filter((event) => event.type === "turn-start" || event.type === "turn-end").map((event) => event.type),
+    ["turn-start", "turn-end"]);
+  assert.deepEqual(events.filter((event) => event.type === "runtime-observation" && event.completionKey), []);
+});
+
+test("Pi busy steer during a tmux followUp turn attaches to that turn instead of opening another epoch", async () => {
+  let listener;
+  const calls = [];
+  const sdk = {
+    sessionId: "pi-tmux-busy-steer",
+    prompt(text) { calls.push(["prompt", text]); },
+    steer(text) { calls.push(["steer", text]); },
+    abort() {},
+    subscribe(next) { listener = next; return () => {}; },
+  };
+  const session = await createNativeRuntimeAdapter("pi", {
+    createPiSession: async () => sdk,
+    env: { LARKIN_PI_DISTRIBUTION: "builtin" },
+  }).createSession(create());
+  listener({ type: "turn_start" });
+  listener({
+    type: "agent_end",
+    willRetry: false,
+    messages: [buildTmuxBashFollowUpMessage("tmux-bash-completion", "still wrapping up")],
+  });
+  const result = await session.busyInput({ inputId: "inbox-1", kind: "inbox_update", text: "new inbox", attempt: 0 });
+  assert.deepEqual(result, { status: "accepted", inputId: "inbox-1" });
+  listener({ type: "agent_settled" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, [["steer", "new inbox"]]);
+});
+
 test("Pi background Agent tool results emit a dispatched-task observation", async () => {
   let listener;
   const sdk = {
@@ -919,19 +1002,11 @@ test("Pi initialization caps eight concurrent adapters and releases a failed per
   assert.equal(results.filter((result) => result.status === "fulfilled").length, 7);
 });
 
-test.each(["win32", "linux"])("Pi retains all -e extension args on simulated %s", (platform) => {
+test.each(["win32", "linux"])("Pi does not inject Larkin -e extensions on simulated %s", (platform) => {
   const args = resolvePiProcessExtensionArgs({
     distribution: "external", piCommand: "external-pi", env: {}, platform,
-  }, {
-    subagents: () => "/fixture/pi-subagents.bundle.js",
-    bashTimeout: () => "/fixture/pi-bash-timeout.bundle.js",
-    recordWatchdog: () => "/fixture/pi-subagent-record-watchdog.bundle.js",
   });
-  assert.deepEqual(args, [
-    "-e", "/fixture/pi-subagent-record-watchdog.bundle.js",
-    "-e", "/fixture/pi-subagents.bundle.js",
-    "-e", "/fixture/pi-bash-timeout.bundle.js",
-  ], "watchdog must precede the subagent extension so shutdown can still read getRecord");
+  assert.deepEqual(args, []);
 });
 
 test("Pi launches one shared append standing-prompt path without replacement", async () => {
@@ -1019,13 +1094,7 @@ test("inherited PI_PACKAGE_DIR does not drop production extension version probes
     for (let index = 0; index < sessionLaunch.args.length; index += 1) {
       if (sessionLaunch.args[index] === "-e") extensionPaths.push(sessionLaunch.args[index + 1]);
     }
-    assert.equal(extensionPaths.length, 3, JSON.stringify(sessionLaunch.args));
-    const expected = [
-      path.join(ADAPTERS_ROOT, "dist", "runtime", "pi-bash-timeout.bundle.js"),
-      path.join(ADAPTERS_ROOT, "dist", "runtime", "pi-subagent-record-watchdog.bundle.js"),
-      path.join(ADAPTERS_ROOT, "dist", "runtime", "pi-subagents.bundle.js"),
-    ].map((entry) => fs.realpathSync(entry)).sort();
-    assert.deepEqual(extensionPaths.map((entry) => fs.realpathSync(entry)).sort(), expected);
+    assert.deepEqual(extensionPaths, [], JSON.stringify(sessionLaunch.args));
     assert.equal(session.effectiveModel, "test-provider/test-model");
   } finally {
     await session?.close("inherited extension probe test complete").catch(() => {});

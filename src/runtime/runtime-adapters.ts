@@ -18,14 +18,12 @@ import type {
 import { isPiThinkingLevel } from "./pi-model-catalog.js";
 import { PiRpcClient, type PiRpcClientOptions } from "./pi-rpc-client.js";
 import { traceProcessBoundary } from "../platform/process-boundary-trace.js";
-import { resolvePiSubagentExtensionArg } from "./pi-subagent-injection.js";
 import {
   extractCanonicalPiSubagentNotification,
   ledgerStatusFromPiNotificationStatus,
 } from "./pi-subagents-notification.js";
-import { resolvePiSubagentRecordWatchdogExtensionArg } from "./pi-subagent-record-watchdog-injection.js";
 import { effectivePiStateDir, extractBackgroundPiSubagentDispatch } from "./pi-subagent-ledger.js";
-import { resolvePiBashTimeoutExtensionArg } from "./pi-bash-timeout-injection.js";
+import { extractTmuxBashFollowUp } from "./pi-tmux-bash-followup.js";
 import {
   classifyPiMissingCredentialRejection,
   classifyRuntimePrerequisite,
@@ -561,6 +559,7 @@ class PiSession extends EventSession {
   private readonly observedBackgroundCompletionKeys = new Set<string>();
   private readonly pendingUnownedCompletionKeys = new Set<string>();
   private readonly pendingUnownedCompletionStatuses = new Map<string, Record<string, "completed" | "failed" | "cancelled" | "timed_out">>();
+  private readonly observedTmuxFollowUpKeys = new Set<string>();
   private readonly observedAgentEndEpochs = new Set<number>();
   private firstOutputObserved = false;
   private toolCallOpen = false;
@@ -604,8 +603,8 @@ class PiSession extends EventSession {
   async close(_reason: string): Promise<void> { this.unsubscribe?.(); await this.sdk.dispose?.(); }
 
   private async enqueue(input: RuntimeInput, operation: () => Promise<unknown> | unknown): Promise<RuntimeInputResult> {
-    if (this.ownedInputIds.size === 0) this.requestEpoch += 1;
-    const epoch = this.requestEpoch;
+    if (this.ownedInputIds.size === 0 && this.activeEpoch === null) this.requestEpoch += 1;
+    const epoch = this.activeEpoch ?? this.requestEpoch;
     this.ownedInputIds.add(input.inputId);
     this.inputEpochs.set(input.inputId, epoch);
     this.awaitingAcknowledgement.add(input.inputId);
@@ -670,6 +669,7 @@ class PiSession extends EventSession {
       this.observedBackgroundCompletionKeys.clear();
       this.pendingUnownedCompletionKeys.clear();
       this.pendingUnownedCompletionStatuses.clear();
+      this.observedTmuxFollowUpKeys.clear();
       this.observedAgentEndEpochs.clear();
       this.activeEpoch = null;
       this.settleArmedEpoch = null;
@@ -686,13 +686,18 @@ class PiSession extends EventSession {
       this.emitObservation("retry_progress");
     } else if (event?.type === "turn_start") {
       const epoch = this.oldestOwnedEpoch();
-      if (epoch === null || this.activeEpoch !== null) return;
-      this.activeEpoch = epoch;
-      this.settleArmedEpoch = null;
-      this.firstOutputObserved = false;
-      this.toolCallOpen = false;
-      this.emitObservation("turn_start");
-      this.emit({ type: "turn-start", ...(Number.isInteger(event.turnIndex) ? { turnId: `pi-${event.turnIndex}` } : {}) });
+      if (epoch !== null) {
+        if (this.activeEpoch !== null) return;
+        this.activeEpoch = epoch;
+        this.settleArmedEpoch = null;
+        this.firstOutputObserved = false;
+        this.toolCallOpen = false;
+        this.emitObservation("turn_start");
+        this.emit({ type: "turn-start", ...(Number.isInteger(event.turnIndex) ? { turnId: `pi-${event.turnIndex}` } : {}) });
+        return;
+      }
+      // Extension followUp / triggerTurn starts a Pi-owned turn with no host prompt.
+      this.beginAutonomousFollowUpTurn(Number.isInteger(event.turnIndex) ? `pi-${event.turnIndex}` : undefined);
     }
     else if (event?.type === "agent_end") {
       const assistant = [...(Array.isArray(event.messages) ? event.messages : [])]
@@ -713,6 +718,14 @@ class PiSession extends EventSession {
       if (event.willRetry !== true && this.activeEpoch !== null && !this.observedCompletedEpochs.has(this.activeEpoch)) {
         this.observedCompletedEpochs.add(this.activeEpoch);
         this.emitObservation("completed");
+      }
+      const tmuxFollowUp = extractTmuxBashFollowUp(event.messages);
+      if (tmuxFollowUp && !this.observedTmuxFollowUpKeys.has(tmuxFollowUp.key)) {
+        this.observedTmuxFollowUpKeys.add(tmuxFollowUp.key);
+        // Pi already triggerTurn'd this followUp. Account for the notification
+        // turn, but never emit a host-wake completionKey.
+        if (this.activeEpoch === null) this.beginAutonomousFollowUpTurn();
+        if (this.settleArmedEpoch === null) this.settleArmedEpoch = this.activeEpoch;
       }
       const completionNotification = extractCanonicalPiSubagentNotification(event.messages);
       if (completionNotification && !this.observedBackgroundCompletionKeys.has(completionNotification.key)) {
@@ -849,6 +862,17 @@ class PiSession extends EventSession {
     if (inputId) Object.defineProperty(observation, "inputId", { value: inputId, enumerable: false });
     if (fields.completionKey) Object.defineProperty(observation, "completionKey", { value: fields.completionKey, enumerable: false });
     this.emit(observation as NormalizedRuntimeEvent);
+  }
+
+  private beginAutonomousFollowUpTurn(turnId?: string): void {
+    if (this.activeEpoch !== null) return;
+    this.requestEpoch += 1;
+    this.activeEpoch = this.requestEpoch;
+    this.settleArmedEpoch = null;
+    this.firstOutputObserved = false;
+    this.toolCallOpen = false;
+    this.emitObservation("turn_start");
+    this.emit({ type: "turn-start", ...(turnId ? { turnId } : {}) });
   }
 
   private oldestOwnedInput(): string | undefined {
@@ -1081,27 +1105,14 @@ class PiRpcBackend implements PiSessionProcessLike {
   }
 }
 
-export function resolvePiProcessExtensionArgs(input: {
+/** Larkin no longer injects Pi extensions; user-installed packages load through normal Pi discovery. */
+export function resolvePiProcessExtensionArgs(_input?: {
   distribution?: "external";
   piCommand: string;
   env: NodeJS.ProcessEnv;
   platform: NodeJS.Platform;
-}, resolvers: {
-  subagents?: typeof resolvePiSubagentExtensionArg;
-  bashTimeout?: typeof resolvePiBashTimeoutExtensionArg;
-  recordWatchdog?: typeof resolvePiSubagentRecordWatchdogExtensionArg;
-} = {}): string[] {
-  const resolverInput = { distribution: "external" as const, piCommand: input.piCommand, env: input.env };
-  const args: string[] = [];
-  // Watchdog must load before the subagent extension so session_shutdown still
-  // sees AgentManager.getRecord and can bridge consumed or terminal state.
-  const recordWatchdog = (resolvers.recordWatchdog ?? resolvePiSubagentRecordWatchdogExtensionArg)(resolverInput);
-  if (recordWatchdog) args.push("-e", recordWatchdog);
-  const subagents = (resolvers.subagents ?? resolvePiSubagentExtensionArg)(resolverInput);
-  if (subagents) args.push("-e", subagents);
-  const bashTimeout = (resolvers.bashTimeout ?? resolvePiBashTimeoutExtensionArg)(resolverInput);
-  if (bashTimeout) args.push("-e", bashTimeout);
-  return args;
+}): string[] {
+  return [];
 }
 
 async function createPiRpcBackend(input: RuntimeSessionCreate, dependencies: NativeRuntimeAdapterDependencies,

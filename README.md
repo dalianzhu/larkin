@@ -91,7 +91,7 @@ Feishu (https://open.feishu.cn) and Lark (https://open.larksuite.com) are differ
 
 During setup, choose one of the three externally installed runtimes: Pi (`pi`), Codex (`codex`), or Claude Code (`claude`). Larkin does not ship a runtime and does not store provider credentials. Install the runtime yourself and complete its own login (`pi` login flow, `codex login`, or `claude login`) before setup. Interactive setup lists each runtime as installed or not installed and refuses a missing binary; non-interactive setup requires `--runtime` and exits non-zero with the same missing-install message.
 
-`larkin setup --model <id>` optionally stores a catalog model for that runtime. After setup, use `larkin model` and `larkin runtime` to inspect or switch. For Pi, Larkin talks to your installed `pi --mode rpc`, verifies the RPC handshake and compaction capability contract, and injects its supported extensions through `pi -e` (background subagents and the 60-second foreground bash timeout guard).
+`larkin setup --model <id>` optionally stores a catalog model for that runtime. After setup, use `larkin model` and `larkin runtime` to inspect or switch. For Pi, Larkin talks to your installed `pi --mode rpc` and verifies the RPC handshake and compaction capability contract. Optional long-running bash uses a user-installed `@richardgill/pi-tmux-bash` that Pi loads from its own package list; Larkin does not inject or redistribute that plugin, and tmux is required when it is installed. Without the plugin, Pi keeps native bash.
 
 ### Optional Inbox Audit
 
