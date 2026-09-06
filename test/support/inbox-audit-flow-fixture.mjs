@@ -21,12 +21,27 @@ function eventForTarget(target, anchor) {
   return { chat_id: parts[1], thread_id: parts[2], message_id: anchor };
 }
 
-async function observeFixtureTarget(sourceRoot, registryFile, agentId, target, anchor, now) {
+async function observeFixtureTarget(sourceRoot, root, registryFile, agentId, target, anchor, now) {
   if (!sourceRoot) throw new Error("fixture setup requires --source-root");
-  const module = await import(pathToFileURL(path.join(sourceRoot, "dist", "agent", "missed-outbound-scan.mjs")).href);
+  const [stateModule, auditModule] = await Promise.all([
+    import(pathToFileURL(path.join(sourceRoot, "dist", "agent", "agent-state-store.mjs")).href),
+    import(pathToFileURL(path.join(sourceRoot, "dist", "agent", "missed-outbound-scan.mjs")).href),
+  ]);
   const event = eventForTarget(target, anchor);
-  return module.observeInboxAuditTarget(registryFile, agentId, {
+  const store = stateModule.createAgentStateStore(root, agentId);
+  const appended = store.appendCanonicalInboxOnce({
+    message_id: anchor,
+    chat_id: event.chat_id,
+    ...(event.thread_id ? { thread_id: event.thread_id } : {}),
+    content: "synthetic audit source",
+    wake: true,
+  });
+  if (appended.status !== "appended" || !Number.isSafeInteger(appended.envelope?.target_seq)) {
+    throw new Error("fixture canonical Inbox append did not produce target_seq");
+  }
+  return auditModule.observeInboxAuditTarget(registryFile, agentId, {
     ...event, chat_type: "group", wake: true, _sender_is_bot: false, _scan_authority: true,
+    source_seq: appended.envelope.target_seq,
   }, now);
 }
 
@@ -40,7 +55,7 @@ export async function createInboxAuditFixture({ root, scenario, sourceRoot }) {
     activeAgent: agentId,
     agents: { [agentId]: { runtime: "codex", model: "gpt-5.6-sol" } },
   });
-  await observeFixtureTarget(sourceRoot, path.join(fixtureRoot, "inbox-audit.json"), agentId,
+  await observeFixtureTarget(sourceRoot, fixtureRoot, path.join(fixtureRoot, "inbox-audit.json"), agentId,
     scenario.fixture.target, scenario.fixture.anchor, new Date(FIXTURE_TIME));
   fs.writeFileSync(path.join(fixtureRoot, "trace.ndjson"), "", { mode: 0o600 });
   writePrivate(path.join(fixtureRoot, "history.json"), {
@@ -53,7 +68,7 @@ export async function createInboxAuditFixture({ root, scenario, sourceRoot }) {
 
 export async function advanceFixtureAnchor(root, scenario, sourceRoot, agentId = FIXTURE_AGENT_ID) {
   const file = path.join(root, "inbox-audit.json");
-  const observed = await observeFixtureTarget(sourceRoot, file, agentId, scenario.fixture.target,
+  const observed = await observeFixtureTarget(sourceRoot, root, file, agentId, scenario.fixture.target,
     scenario.fixture.new_anchor, new Date("2026-09-06T00:01:00.000Z"));
   if (observed !== true) throw new Error("fixture anchor advance did not create new evidence");
   writePrivate(path.join(root, "history.json"), {

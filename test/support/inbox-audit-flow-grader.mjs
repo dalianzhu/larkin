@@ -53,7 +53,7 @@ export function gradeInboxAuditFlowTrace(dataset, scenario, trace) {
   const reads = trace.filter((event) => event.action === "audit_read");
   const firstRead = reads[0];
   const initial = readTarget(firstRead);
-  if (!firstRead || firstRead.result?.version !== 3 || !initial || initial.target !== scenario.fixture.target || initial.anchor !== scenario.fixture.anchor
+  if (!firstRead || firstRead.result?.version !== 4 || !initial || initial.target !== scenario.fixture.target || initial.anchor !== scenario.fixture.anchor
       || typeof initial.receipt !== "string" || typeof initial.revision !== "string") {
     fail("audit_read_receipt", "first public audit read did not return the declared target, anchor, revision, and receipt");
   }

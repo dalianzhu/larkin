@@ -8,7 +8,7 @@ const DATASET = loadInboxAuditFlowEval(path.join(ROOT, "evals/inbox-audit-flow/s
 
 function read(scenario, receipt = "receipt-old") {
   return { action: "audit_read", surface: "public-cli", argv: ["inbox", "audit", "--json"], exit_code: 0,
-    result: { version: 3, targets: [{ target: scenario.fixture.target, anchor: scenario.fixture.anchor, observed_at: "2026-09-06T00:00:00.000Z", revision: "sha256:read", receipt }] } };
+    result: { version: 4, targets: [{ target: scenario.fixture.target, anchor: scenario.fixture.anchor, observed_at: "2026-09-06T00:00:00.000Z", revision: "sha256:read", receipt }] } };
 }
 
 test("inbox audit flow dataset is versioned with four fixed synthetic scenarios", () => {
@@ -44,7 +44,7 @@ test("grader accepts pending-after-failure and stale-receipt traces", () => {
   assert.equal(gradeInboxAuditFlowTrace(DATASET, failed, [
     read(failed),
     { action: "verification_audit_read", surface: "public-cli", argv: ["inbox", "audit", "--json"], exit_code: 0,
-      result: { version: 3, targets: [{ target: failed.fixture.target, anchor: failed.fixture.anchor, receipt: "receipt-new" }] } },
+      result: { version: 4, targets: [{ target: failed.fixture.target, anchor: failed.fixture.anchor, receipt: "receipt-new" }] } },
   ]).passed, true);
 
   const stale = DATASET.scenarios.find((scenario) => scenario.id === "stale-receipt");
@@ -54,7 +54,7 @@ test("grader accepts pending-after-failure and stale-receipt traces", () => {
     { action: "audit_complete", surface: "public-cli", argv: ["inbox", "audit", "complete", "--receipt", "receipt-old", "--outcome", "handled", "--json"], exit_code: 0,
       requested_receipt: "receipt-old", result: { completed: false, reason: "stale" } },
     { action: "verification_audit_read", surface: "public-cli", argv: ["inbox", "audit", "--json"], exit_code: 0,
-      result: { version: 3, targets: [{ target: stale.fixture.target, anchor: stale.fixture.new_anchor, receipt: "receipt-new" }] } },
+      result: { version: 4, targets: [{ target: stale.fixture.target, anchor: stale.fixture.new_anchor, receipt: "receipt-new" }] } },
   ]).passed, true);
 });
 
