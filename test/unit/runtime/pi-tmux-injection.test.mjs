@@ -30,6 +30,23 @@ test("embedded standalone bundle materializes as a private file", () => {
   }
 });
 
+test("materialize refuses a symlink extensions directory and does not write outside", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-embed-dirlink-"));
+  try {
+    const dir = path.join(root, "providers", "pi");
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const outside = path.join(root, "outside-dir");
+    fs.mkdirSync(outside);
+    fs.symlinkSync(outside, path.join(dir, "extensions"));
+    globalThis.__LARKIN_EMBEDDED_PI_TMUX_BUNDLE__ = "export default function() {}";
+    assert.equal(materializeEmbeddedPiTmuxBundle(root), null);
+    assert.equal(fs.readdirSync(outside).length, 0);
+    assert.equal(fs.lstatSync(path.join(dir, "extensions")).isSymbolicLink(), true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("materialize refuses a symlink target and does not write through it", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-embed-link-"));
   try {

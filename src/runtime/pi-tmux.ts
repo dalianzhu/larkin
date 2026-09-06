@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { ensureOwnedTree, mkdirPrivateExclusive, writePrivateExclusive } from "./pi-state-dir.js";
 
 export const DEFAULT_BASH_WAIT_SECONDS = 30;
 export const OUTPUT_TAIL_BYTES = 32 * 1024;
@@ -107,7 +108,7 @@ function writeEnvScript(file: string, env: NodeJS.ProcessEnv): void {
     if (key === "PWD" || key === "TMUX" || key === "TMUX_PANE") continue;
     lines.push(`export ${key}=${posixQuote(value)}`);
   }
-  writePrivate(file, `${lines.join("\n")}\n`);
+  writePrivateExclusive(file, `${lines.join("\n")}\n`);
 }
 
 function tmuxClientEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -244,13 +245,13 @@ export function createLarkinTmux(input: {
   const env = input.env ?? process.env;
   const agentId = input.agentId;
   const instanceId = input.instanceId || crypto.randomUUID();
-  const stateDir = input.stateDir;
+  const stateDir = path.resolve(input.stateDir);
+  const ownedParts = ["pi-tmux", sanitizeName(agentId, "agent"), sanitizeName(instanceId, "inst")] as const;
   const root = taskRoot(stateDir, agentId, instanceId);
 
   const expectedSession = (taskId: string): string => sessionName(agentId, instanceId, taskId);
 
   const assertPrivateScripts = (dir: string): void => {
-    const realDir = fs.realpathSync(dir);
     for (const name of ["env.sh", "command.sh", "run.sh", "meta.json"]) {
       const file = path.join(dir, name);
       if (!fs.existsSync(file)) {
@@ -258,25 +259,27 @@ export function createLarkinTmux(input: {
         continue;
       }
       if (!isRegularFile(file)) throw new ForeignTmuxTaskError(path.basename(dir));
-      const realFile = fs.realpathSync(file);
-      if (!isInside(realDir, realFile)) throw new ForeignTmuxTaskError(path.basename(dir));
     }
   };
 
   const requireOwned = (taskId: string): string => {
     if (!/^[A-Za-z0-9_-]+$/.test(taskId)) throw new ForeignTmuxTaskError(taskId);
-    const dir = taskDir(stateDir, agentId, instanceId, taskId);
-    const metaFile = path.join(dir, "meta.json");
-    if (!isRegularFile(metaFile)) throw new ForeignTmuxTaskError(taskId);
-    let realRoot: string;
-    let realDir: string;
+    let instanceRoot: string;
     try {
-      realRoot = fs.realpathSync(root);
-      realDir = fs.realpathSync(dir);
+      instanceRoot = ensureOwnedTree(stateDir, ownedParts, false);
     } catch {
       throw new ForeignTmuxTaskError(taskId);
     }
-    if (!isInside(realRoot, realDir)) throw new ForeignTmuxTaskError(taskId);
+    const dir = taskDir(stateDir, agentId, instanceId, taskId);
+    try {
+      const stat = fs.lstatSync(dir);
+      if (stat.isSymbolicLink() || !stat.isDirectory() || !isInside(instanceRoot, dir)) throw new ForeignTmuxTaskError(taskId);
+    } catch (error) {
+      if (error instanceof ForeignTmuxTaskError) throw error;
+      throw new ForeignTmuxTaskError(taskId);
+    }
+    const metaFile = path.join(dir, "meta.json");
+    if (!isRegularFile(metaFile)) throw new ForeignTmuxTaskError(taskId);
     let meta: { taskId?: unknown; agentId?: unknown; instanceId?: unknown; session?: unknown; cwd?: unknown };
     try {
       meta = JSON.parse(fs.readFileSync(metaFile, "utf8")) as typeof meta;
@@ -298,18 +301,17 @@ export function createLarkinTmux(input: {
   };
 
   const start = (command: string, cwd: string): TmuxTaskSnapshot => {
-    if (!tmuxAvailable(env)) throw new Error("tmux is not available");
     const taskId = crypto.randomBytes(8).toString("hex");
-    const dir = taskDir(stateDir, agentId, instanceId, taskId);
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    fs.chmodSync(dir, 0o700);
-    fs.chmodSync(path.dirname(dir), 0o700);
+    const parent = ensureOwnedTree(stateDir, ownedParts);
+    const dir = path.join(parent, taskId);
+    mkdirPrivateExclusive(dir);
+    if (!tmuxAvailable(env)) throw new Error("tmux is not available");
     const session = expectedSession(taskId);
-    writePrivate(path.join(dir, "meta.json"), `${JSON.stringify({
+    writePrivateExclusive(path.join(dir, "meta.json"), `${JSON.stringify({
       taskId, agentId, instanceId, session, cwd,
     })}\n`);
     writeEnvScript(path.join(dir, "env.sh"), env);
-    writePrivate(path.join(dir, "command.sh"), command.endsWith("\n") ? command : `${command}\n`);
+    writePrivateExclusive(path.join(dir, "command.sh"), command.endsWith("\n") ? command : `${command}\n`);
     const envFile = path.join(dir, "env.sh");
     const commandFile = path.join(dir, "command.sh");
     const outputFile = path.join(dir, "output");
@@ -317,7 +319,7 @@ export function createLarkinTmux(input: {
     const startedFile = path.join(dir, "started_at");
     const endedFile = path.join(dir, "ended_at");
     // 包装器用 /bin/bash；用户命令另启 bash -o pipefail，保留数组 / [[ / pipefail。
-    writePrivate(path.join(dir, "run.sh"), [
+    writePrivateExclusive(path.join(dir, "run.sh"), [
       "#!/bin/bash",
       `PANE_TMUX=\${TMUX-}`,
       `PANE_TMUX_PANE=\${TMUX_PANE-}`,
@@ -335,7 +337,6 @@ export function createLarkinTmux(input: {
       `printf '%s\\n' "$status" > ${posixQuote(exitFile)}`,
       "",
     ].join("\n"));
-    assertPrivateScripts(dir);
     const created = spawnSync("tmux", ["new-session", "-d", "-s", session, "-n", "bash", "/bin/bash", path.join(dir, "run.sh")], {
       env: tmuxClientEnv(env),
       encoding: "utf8",
@@ -353,8 +354,13 @@ export function createLarkinTmux(input: {
   };
 
   const list = (): TmuxTaskSnapshot[] => {
-    if (!fs.existsSync(root)) return [];
-    return fs.readdirSync(root).sort().flatMap((taskId) => {
+    let instanceRoot: string;
+    try {
+      instanceRoot = ensureOwnedTree(stateDir, ownedParts, false);
+    } catch {
+      return [];
+    }
+    return fs.readdirSync(instanceRoot).sort().flatMap((taskId) => {
       try { return [peek(taskId)]; } catch { return []; }
     });
   };

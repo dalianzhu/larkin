@@ -34,6 +34,67 @@ function makeTmux(root, instanceId, agentId = "cli_tmuxSameA1") {
   });
 }
 
+test("start refuses a symlink owned tree before writing env secrets", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-owned-link-"));
+  const secret = "larkin-tmux-boundary-secret";
+  const assertNoLeak = (outside) => {
+    assert.equal(fs.readdirSync(outside).length, 0);
+    const leaked = spawnSync("grep", ["-R", secret, outside], { encoding: "utf8", timeout: 5_000 });
+    assert.notEqual(leaked.status, 0);
+  };
+  try {
+    const stateDir = path.join(root, "state-root");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const outside = path.join(root, "outside-root");
+    fs.mkdirSync(outside);
+    fs.symlinkSync(outside, path.join(stateDir, "pi-tmux"));
+    const tmux = createLarkinTmux({
+      stateDir,
+      agentId: "cli_tmuxSameA1",
+      instanceId: "inst-owned",
+      env: { ...process.env, LARKIN_TMUX_TEST_SECRET: secret },
+    });
+    assert.throws(() => tmux.start("true", root), /unsafe private directory/);
+    assert.equal(fs.lstatSync(path.join(stateDir, "pi-tmux")).isSymbolicLink(), true);
+    assertNoLeak(outside);
+
+    const nested = path.join(root, "state-inst");
+    const agentDir = path.join(nested, "pi-tmux", "cli_tmuxSameA1");
+    fs.mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+    const outsideInst = path.join(root, "outside-inst");
+    fs.mkdirSync(outsideInst);
+    fs.symlinkSync(outsideInst, path.join(agentDir, "inst-owned"));
+    const nestedTmux = createLarkinTmux({
+      stateDir: nested,
+      agentId: "cli_tmuxSameA1",
+      instanceId: "inst-owned",
+      env: { ...process.env, LARKIN_TMUX_TEST_SECRET: secret },
+    });
+    assert.throws(() => nestedTmux.start("true", root), /unsafe private directory/);
+    assert.equal(fs.lstatSync(path.join(agentDir, "inst-owned")).isSymbolicLink(), true);
+    assertNoLeak(outsideInst);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(!tmuxAvailable())("start accepts a symlink cwd without treating it as an owned-tree escape", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-cwdlink-"));
+  const realCwd = path.join(root, "real cwd");
+  const cwd = path.join(root, "link cwd");
+  fs.mkdirSync(realCwd, { recursive: true });
+  fs.symlinkSync(realCwd, cwd);
+  const tmux = makeTmux(root, "inst-cwdlink");
+  try {
+    const started = track(tmux, tmux.start("printf '%s\\n' \"$PWD\" > marker.txt", cwd));
+    const done = await tmux.wait(started.taskId, 5);
+    assert.equal(done.status, "completed");
+    assert.equal(fs.readFileSync(path.join(realCwd, "marker.txt"), "utf8").trim(), cwd);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("tmuxAvailable is false when PATH has no tmux binary", () => {
   const empty = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-no-tmux-"));
   try {
