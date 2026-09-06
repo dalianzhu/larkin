@@ -589,7 +589,8 @@ export function createHostShell({
         // An event becomes permanently transport-seen only after the canonical
         // append/dedupe decision is durable. Agent model-seen state is untouched.
         if (event.event_id) seenEventIds.add(eventKey);
-        const auditSourceSeq = Number((append.envelope as { seq?: unknown }).seq);
+        if (append.status === "duplicate_consumed") return null;
+        const auditSourceSeq = Number((append.envelope as { target_seq?: unknown }).target_seq);
         try {
           observeInboxAuditTarget(auditRegistry, agent.agentId, { ...event, wake, source_seq: auditSourceSeq });
           discardInboxAuditTargetRetry(auditRetryJournal, agent.agentId, { ...event, source_seq: auditSourceSeq });
@@ -600,7 +601,6 @@ export function createHostShell({
             log(`inbox audit target 延后重试: ${boundedInboxAuditDiagnostic(error)}`);
           } catch (retryError) { log(`inbox audit target 未持久化: ${boundedInboxAuditDiagnostic(retryError)}`); }
         }
-        if (append.status === "duplicate_consumed") return null;
         const inboxEnvelope = append.envelope;
         if (append.status === "appended") hostState.appendConversation(agent, {
           direction: "in", from: inboxEnvelope.sender_name, senderType: inboxEnvelope.sender_type,

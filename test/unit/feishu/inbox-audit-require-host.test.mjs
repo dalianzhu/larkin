@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "bun:test";
 import { createHostShell } from "../../../dist/feishu/host-shell.mjs";
 import { inboxAuditRegistryFile, readInboxAuditTargets } from "../../../dist/agent/missed-outbound-scan.mjs";
+import { createAgentStateStore } from "../../../dist/agent/agent-state-store.mjs";
 
 const CHAT = "oc_7961b9d7be893b46520a926b90cf46eb";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -34,6 +35,9 @@ test("Host ingest records only originally wake=true group traffic into the audit
     LARKIN_HOME: root, LARKIN_CONFIG_DIR: root, LARKIN_SERVER_ID: "server-inbox-audit-host",
     LARKIN_AGENTS_CONFIG: JSON.stringify([agent]),
   };
+  const preexisting = createAgentStateStore(root, agentId);
+  for (let index = 1; index <= 3; index += 1) preexisting.appendCanonicalInboxOnce({ message_id: `om_seed_${index}`, chat_id: CHAT, content: "seed" });
+  preexisting.pollInbox({ target: `chat:${CHAT}` });
   const runtimeHost = {
     subscribe() { return () => {}; },
     async start() {},
@@ -61,7 +65,10 @@ test("Host ingest records only originally wake=true group traffic into the audit
     const audit = readInboxAuditTargets(inboxAuditRegistryFile(root), agentId);
     assert.deepEqual(audit.targets.map((row) => row.anchor), ["om_mentioned"]);
     assert.equal(audit.targets[0].target, `chat:${CHAT}`);
-    assert.equal(JSON.parse(fs.readFileSync(inboxAuditRegistryFile(root), "utf8")).targets[0].source_seq, 2, "Host uses canonical append sequence, never an external event field");
+    assert.equal(JSON.parse(fs.readFileSync(inboxAuditRegistryFile(root), "utf8")).targets[0].source_seq, 5, "Host uses the persisted target high-watermark, never an external/projector sequence");
+    createAgentStateStore(root, agentId).pollInbox({ target: `chat:${CHAT}` });
+    await host.ingest(agentId, { ...event, message_id: "om_mentioned", event_id: "ev_duplicate_consumed" }, { wake: true });
+    assert.deepEqual(readInboxAuditTargets(inboxAuditRegistryFile(root), agentId).targets.map((row) => row.anchor), ["om_mentioned"], "a consumed duplicate has no envelope to audit and does not reopen work");
   } finally {
     await host.shutdown("cleanup");
     fs.rmSync(root, { recursive: true, force: true });
