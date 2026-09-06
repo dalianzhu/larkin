@@ -92,7 +92,7 @@ async function startIsolatedPi({ appendPrompt = true, git = true } = {}) {
   const source = resolveTmuxBashPackagePath();
   const loadMode = resolveTmuxBashLoadMode();
   if (loadMode === "extension" && !source) {
-    throw new Error("LARKIN_PI_TMUX_BASH_PACKAGE or the isolated published 0.0.12 package is required for extension load");
+    throw new Error("extension load requires LARKIN_PI_TMUX_BASH_PACKAGE or a user-installed @richardgill/pi-tmux-bash@0.0.12");
   }
   const workspace = createIsolatedTmuxWorkspace({
     prefix: git ? "larkin-tmux-eval-" : "larkin-tmux-nongit-",
@@ -144,6 +144,8 @@ test("pi-tmux-bash eval starts from the fixed scenario dataset", () => {
   assert.equal(DATASET.harness.tui_independent, true);
   assert.equal(DATASET.harness.intended_script, INTENDED_EVAL_SCRIPT);
   assert.deepEqual(DATASET.harness.pi_args, ["--mode", "rpc", "--no-session", "--no-extensions", "-e"]);
+  assert.equal(DATASET.core_acceptance_rate, 1);
+  assert.match(DATASET.threshold_rationale, /deterministic/);
   assert.deepEqual(DATASET.scenarios.map((scenario) => scenario.id), [
     "long-command-backgrounds-without-subagent",
     "wait-timeout-is-not-failure",
@@ -151,6 +153,7 @@ test("pi-tmux-bash eval starts from the fixed scenario dataset", () => {
     "stop-by-returned-id",
     "completion-stays-in-originating-target",
     "no-forced-subagent-for-known-long",
+    "natural-long-local-command",
   ]);
 });
 

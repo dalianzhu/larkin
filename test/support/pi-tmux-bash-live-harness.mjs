@@ -4,9 +4,6 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const DEFAULT_ISOLATED_PACKAGE =
-  "/tmp/larkin-tmux-package.ypzqKm/node_modules/@richardgill/pi-tmux-bash";
-export const DEFAULT_EXTRACTED_PACKAGE = DEFAULT_ISOLATED_PACKAGE;
 export const PINNED_PLUGIN = { name: "@richardgill/pi-tmux-bash", version: "0.0.12" };
 export const UPSTREAM_NON_GIT_ERROR = /not in a git repository/i;
 export const INTENDED_EVAL_SCRIPT = "test:eval:pi-tmux-bash";
@@ -20,12 +17,56 @@ export function userPiAgentDir(env = process.env) {
   return env.PI_CODING_AGENT_DIR || path.join(env.HOME || os.homedir(), ".pi", "agent");
 }
 
+export function resolveUserInstalledTmuxBashPackage(env = process.env) {
+  const agentDir = userPiAgentDir(env);
+  const candidates = [
+    path.join(agentDir, "npm", "node_modules", PINNED_PLUGIN.name),
+    path.join(agentDir, "node_modules", PINNED_PLUGIN.name),
+  ];
+  const settingsFile = path.join(agentDir, "settings.json");
+  if (fs.existsSync(settingsFile)) {
+    try {
+      const settings = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
+      const packages = Array.isArray(settings.packages) ? settings.packages : [];
+      for (const entry of packages) {
+        const spec = String(entry || "").replace(/^npm:/, "");
+        if (spec === PINNED_PLUGIN.name || spec.startsWith(`${PINNED_PLUGIN.name}@`)) {
+          candidates.unshift(path.join(agentDir, "npm", "node_modules", PINNED_PLUGIN.name));
+        }
+      }
+    } catch {
+      // settings are only a discovery hint
+    }
+  }
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const resolved = path.resolve(candidate);
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    const manifestFile = path.join(resolved, "package.json");
+    if (!fs.existsSync(manifestFile)) continue;
+    try {
+      const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
+      if (manifest.name === PINNED_PLUGIN.name && manifest.version === PINNED_PLUGIN.version) {
+        return resolved;
+      }
+    } catch {
+      // skip unreadable manifests
+    }
+  }
+  return null;
+}
+
 export function resolveTmuxBashPackagePath(env = process.env) {
   const configured = String(env.LARKIN_PI_TMUX_BASH_PACKAGE || "").trim();
-  if (configured) return path.resolve(configured);
-  const fallback = String(env.LARKIN_PI_TMUX_BASH_DEFAULT_PACKAGE || DEFAULT_ISOLATED_PACKAGE).trim();
-  if (fallback && fs.existsSync(path.join(fallback, "package.json"))) return path.resolve(fallback);
-  return null;
+  if (configured) {
+    const resolved = path.resolve(configured);
+    if (!fs.existsSync(path.join(resolved, "package.json"))) {
+      throw new Error(`LARKIN_PI_TMUX_BASH_PACKAGE is not a package directory: ${resolved}`);
+    }
+    return resolved;
+  }
+  return resolveUserInstalledTmuxBashPackage(env);
 }
 
 export function packageHasResolvableDependencies(packageDir) {
@@ -54,7 +95,6 @@ export function readPinnedPluginManifest(packageDir) {
   if (manifest.name !== PINNED_PLUGIN.name || manifest.version !== PINNED_PLUGIN.version) {
     throw new Error(`expected ${PINNED_PLUGIN.name}@${PINNED_PLUGIN.version}, got ${manifest.name}@${manifest.version}`);
   }
-  if (manifest.license) throw new Error("pinned 0.0.12 is expected to have no license field");
   return manifest;
 }
 

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { test } from "bun:test";
 import {
@@ -16,9 +17,9 @@ import {
   summarizePiTmuxBashEval,
 } from "../../support/pi-tmux-bash-grader.mjs";
 import {
-  DEFAULT_ISOLATED_PACKAGE,
   HEADLESS_PI_RPC_PREFIX,
   INTENDED_EVAL_SCRIPT,
+  PINNED_PLUGIN,
   UPSTREAM_NON_GIT_ERROR,
   assertHeadlessExtensionFixtureArgs,
   assertUserPiSettingsUnchanged,
@@ -30,6 +31,7 @@ import {
   readPinnedPluginManifest,
   resolveTmuxBashLoadMode,
   resolveTmuxBashPackagePath,
+  resolveUserInstalledTmuxBashPackage,
   snapshotUserPiSettings,
 } from "../../support/pi-tmux-bash-live-harness.mjs";
 
@@ -65,6 +67,9 @@ test("pi-tmux-bash dataset pins version, threshold, external plugin 0.0.12, and 
   assert.deepEqual(DATASET.harness.pi_args, ["--mode", "rpc", "--no-session", "--no-extensions", "-e"]);
   assert.equal(DATASET.model.selection, "opencode-go/deepseek-v4-flash");
   assert.equal(DATASET.threshold, 0.6);
+  assert.equal(DATASET.core_acceptance_rate, 1);
+  assert.match(DATASET.threshold_rationale, /natural user request/);
+  assert.match(DATASET.threshold_rationale, /must all pass/);
   assert.equal(DATASET.grader.version, 1);
   assert.equal(DATASET.grader.threshold, 0.6);
   assert.equal(DATASET.plugin.name, "@richardgill/pi-tmux-bash");
@@ -77,7 +82,12 @@ test("pi-tmux-bash dataset pins version, threshold, external plugin 0.0.12, and 
     "stop-by-returned-id",
     "completion-stays-in-originating-target",
     "no-forced-subagent-for-known-long",
+    "natural-long-local-command",
   ]);
+  const natural = DATASET.scenarios.find((scenario) => scenario.kind === "natural");
+  assert.equal(natural.id, "natural-long-local-command");
+  const prose = natural.prompt.replace(/`[^`]+`/g, "");
+  assert.doesNotMatch(prose, /subagent|Agent tool|timeout|tmux|Feishu|bash tool|run_in_background|identifier/i);
 });
 
 test("standing prompt v30 replaces forced subagent rules with conditional tmux-backed bash guidance", () => {
@@ -150,6 +160,11 @@ test("golden traces reach the registered threshold and reject forced subagent ro
       { type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "Started in background tmux window @15" }] } },
       { type: "agent_end" },
     ],
+    "natural-long-local-command": [
+      { type: "tool_execution_start", toolName: "bash", args: { command: "sleep 8 && echo larkin-tmux-eval-natural" } },
+      { type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "Still running after 5s in background tmux @21" }] } },
+      { type: "agent_end" },
+    ],
   };
   const graded = DATASET.scenarios.map((scenario) => ({
     id: scenario.id,
@@ -159,7 +174,7 @@ test("golden traces reach the registered threshold and reject forced subagent ro
     assert.equal(result.passed, true, `${result.id}: ${JSON.stringify(result.results)}`);
   }
   const summary = summarizePiTmuxBashEval(graded);
-  assert.equal(summary.rate >= DATASET.threshold, true);
+  assert.equal(summary.rate, DATASET.core_acceptance_rate);
   assert.equal(summary.passed, DATASET.scenarios.length);
 });
 
@@ -188,13 +203,14 @@ test("completion extractor only accepts tmux-bash-completion followUp", () => {
 });
 
 test("headless RPC fixture args and unprompted completion turn are independent of TUI", () => {
+  const packagePath = path.resolve("resolved-pi-tmux-bash");
   const args = buildPiRpcArgs({
-    packagePath: "/tmp/fixture-pkg",
+    packagePath,
     loadMode: "extension",
     model: "openai-codex/gpt-5.6-luna",
   });
   assert.deepEqual(args.slice(0, 4), HEADLESS_PI_RPC_PREFIX);
-  assert.equal(assertHeadlessExtensionFixtureArgs(args, "/tmp/fixture-pkg"), true);
+  assert.equal(assertHeadlessExtensionFixtureArgs(args, packagePath), true);
   const timeoutEnd = {
     type: "tool_execution_end",
     toolName: "bash",
@@ -210,9 +226,20 @@ test("headless RPC fixture args and unprompted completion turn are independent o
   assert.equal(findUnpromptedCompletionTurn([timeoutEnd, firstEnd], firstEnd), null);
 });
 
-test("isolated harness uses configurable local package or normal discovery and does not write user Pi settings", () => {
+function writePinnedManifest(dir, extra = {}) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(dir, "package.json"), `${JSON.stringify({
+    name: PINNED_PLUGIN.name,
+    version: PINNED_PLUGIN.version,
+    ...extra,
+  }, null, 2)}\n`);
+  return dir;
+}
+
+test("isolated harness uses explicit env or the user-installed package and does not write user Pi settings", () => {
   const snapshot = snapshotUserPiSettings();
   const workspace = createIsolatedTmuxWorkspace("larkin-tmux-unit-");
+  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-user-pi-"));
   try {
     assert.equal(workspace.gitFixture, true);
     assert.equal(fs.existsSync(path.join(workspace.workDir, ".git")), true);
@@ -227,29 +254,41 @@ test("isolated harness uses configurable local package or normal discovery and d
     assert.equal(discoveryArgs.includes("-e"), false);
     assert.equal(discoveryArgs.includes("--no-extensions"), false);
     assert.equal(resolveTmuxBashLoadMode({ LARKIN_PI_TMUX_BASH_LOAD: "discovery" }), "discovery");
-    const defaultPath = resolveTmuxBashPackagePath({});
-    if (defaultPath) {
-      assert.equal(defaultPath, path.resolve(DEFAULT_ISOLATED_PACKAGE));
-      const manifest = readPinnedPluginManifest(defaultPath);
-      assert.equal(manifest.name, "@richardgill/pi-tmux-bash");
-      assert.equal(manifest.version, "0.0.12");
-      assert.equal(packageHasResolvableDependencies(defaultPath), true);
-      const unusedDest = path.join(workspace.root, "must-not-copy");
-      assert.equal(prepareIsolatedTmuxBashPackage(defaultPath, unusedDest), path.resolve(defaultPath));
-      assert.equal(fs.existsSync(unusedDest), false);
-    }
-    const packagePath = resolveTmuxBashPackagePath({
-      LARKIN_PI_TMUX_BASH_PACKAGE: DEFAULT_ISOLATED_PACKAGE,
+
+    const explicitDir = writePinnedManifest(path.join(workspace.root, "explicit-pkg"), { license: "MIT" });
+    const explicit = resolveTmuxBashPackagePath({ LARKIN_PI_TMUX_BASH_PACKAGE: explicitDir });
+    assert.equal(explicit, path.resolve(explicitDir));
+    const manifest = readPinnedPluginManifest(explicit);
+    assert.equal(manifest.name, PINNED_PLUGIN.name);
+    assert.equal(manifest.version, PINNED_PLUGIN.version);
+    assert.equal(manifest.license, "MIT");
+
+    const userPkg = writePinnedManifest(path.join(fakeHome, "agent", "npm", "node_modules", PINNED_PLUGIN.name));
+    fs.writeFileSync(path.join(fakeHome, "agent", "settings.json"), `${JSON.stringify({
+      packages: [`npm:${PINNED_PLUGIN.name}`],
+    })}\n`);
+    const discovered = resolveUserInstalledTmuxBashPackage({
+      PI_CODING_AGENT_DIR: path.join(fakeHome, "agent"),
     });
-    if (packagePath) {
-      const manifest = readPinnedPluginManifest(packagePath);
-      assert.equal(manifest.name, "@richardgill/pi-tmux-bash");
-      assert.equal(manifest.version, "0.0.12");
-    }
+    assert.equal(discovered, path.resolve(userPkg));
+    assert.equal(resolveTmuxBashPackagePath({
+      PI_CODING_AGENT_DIR: path.join(fakeHome, "agent"),
+    }), path.resolve(userPkg));
+    assert.equal(resolveTmuxBashPackagePath({
+      PI_CODING_AGENT_DIR: path.join(fakeHome, "missing-agent"),
+    }), null);
+
+    const unusedDest = path.join(workspace.root, "must-not-copy");
+    fs.mkdirSync(path.join(explicitDir, "node_modules", "zod"), { recursive: true });
+    fs.mkdirSync(path.join(explicitDir, "node_modules", "@richardgill", "lib"), { recursive: true });
+    assert.equal(packageHasResolvableDependencies(explicitDir), true);
+    assert.equal(prepareIsolatedTmuxBashPackage(explicitDir, unusedDest), path.resolve(explicitDir));
+    assert.equal(fs.existsSync(unusedDest), false);
     assertUserPiSettingsUnchanged(snapshot);
   } finally {
     killIsolatedTmuxSession(workspace.sessionName);
     fs.rmSync(workspace.root, { recursive: true, force: true });
+    fs.rmSync(fakeHome, { recursive: true, force: true });
   }
 });
 
@@ -262,12 +301,25 @@ test("harness distinguishes isolated git fixture from explicit non-git cwd that 
     assert.equal(nongit.gitFixture, false);
     assert.equal(fs.existsSync(path.join(nongit.workDir, ".git")), false);
     assert.match("Error: not in a git repository.", UPSTREAM_NON_GIT_ERROR);
-    assert.equal(DEFAULT_ISOLATED_PACKAGE,
-      "/tmp/larkin-tmux-package.ypzqKm/node_modules/@richardgill/pi-tmux-bash");
   } finally {
     killIsolatedTmuxSession(git.sessionName);
     killIsolatedTmuxSession(nongit.sessionName);
     fs.rmSync(git.root, { recursive: true, force: true });
     fs.rmSync(nongit.root, { recursive: true, force: true });
+  }
+});
+
+test("prompt-eval files do not commit machine-specific package paths or a missing-license contract", () => {
+  const files = [
+    "evals/pi-tmux-bash/scenarios.json",
+    "test/support/pi-tmux-bash-grader.mjs",
+    "test/support/pi-tmux-bash-live-harness.mjs",
+    "test/live/pi-tmux-bash-live.test.mjs",
+  ];
+  for (const rel of files) {
+    const text = fs.readFileSync(path.join(ROOT, rel), "utf8");
+    assert.doesNotMatch(text, /\/tmp\/larkin-tmux-package/);
+    assert.doesNotMatch(text, /DEFAULT_EXTRACTED_PACKAGE|DEFAULT_ISOLATED_PACKAGE/);
+    assert.doesNotMatch(text, /expected to have no license field/);
   }
 });

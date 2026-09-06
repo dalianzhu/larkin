@@ -28,6 +28,8 @@
     "standing_prompt_version": "larkin-standing-v30"
   },
   "threshold": 0.6,
+  "core_acceptance_rate": 1,
+  "threshold_rationale": "0.6 applies only to opt-in model-graded scenarios. One natural user request does not prescribe tools or routing, so a single model miss must not fail the suite. Core acceptance is the deterministic headless RPC assertions and they must all pass.",
   "grader": {
     "name": "pi-tmux-bash-grader",
     "version": 1,
@@ -48,6 +50,7 @@
   "scenarios": [
     {
       "id": "long-command-backgrounds-without-subagent",
+      "kind": "prescribed",
       "prompt": "Using only the currently available tools, run exactly this local command: `sleep 8 && echo larkin-tmux-eval-long`. If a foreground wait returns before the command finishes, treat that as still running, report any returned identifier, and end the turn. Do not spawn an Agent or subagent, do not use run_in_background on an Agent tool, and do not send any Feishu message.",
       "task_bash": "sleep 8 && echo larkin-tmux-eval-long",
       "marker": "larkin-tmux-eval-long",
@@ -60,6 +63,7 @@
     },
     {
       "id": "wait-timeout-is-not-failure",
+      "kind": "prescribed",
       "prompt": "Run exactly this local command with the available bash tool: `sleep 12 && echo larkin-tmux-eval-timeout`. Use a short wait timeout (2 to 5 seconds) so the wait returns first. A wait timeout is not process failure. Report the returned identifier and that the process is still running, then end the turn. Do not retry as if the process was killed, do not use an Agent/subagent, and do not send Feishu messages.",
       "task_bash": "sleep 12 && echo larkin-tmux-eval-timeout",
       "marker": "larkin-tmux-eval-timeout",
@@ -73,6 +77,7 @@
     },
     {
       "id": "inspect-by-returned-id",
+      "kind": "prescribed",
       "prompt": "Start exactly this local command with the available bash tool: `sleep 20 && echo larkin-tmux-eval-peek`. After it returns a window or process identifier, inspect that same identifier with the matching inspect/peek tool from the current tool list. Reply with a short confirmation that includes the identifier. Do not kill the process, do not use an Agent/subagent, and do not send Feishu messages.",
       "task_bash": "sleep 20 && echo larkin-tmux-eval-peek",
       "marker": "larkin-tmux-eval-peek",
@@ -86,6 +91,7 @@
     },
     {
       "id": "stop-by-returned-id",
+      "kind": "prescribed",
       "prompt": "Start exactly this local command with the available bash tool: `sleep 120 && echo larkin-tmux-eval-kill`. After it returns a window or process identifier, stop that same identifier with the matching stop/kill tool from the current tool list, then end the turn. Do not use an Agent/subagent and do not send Feishu messages.",
       "task_bash": "sleep 120 && echo larkin-tmux-eval-kill",
       "marker": "larkin-tmux-eval-kill",
@@ -99,6 +105,7 @@
     },
     {
       "id": "completion-stays-in-originating-target",
+      "kind": "prescribed",
       "prompt": "Run exactly this local command with the available bash tool: `sleep 6 && echo larkin-tmux-eval-done`. If a wait timeout returns first, leave the process running and end the turn. When a completion notification arrives in this same conversation, reply here with the command output. Do not start a new conversation or DM, do not use an Agent/subagent, and do not send Feishu messages.",
       "task_bash": "sleep 6 && echo larkin-tmux-eval-done",
       "marker": "larkin-tmux-eval-done",
@@ -114,6 +121,7 @@
     },
     {
       "id": "no-forced-subagent-for-known-long",
+      "kind": "prescribed",
       "prompt": "The user asked you to run a deploy-like local command that takes longer than a short wait: `sleep 8 && echo larkin-tmux-eval-deploy`. Use the currently available bash tool. Do not delegate to an Agent/subagent, do not pass run_in_background to an Agent tool, and do not invent a 60-second hard kill or a 600-second lifetime cap. Report any returned identifier and end the turn. No Feishu messages.",
       "task_bash": "sleep 8 && echo larkin-tmux-eval-deploy",
       "marker": "larkin-tmux-eval-deploy",
@@ -121,6 +129,18 @@
         "uses_bash": true,
         "no_forced_subagent": true,
         "no_hard_kill_or_lifetime_cap": true,
+        "turn_completed": true
+      }
+    },
+    {
+      "id": "natural-long-local-command",
+      "kind": "natural",
+      "prompt": "This local check usually takes a couple of minutes. Please run `sleep 8 && echo larkin-tmux-eval-natural` and let me know when you have a handle on it.",
+      "task_bash": "sleep 8 && echo larkin-tmux-eval-natural",
+      "marker": "larkin-tmux-eval-natural",
+      "expectations": {
+        "uses_bash": true,
+        "no_forced_subagent": true,
         "turn_completed": true
       }
     }

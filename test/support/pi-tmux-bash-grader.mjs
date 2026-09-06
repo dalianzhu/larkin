@@ -107,31 +107,42 @@ export function loadPiTmuxBashEval(file) {
   if (typeof raw.threshold !== "number" || raw.threshold <= 0 || raw.threshold > 1) {
     throw new Error("eval threshold must be in (0, 1]");
   }
+  if (raw.core_acceptance_rate !== 1) {
+    throw new Error("core acceptance deterministic assertions must require rate 1");
+  }
+  if (typeof raw.threshold_rationale !== "string" || raw.threshold_rationale.length < 40) {
+    throw new Error("pi-tmux-bash model-eval threshold needs a meaningful rationale");
+  }
   if (!Array.isArray(raw.scenarios) || raw.scenarios.length === 0) {
     throw new Error("eval scenarios must be non-empty");
   }
-  return {
-    ...raw,
-    scenarios: raw.scenarios.map((scenario) => {
-      if (!scenario || typeof scenario !== "object") throw new Error("scenario must be an object");
-      if (!scenario.id || typeof scenario.id !== "string") throw new Error("scenario.id required");
-      if (!scenario.prompt || typeof scenario.prompt !== "string") {
-        throw new Error(`scenario ${scenario.id}.prompt required`);
+  const scenarios = raw.scenarios.map((scenario) => {
+    if (!scenario || typeof scenario !== "object") throw new Error("scenario must be an object");
+    if (!scenario.id || typeof scenario.id !== "string") throw new Error("scenario.id required");
+    if (!scenario.prompt || typeof scenario.prompt !== "string") {
+      throw new Error(`scenario ${scenario.id}.prompt required`);
+    }
+    if (!scenario.task_bash || typeof scenario.task_bash !== "string") {
+      throw new Error(`scenario ${scenario.id}.task_bash required`);
+    }
+    if (!scenario.expectations || typeof scenario.expectations !== "object") {
+      throw new Error(`scenario ${scenario.id}.expectations required`);
+    }
+    const kind = scenario.kind || "prescribed";
+    if (kind !== "prescribed" && kind !== "natural") {
+      throw new Error(`scenario ${scenario.id}.kind must be prescribed or natural`);
+    }
+    for (const key of BOOLEAN_KEYS) {
+      if (scenario.expectations[key] !== undefined && typeof scenario.expectations[key] !== "boolean") {
+        throw new Error(`scenario ${scenario.id}.expectations.${key} must be boolean`);
       }
-      if (!scenario.task_bash || typeof scenario.task_bash !== "string") {
-        throw new Error(`scenario ${scenario.id}.task_bash required`);
-      }
-      if (!scenario.expectations || typeof scenario.expectations !== "object") {
-        throw new Error(`scenario ${scenario.id}.expectations required`);
-      }
-      for (const key of BOOLEAN_KEYS) {
-        if (scenario.expectations[key] !== undefined && typeof scenario.expectations[key] !== "boolean") {
-          throw new Error(`scenario ${scenario.id}.expectations.${key} must be boolean`);
-        }
-      }
-      return scenario;
-    }),
-  };
+    }
+    return { ...scenario, kind };
+  });
+  if (!scenarios.some((scenario) => scenario.kind === "natural")) {
+    throw new Error("pi-tmux-bash eval must include at least one natural user request");
+  }
+  return { ...raw, scenarios };
 }
 
 function toolStarts(trace, toolName) {
