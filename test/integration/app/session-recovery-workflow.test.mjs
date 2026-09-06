@@ -28,16 +28,24 @@ function runPublicCli(root, args) {
 
 test("isolated public workflow refuses ordinary reset, recovers four deliveries, and preserves stable identities", { timeout: 15_000 }, async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-public-context-workflow-"));
+  const workflowTmp = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-workflow-tmp-"));
   const calls = path.join(root, "calls.log");
   const agentId = "cli_newA1";
   fs.writeFileSync(calls, "", { mode: 0o600 });
   fs.writeFileSync(path.join(root, "config.json"), JSON.stringify({ version: 3, serverId: "server-workflow",
     activeAgent: agentId, agents: { [agentId]: { runtime: "pi", model: "fixture-model" } } }), { mode: 0o600 });
-  const harness = spawn(process.execPath, [path.join(ROOT, "test/support/local-control-harness.mjs"), "app/runtime-process.mjs"], {
-    cwd: ROOT, env: { ...process.env, LARKIN_HOME: root, LARKIN_CONFIG_DIR: root, LARKIN_CONTROL_CALLS: calls,
-      LARKIN_RECOVERY_WORKFLOW: "1", LARKIN_CONTROL_DELAY_MS: "0", TMPDIR: fs.mkdtempSync(path.join(os.tmpdir(), "larkin-workflow-tmp-")) },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  let harness;
+  try {
+    harness = spawn(process.execPath, [path.join(ROOT, "test/support/local-control-harness.mjs"), "app/runtime-process.mjs"], {
+      cwd: ROOT, env: { ...process.env, LARKIN_HOME: root, LARKIN_CONFIG_DIR: root, LARKIN_CONTROL_CALLS: calls,
+        LARKIN_RECOVERY_WORKFLOW: "1", LARKIN_CONTROL_DELAY_MS: "0", TMPDIR: workflowTmp },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    fs.rmSync(workflowTmp, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
   let output = "";
   harness.stdout.on("data", (chunk) => { output += chunk; });
   harness.stderr.on("data", (chunk) => { output += chunk; });
@@ -73,7 +81,17 @@ test("isolated public workflow refuses ordinary reset, recovers four deliveries,
     ]);
     const store = createAgentStateStore(root, agentId);
     const consumedDeadline = Date.now() + 3_000;
-    while (store.readNdjson("inbox").length !== 0 && Date.now() < consumedDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    let inboxState = store.readJson("inboxState", { targets: {} });
+    while (Date.now() < consumedDeadline) {
+      const inboxEmpty = store.readNdjson("inbox").length === 0;
+      inboxState = store.readJson("inboxState", { targets: {} });
+      const ledgerState = store.readJson("runtimeDeliveries", { records: [] });
+      const consumedCount = Array.isArray(ledgerState.records)
+        ? ledgerState.records.filter((record) => record.messageId?.startsWith("om_workflow_context_") && record.status === "consumed").length
+        : 0;
+      if (inboxEmpty && inboxState.targets?.["chat:oc_workflow_context"]?.model_seen_seq === 4 && consumedCount === 4) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     assert.equal(store.readNdjson("inbox").length, 0);
     const ledger = store.readJson("runtimeDeliveries", { records: [] });
     assert.deepEqual(ledger.records.filter((record) => record.messageId.startsWith("om_workflow_context_")).map((record) => record.status), ["consumed", "consumed", "consumed", "consumed"]);
@@ -81,7 +99,6 @@ test("isolated public workflow refuses ordinary reset, recovers four deliveries,
       ["workflow-delivery-0", "workflow-input-0"], ["workflow-delivery-1", "workflow-input-1"],
       ["workflow-delivery-2", "workflow-input-2"], ["workflow-delivery-3", "workflow-input-3"],
     ]);
-    const inboxState = store.readJson("inboxState", { targets: {} });
     assert.equal(inboxState.targets["chat:oc_workflow_context"].model_seen_seq, 4);
 
     const repeated = runPublicCli(root, ["session", "recover", "--agent", agentId, "--reason", "context-overflow", "--json", "--wait-ready", "0"]);
@@ -92,6 +109,7 @@ test("isolated public workflow refuses ordinary reset, recovers four deliveries,
     assert.doesNotMatch(repeated.stdout, /workflow-delivery|workflow-input|om_workflow|\/private|\/tmp|secret|credential|synthetic/);
   } finally {
     if (harness.exitCode === null) { harness.kill("SIGTERM"); await once(harness, "exit"); }
+    fs.rmSync(workflowTmp, { recursive: true, force: true });
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
