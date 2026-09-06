@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { test } from "bun:test";
 import { resolvePiProcessExtensionArgs } from "../../../dist/runtime/runtime-adapters.mjs";
 
@@ -10,11 +11,13 @@ test("Pi process extension args inject only the Larkin tmux bundle off Windows",
   const unix = resolvePiProcessExtensionArgs({
     distribution: "external",
     piCommand: "pi",
-    env: {},
-    platform: "linux",
+    env: process.env,
+    platform: process.platform,
   });
-  assert.equal(unix[0], "-e");
-  assert.match(unix[1], /pi-tmux\.bundle\.js$/);
+  if (process.platform !== "win32" && spawnSync("tmux", ["-V"], { env: process.env }).status === 0) {
+    assert.equal(unix[0], "-e");
+    assert.match(unix[1], /pi-tmux\.bundle\.js$/);
+  } else assert.deepEqual(unix, []);
   assert.deepEqual(resolvePiProcessExtensionArgs({
     distribution: "external",
     piCommand: "pi",

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -579,12 +580,14 @@ test("Pi initialization caps eight concurrent adapters and releases a failed per
   assert.equal(results.filter((result) => result.status === "fulfilled").length, 7);
 });
 
-test("Pi injects the Larkin tmux extension on unix and skips it on win32", () => {
+test("Pi injects its tmux extension only when the host capability is available", () => {
   const linux = resolvePiProcessExtensionArgs({
-    distribution: "external", piCommand: "external-pi", env: {}, platform: "linux",
+    distribution: "external", piCommand: "external-pi", env: process.env, platform: process.platform,
   });
-  assert.equal(linux[0], "-e");
-  assert.match(linux[1], /pi-tmux\.bundle\.js$/);
+  if (process.platform !== "win32" && spawnSync("tmux", ["-V"], { env: process.env }).status === 0) {
+    assert.equal(linux[0], "-e");
+    assert.match(linux[1], /pi-tmux\.bundle\.js$/);
+  } else assert.deepEqual(linux, []);
   assert.deepEqual(resolvePiProcessExtensionArgs({
     distribution: "external", piCommand: "external-pi", env: {}, platform: "win32",
   }), []);
