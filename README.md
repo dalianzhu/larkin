@@ -91,11 +91,13 @@ Feishu (https://open.feishu.cn) and Lark (https://open.larksuite.com) are differ
 
 During setup, choose one of the three externally installed runtimes: Pi (`pi`), Codex (`codex`), or Claude Code (`claude`). Larkin does not ship a runtime and does not store provider credentials. Install the runtime yourself and complete its own login (`pi` login flow, `codex login`, or `claude login`) before setup. Interactive setup lists each runtime as installed or not installed and refuses a missing binary; non-interactive setup requires `--runtime` and exits non-zero with the same missing-install message.
 
-`larkin setup --model <id>` optionally stores a catalog model for that runtime. After setup, use `larkin model` and `larkin runtime` to inspect or switch. For Pi, Larkin talks to your installed `pi --mode rpc` and verifies the RPC handshake and compaction capability contract. Larkin does not inject Pi extensions.
+`larkin setup --model <id>` optionally stores a catalog model for that runtime. After setup, use `larkin model` and `larkin runtime` to inspect or switch. For Pi, Larkin talks to your installed `pi --mode rpc` and verifies the RPC handshake and compaction capability contract.
 
 ### Optional Pi tmux-backed bash
 
-When `tmux` is available, Larkin can inject its own thin tmux-backed bash extension (`dist/runtime/pi-tmux.bundle.js`). This is not a published third-party tmux plugin, and Larkin does not install or copy one. Commands keep the exact process cwd, including ordinary non-Git directories and paths with spaces. A wait timeout is not process failure; inspect and stop use the returned `taskId`. Completion notifications use `larkin-tmux-completion` in the originating conversation. When this extension is loaded, it does not fall back to native bash. If tmux is unavailable, Larkin does not register the extension and Pi keeps native bash. After Pi shutdown, watchers stop; background commands may remain tmux-recoverable, but automatic completion after restart is not promised.
+On macOS and Linux with `tmux` installed, Larkin provides a small tmux-backed Bash tool. Commands run in their requested directory, including non-Git directories and paths with spaces. By default the tool waits up to 30 seconds, then returns a `taskId` while the same command continues; `background: true` returns immediately. The `tmux` tool lists, inspects and stops tasks owned by that Pi instance. Completed background commands notify the Agent. There is no Larkin-imposed 60-second kill or ten-minute command limit.
+
+Without tmux, or on native Windows, Pi keeps native bash. After Pi shuts down, background commands remain in tmux, but automatic completion notifications are not restored; use `tmux list-sessions` to find the session containing the task ID and attach manually. Larkin does not require a third-party tmux plugin.
 
 ### Optional Inbox Audit
 

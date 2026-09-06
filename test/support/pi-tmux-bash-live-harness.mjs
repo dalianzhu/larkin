@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomBytes, createHash } from "node:crypto";
+import { createLarkinTmux } from "../../src/runtime/pi-tmux.ts";
 import { OWN_EXTENSION_NAME, OWN_TMUX_BASH_BUNDLE } from "./pi-tmux-bash-grader.mjs";
 
 export { OWN_EXTENSION_NAME, OWN_TMUX_BASH_BUNDLE };
@@ -18,6 +20,7 @@ export const LOCAL_PI_MODELS = [
 export const UNAVAILABLE_PI_MODELS = ["opencode-go/deepseek-v4-flash"];
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const isolatedWorkspaces = new Map();
 
 export function userPiAgentDir(env = process.env) {
   return env.PI_CODING_AGENT_DIR || path.join(env.HOME || os.homedir(), ".pi", "agent");
@@ -40,6 +43,7 @@ export function readOwnBuildRevision(root = ROOT, env = process.env) {
     entry: "src/runtime/pi-tmux-extension.ts",
     core: "src/runtime/pi-tmux.ts",
     package_version: pkg.version,
+    bundle_sha256: fs.existsSync(resolved) ? createHash("sha256").update(fs.readFileSync(resolved)).digest("hex") : null,
     bundle_ready: fs.existsSync(bundle),
     resolved,
     revision_source: "own-package-version+bundle",
@@ -123,7 +127,7 @@ export function createIsolatedTmuxWorkspace(prefixOrOptions = "larkin-tmux-eval-
   }
   const sessionName = options.sessionName
     || `larkin-tmux-${path.basename(root).replace(/[^a-zA-Z0-9-]/g, "").slice(-16)}`;
-  return {
+  const workspace = {
     root,
     workDir,
     extConfigDir,
@@ -131,15 +135,24 @@ export function createIsolatedTmuxWorkspace(prefixOrOptions = "larkin-tmux-eval-
     sessionName,
     gitFixture,
     spacesInPath: workDir.includes(" "),
+    stateDir: path.join(root, "state"),
+    instances: [],
   };
+  isolatedWorkspaces.set(sessionName, workspace);
+  return workspace;
 }
 
 export function childEnvForIsolatedPi(workspace, env = process.env) {
+  const instance = { stateDir: workspace.stateDir, agentId: "tmux-eval", instanceId: randomBytes(8).toString("hex") };
+  workspace.instances.push(instance);
   return {
     ...env,
     NO_COLOR: "1",
     PI_EXTENSION_CONFIG_DIR: workspace.extConfigDir,
     PI_OFFLINE: env.PI_OFFLINE || "",
+    LARKIN_STATE_DIR: instance.stateDir,
+    LARKIN_AGENT_ID: instance.agentId,
+    LARKIN_TMUX_INSTANCE_ID: instance.instanceId,
   };
 }
 
@@ -154,12 +167,7 @@ export function requireExplicitEvalModel(env = process.env) {
   if (!model) {
     throw new Error("LARKIN_PI_TMUX_BASH_EVAL_MODEL is required for real Pi runs; dataset.model.selection is not a silent fallback");
   }
-  if (UNAVAILABLE_PI_MODELS.includes(model)) {
-    throw new Error(`${model} is not available on this host (pi --list-models); set LARKIN_PI_TMUX_BASH_EVAL_MODEL to one of ${LOCAL_PI_MODELS.join(", ")}`);
-  }
-  if (!LOCAL_PI_MODELS.includes(model)) {
-    throw new Error(`LARKIN_PI_TMUX_BASH_EVAL_MODEL=${model} is not in the recorded local available list (${LOCAL_PI_MODELS.join(", ")}); refusing silent fallback`);
-  }
+  if (!/^[^\s/]+\/\S+$/.test(model)) throw new Error("explicit model must be provider/model; actual selection is verified at RPC handshake");
   return model;
 }
 
@@ -292,18 +300,28 @@ function runningChildFromWindow(window) {
 }
 
 export function inspectRunningTmuxChild(sessionName, taskId, cwd) {
-  const windows = listIsolatedTmuxWindows(sessionName);
-  const byTask = windows.find((item) => item.taskId === taskId || item.name === taskId);
-  if (byTask) return runningChildFromWindow(byTask);
-  const byCwd = cwd ? listTmuxPanesForCwd(cwd) : [];
-  if (byCwd.length === 1) return runningChildFromWindow(byCwd[0]);
-  if (windows.length === 1) return runningChildFromWindow(windows[0]);
+  const workspace = isolatedWorkspaces.get(sessionName);
+  if (!workspace || !/^[a-f0-9]{16}$/.test(taskId)) return { window: null, running: false, processes: [] };
+  for (const instance of workspace.instances) {
+    const manager = createLarkinTmux(instance);
+    try { manager.peek(taskId); } catch { continue; }
+    const meta = JSON.parse(fs.readFileSync(path.join(manager.root, taskId, "meta.json"), "utf8"));
+    if (meta.taskId !== taskId || path.resolve(meta.cwd) !== path.resolve(cwd)) continue;
+    const listed = spawnSync("tmux", ["list-panes", "-t", `=${meta.session}`, "-F", "#{window_id}\t#{window_name}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}"], { encoding: "utf8" });
+    if (listed.status === 0 && listed.stdout.trim()) return runningChildFromWindow(parseWindowLine(listed.stdout.trim().split("\n")[0]));
+  }
   return { window: null, running: false, processes: [] };
 }
 
 export function killIsolatedTmuxSession(sessionName) {
-  if (!sessionName || !sessionName.startsWith("larkin-tmux-")) return;
-  spawnSync("tmux", ["kill-session", "-t", sessionName], { encoding: "utf8" });
+  const workspace = isolatedWorkspaces.get(sessionName);
+  if (!workspace) return;
+  for (const instance of workspace.instances) {
+    const manager = createLarkinTmux(instance);
+    for (const task of manager.list()) if (task.status === "running") manager.kill(task.taskId);
+  }
+  // The small terminal-list unit fixture creates this exact synthetic session.
+  spawnSync("tmux", ["kill-session", "-t", `=${sessionName}`], { encoding: "utf8" });
 }
 
 export function waitFor(trace, predicate, timeoutMs = 240_000, intervalMs = 250) {

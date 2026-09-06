@@ -1,7 +1,0 @@
-{
-  "name": "@richardgill/pi-tmux-bash",
-  "version": "0.0.12",
-  "requiresGitRepository": true,
-  "redistributed": false,
-  "install": "Install through Pi package settings if you want long-running bash. Larkin never injects -e flags or copies this package."
-}

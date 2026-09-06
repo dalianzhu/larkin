@@ -115,7 +115,6 @@ test("pi-tmux-bash dataset pins own bundle revision, non-git cwd, and standing v
   assert.equal(DATASET.extension.entry, "src/runtime/pi-tmux-extension.ts");
   assert.equal(DATASET.extension.core, "src/runtime/pi-tmux.ts");
   assert.deepEqual(DATASET.result_schema.internal_snapshots, ["startedAt", "endedAt"]);
-  assert.equal(DATASET.extension.package_version, PACKAGE.version);
   assert.equal(DATASET.extension.upstream, "not-used");
   assert.equal(DATASET.completion.customType, LARKIN_TMUX_COMPLETION_TYPE);
   assert.equal(DATASET.completion.triggerTurn, true);
@@ -415,8 +414,7 @@ test("prompt-eval files do not commit upstream package pins or machine-specific 
     assert.doesNotMatch(text, /windowIdFromBashResult/);
   }
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
-  assert.match(readme, /dist\/runtime\/pi-tmux\.bundle\.js/);
-  assert.match(readme, /does not fall back to native bash/);
+  assert.match(readme, /Pi keeps native bash/);
   assert.doesNotMatch(readme, /those sessions stay on Pi's native bash/);
   assert.doesNotMatch(readme, /Published 0\.0\.12/);
 });
@@ -424,14 +422,8 @@ test("prompt-eval files do not commit upstream package pins or machine-specific 
 test("real Pi runs require an explicit local model and the own bundle", () => {
   assert.throws(() => requireExplicitEvalModel({}), /LARKIN_PI_TMUX_BASH_EVAL_MODEL is required/);
   assert.throws(() => requireExplicitEvalModel({ LARKIN_PI_TMUX_BASH_EVAL_MODEL: "" }), /required/);
-  assert.throws(
-    () => requireExplicitEvalModel({ LARKIN_PI_TMUX_BASH_EVAL_MODEL: "opencode-go/deepseek-v4-flash" }),
-    /not available/,
-  );
-  assert.throws(
-    () => requireExplicitEvalModel({ LARKIN_PI_TMUX_BASH_EVAL_MODEL: "openai-codex/gpt-5.6-terra" }),
-    /not in the recorded local available list/,
-  );
+  assert.equal(requireExplicitEvalModel({ LARKIN_PI_TMUX_BASH_EVAL_MODEL: "other-provider/other-model" }), "other-provider/other-model");
+  assert.throws(() => requireExplicitEvalModel({ LARKIN_PI_TMUX_BASH_EVAL_MODEL: "missing-provider" }), /provider\/model/);
   assert.equal(
     requireExplicitEvalModel({ LARKIN_PI_TMUX_BASH_EVAL_MODEL: "openai-codex/gpt-5.6-luna" }),
     "openai-codex/gpt-5.6-luna",

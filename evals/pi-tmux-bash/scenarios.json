@@ -9,7 +9,6 @@
     "entry": "src/runtime/pi-tmux-extension.ts",
     "core": "src/runtime/pi-tmux.ts",
     "revision_source": "own-package-version+bundle",
-    "package_version": "0.5.4",
     "upstream": "not-used"
   },
   "workspace": {

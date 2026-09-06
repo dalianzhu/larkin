@@ -32,6 +32,7 @@ import {
   piSessionIdFromState,
   requireExplicitEvalModel,
   requireOwnTmuxBashBundle,
+  readOwnBuildRevision,
   selectedPiModel,
   snapshotUserPiSettings,
   spawnPiRpc,
@@ -62,7 +63,7 @@ afterAll(() => {
 });
 
 function subscribeTrace(client, trace) {
-  client.subscribe((event) => trace.push(event));
+  client.subscribe((event) => trace.push({ ...event, observedAt: Date.now() }));
 }
 
 function agentEndCount(trace) {
@@ -105,6 +106,8 @@ async function promptWhenIdle(session, message) {
 async function startIsolatedPi({ appendPrompt = true, git = false, workspace } = {}) {
   const snapshot = snapshotUserPiSettings();
   const bundlePath = requireOwnTmuxBashBundle(ROOT);
+  const build = readOwnBuildRevision(ROOT);
+  console.log(`[live-build] version=${build.package_version} bundle_sha256=${build.bundle_sha256}`);
   if (!workspace) {
     workspace = createIsolatedTmuxWorkspace({
       prefix: git ? "larkin-tmux-git-" : "larkin-tmux-eval-",
@@ -124,7 +127,9 @@ async function startIsolatedPi({ appendPrompt = true, git = false, workspace } =
   const trace = [];
   const client = new PiRpcClient(child, { requestTimeoutMs: 30_000, inputTimeoutMs: 180_000, inputMaxTimeoutMs: 600_000 });
   subscribeTrace(client, trace);
-  const state = await client.request("get_state");
+  let state;
+  try { state = await client.request("get_state"); }
+  catch (error) { await client.close(); throw error; }
   const selected = selectedPiModel(state);
   const modelRecord = assertRequestedModelUsed(model, selected);
   assertHeadlessExtensionFixtureArgs(args, bundlePath);
@@ -158,7 +163,6 @@ test("pi-tmux-bash eval starts from the fixed scenario dataset", () => {
   assert.deepEqual(DATASET.model.not_available_locally, ["opencode-go/deepseek-v4-flash"]);
   assert.equal(LOCAL_PI_MODELS.includes(DATASET.model.selection), true);
   assert.match(INTENDED_EVAL_COMMAND, /LARKIN_PI_TMUX_BASH_EVAL_MODEL=openai-codex\/gpt-5\.6-luna/);
-  if (requestedModel) assert.equal(LOCAL_PI_MODELS.includes(requestedModel), true);
   assert.equal(DATASET.standing_prompt_version, "larkin-standing-v30");
   assert.equal(DATASET.workspace.success_path, "non-git-cwd");
   assert.equal(DATASET.workspace.cwd_preservation, "exact");
@@ -262,7 +266,7 @@ test.skipIf(!liveEnabled)("opt-in live RPC: >60s wait-timeout background and unp
     const bashStart = await waitFor(session.trace, (event) =>
       event?.type === "tool_execution_start" && event.toolName === "bash"
       && commandMatchesTaskBash(event.args?.command, timedCommand), 180_000);
-    const toolStartedAt = Date.now();
+    const toolStartedAt = bashStart.observedAt;
     assert.ok(bashStart, "lifetime is measured from the matching bash tool_execution_start, not the pre-model prompt");
     await waitFor(session.trace, (event) => event?.type === "tool_execution_end" && event.toolName === "bash", 180_000);
     const bashEnd = matchingBashEnd(session.trace, timedCommand);

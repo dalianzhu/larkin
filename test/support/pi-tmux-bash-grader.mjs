@@ -136,10 +136,6 @@ function assertOwnExtensionMetadata(raw, repoRoot) {
   if (extension.revision_source !== "own-package-version+bundle") {
     throw new Error("pi-tmux-bash eval must use own package version + bundle as build revision metadata");
   }
-  const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
-  if (extension.package_version !== pkg.version) {
-    throw new Error(`extension.package_version must match package.json version ${pkg.version}`);
-  }
   if (raw.plugin) {
     throw new Error("pi-tmux-bash eval must not pin a published plugin; use extension build revision metadata");
   }
