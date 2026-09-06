@@ -95,7 +95,7 @@ During setup, choose one of the three externally installed runtimes: Pi (`pi`), 
 
 ### Optional Pi tmux-backed bash
 
-When `tmux` is available, Larkin can inject its own thin tmux-backed bash extension (`dist/runtime/pi-tmux-bash.bundle.js`). This is not a published third-party tmux plugin, and Larkin does not install or copy one. Commands keep the exact process cwd, including ordinary non-Git directories and paths with spaces. A wait timeout is not process failure; inspect and stop use the returned `taskId`. Completion notifications use `larkin-tmux-completion` in the originating conversation. When this extension is loaded, it does not fall back to native bash. If tmux is unavailable, Larkin does not register the extension and Pi keeps native bash. After Pi shutdown, watchers stop; background commands may remain tmux-recoverable, but automatic completion after restart is not promised.
+When `tmux` is available, Larkin can inject its own thin tmux-backed bash extension (`dist/runtime/pi-tmux.bundle.js`). This is not a published third-party tmux plugin, and Larkin does not install or copy one. Commands keep the exact process cwd, including ordinary non-Git directories and paths with spaces. A wait timeout is not process failure; inspect and stop use the returned `taskId`. Completion notifications use `larkin-tmux-completion` in the originating conversation. When this extension is loaded, it does not fall back to native bash. If tmux is unavailable, Larkin does not register the extension and Pi keeps native bash. After Pi shutdown, watchers stop; background commands may remain tmux-recoverable, but automatic completion after restart is not promised.
 
 ### Optional Inbox Audit
 

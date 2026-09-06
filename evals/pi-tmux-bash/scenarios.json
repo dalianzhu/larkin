@@ -3,9 +3,11 @@
   "version": 1,
   "standing_prompt_version": "larkin-standing-v30",
   "extension": {
-    "name": "larkin-pi-tmux-bash",
+    "name": "larkin-pi-tmux",
     "distribution": "larkin-owned-bundle",
-    "bundle": "dist/runtime/pi-tmux-bash.bundle.js",
+    "bundle": "dist/runtime/pi-tmux.bundle.js",
+    "entry": "src/runtime/pi-tmux-extension.ts",
+    "core": "src/runtime/pi-tmux.ts",
     "revision_source": "own-package-version+bundle",
     "package_version": "0.5.4",
     "upstream": "not-used"
@@ -24,6 +26,7 @@
   },
   "result_schema": {
     "bash_details": ["taskId", "status", "exitCode", "output"],
+    "internal_snapshots": ["startedAt", "endedAt"],
     "status_values": ["running", "completed", "failed", "cancelled"],
     "tmux_id": "taskId",
     "text_includes": ["taskId", "status"]

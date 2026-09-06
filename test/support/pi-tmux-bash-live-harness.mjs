@@ -23,28 +23,34 @@ export function userPiAgentDir(env = process.env) {
   return env.PI_CODING_AGENT_DIR || path.join(env.HOME || os.homedir(), ".pi", "agent");
 }
 
-export function resolveOwnTmuxBashBundle(root = ROOT) {
+export function resolveOwnTmuxBashBundle(root = ROOT, env = process.env) {
+  const override = String(env.LARKIN_PI_TMUX_BASH_EXTENSION || "").trim();
+  if (override) return path.resolve(override);
   return path.join(root, OWN_TMUX_BASH_BUNDLE);
 }
 
-export function readOwnBuildRevision(root = ROOT) {
+export function readOwnBuildRevision(root = ROOT, env = process.env) {
   const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
-  const bundle = resolveOwnTmuxBashBundle(root);
+  const bundle = path.join(root, OWN_TMUX_BASH_BUNDLE);
+  const resolved = resolveOwnTmuxBashBundle(root, env);
   return {
     name: OWN_EXTENSION_NAME,
     distribution: "larkin-owned-bundle",
     bundle: OWN_TMUX_BASH_BUNDLE,
+    entry: "src/runtime/pi-tmux-extension.ts",
+    core: "src/runtime/pi-tmux.ts",
     package_version: pkg.version,
     bundle_ready: fs.existsSync(bundle),
+    resolved,
     revision_source: "own-package-version+bundle",
     upstream: "not-used",
   };
 }
 
-export function requireOwnTmuxBashBundle(root = ROOT) {
-  const resolved = resolveOwnTmuxBashBundle(root);
+export function requireOwnTmuxBashBundle(root = ROOT, env = process.env) {
+  const resolved = resolveOwnTmuxBashBundle(root, env);
   if (!fs.existsSync(resolved)) {
-    throw new Error(`Larkin tmux bundle not ready: ${resolved}; wait for runtime integration; refusing upstream plugin`);
+    throw new Error(`Larkin tmux extension not ready: ${resolved}; set LARKIN_PI_TMUX_BASH_EXTENSION to the live entrypoint or wait for ${OWN_TMUX_BASH_BUNDLE}; refusing upstream plugin`);
   }
   return resolved;
 }

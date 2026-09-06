@@ -112,6 +112,9 @@ test("pi-tmux-bash dataset pins own bundle revision, non-git cwd, and standing v
   assert.equal(DATASET.extension.name, OWN_EXTENSION_NAME);
   assert.equal(DATASET.extension.distribution, "larkin-owned-bundle");
   assert.equal(DATASET.extension.bundle, OWN_TMUX_BASH_BUNDLE);
+  assert.equal(DATASET.extension.entry, "src/runtime/pi-tmux-extension.ts");
+  assert.equal(DATASET.extension.core, "src/runtime/pi-tmux.ts");
+  assert.deepEqual(DATASET.result_schema.internal_snapshots, ["startedAt", "endedAt"]);
   assert.equal(DATASET.extension.package_version, PACKAGE.version);
   assert.equal(DATASET.extension.upstream, "not-used");
   assert.equal(DATASET.completion.customType, LARKIN_TMUX_COMPLETION_TYPE);
@@ -342,16 +345,28 @@ test("isolated harness uses the own bundle path and does not write user Pi setti
     const revision = readOwnBuildRevision(ROOT);
     assert.equal(revision.name, OWN_EXTENSION_NAME);
     assert.equal(revision.bundle, OWN_TMUX_BASH_BUNDLE);
+    assert.equal(revision.entry, "src/runtime/pi-tmux-extension.ts");
+    assert.equal(revision.core, "src/runtime/pi-tmux.ts");
     assert.equal(revision.package_version, PACKAGE.version);
     assert.equal(revision.upstream, "not-used");
-    assert.equal(resolveOwnTmuxBashBundle(ROOT), path.join(ROOT, OWN_TMUX_BASH_BUNDLE));
+    assert.equal(resolveOwnTmuxBashBundle(ROOT, {}), path.join(ROOT, OWN_TMUX_BASH_BUNDLE));
+    const liveEntry = path.join(workspace.root, "pi-tmux-extension.ts");
+    fs.writeFileSync(liveEntry, "export {}\n");
+    assert.equal(
+      resolveOwnTmuxBashBundle(ROOT, { LARKIN_PI_TMUX_BASH_EXTENSION: liveEntry }),
+      path.resolve(liveEntry),
+    );
+    assert.equal(
+      requireOwnTmuxBashBundle(ROOT, { LARKIN_PI_TMUX_BASH_EXTENSION: liveEntry }),
+      path.resolve(liveEntry),
+    );
     const extensionArgs = buildPiRpcArgs({
-      bundlePath: resolveOwnTmuxBashBundle(ROOT),
+      bundlePath: resolveOwnTmuxBashBundle(ROOT, {}),
       loadMode: "extension",
       model: DATASET.model.selection,
     });
     assert.deepEqual(extensionArgs.slice(0, 4), HEADLESS_PI_RPC_PREFIX);
-    assert.equal(assertHeadlessExtensionFixtureArgs(extensionArgs, resolveOwnTmuxBashBundle(ROOT)), true);
+    assert.equal(assertHeadlessExtensionFixtureArgs(extensionArgs, resolveOwnTmuxBashBundle(ROOT, {})), true);
     assert.equal(extensionArgs.includes("-e"), true);
     assert.doesNotMatch(extensionArgs.join(" "), /@richardgill|0\.0\.12/);
     assertUserPiSettingsUnchanged(snapshot);
@@ -392,6 +407,7 @@ test("prompt-eval files do not commit upstream package pins or machine-specific 
     assert.doesNotMatch(text, /DEFAULT_EXTRACTED_PACKAGE|DEFAULT_ISOLATED_PACKAGE/);
     assert.doesNotMatch(text, /@richardgill\/pi-tmux-bash/);
     assert.doesNotMatch(text, /0\.0\.12/);
+    assert.doesNotMatch(text, /pi-tmux-bash\.bundle\.js/);
     assert.doesNotMatch(text, /LARKIN_PI_TMUX_BASH_PACKAGE/);
     assert.doesNotMatch(text, /prepareIsolatedTmuxBashPackage/);
     assert.doesNotMatch(text, /npm install/);
@@ -399,7 +415,7 @@ test("prompt-eval files do not commit upstream package pins or machine-specific 
     assert.doesNotMatch(text, /windowIdFromBashResult/);
   }
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
-  assert.match(readme, /dist\/runtime\/pi-tmux-bash\.bundle\.js/);
+  assert.match(readme, /dist\/runtime\/pi-tmux\.bundle\.js/);
   assert.match(readme, /does not fall back to native bash/);
   assert.doesNotMatch(readme, /those sessions stay on Pi's native bash/);
   assert.doesNotMatch(readme, /Published 0\.0\.12/);
@@ -430,7 +446,7 @@ test("real Pi runs require an explicit local model and the own bundle", () => {
   );
   const missingRoot = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-missing-bundle-"));
   try {
-    assert.throws(() => requireOwnTmuxBashBundle(missingRoot), /refusing upstream plugin/);
+    assert.throws(() => requireOwnTmuxBashBundle(missingRoot, {}), /refusing upstream plugin/);
   } finally {
     fs.rmSync(missingRoot, { recursive: true, force: true });
   }
@@ -463,6 +479,10 @@ test("command runtime is taken from in-command timestamps, not leftover tmux win
   assert.match(harness, /list-windows/);
   assert.equal(taskIdFromBashResult(bashResult("task-42")), "task-42");
   assert.equal(taskIdFromBashResult({ details: { taskId: "abc-1", status: "running" } }), "abc-1");
+  assert.equal(taskIdFromBashResult({
+    details: { taskId: "task-42", status: "running", exitCode: null, output: "", startedAt: 1000, endedAt: null },
+  }), "task-42");
+  assert.equal(taskIdFromBashResult({ details: { startedAt: 1000, endedAt: 2000, status: "completed" } }), null);
   assert.equal(taskIdFromBashResult("Still running in background tmux window @42"), null);
   assert.equal(taskIdFromBashResult("no identifier"), null);
 

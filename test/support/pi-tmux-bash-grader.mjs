@@ -25,8 +25,10 @@ const FORCED_SUBAGENT_TOOLS = new Set([
 ]);
 
 export const LARKIN_TMUX_COMPLETION_TYPE = "larkin-tmux-completion";
-export const OWN_TMUX_BASH_BUNDLE = "dist/runtime/pi-tmux-bash.bundle.js";
-export const OWN_EXTENSION_NAME = "larkin-pi-tmux-bash";
+export const OWN_TMUX_BASH_BUNDLE = "dist/runtime/pi-tmux.bundle.js";
+export const OWN_EXTENSION_ENTRY = "src/runtime/pi-tmux-extension.ts";
+export const OWN_EXTENSION_CORE = "src/runtime/pi-tmux.ts";
+export const OWN_EXTENSION_NAME = "larkin-pi-tmux";
 
 const STILL_RUNNING_RE = /still running|started in background|background tmux|timeoutAction["']?\s*[:=]\s*["']?background|status["']?\s*[:=]\s*["']?running/i;
 const HARD_KILL_RE = /hard-capped at 60|never pass a bash timeout above 60|total lifetime is 600s|supervised_start|run_in_background:\s*true/i;
@@ -122,6 +124,12 @@ function assertOwnExtensionMetadata(raw, repoRoot) {
   if (extension.bundle !== OWN_TMUX_BASH_BUNDLE) {
     throw new Error(`pi-tmux-bash extension.bundle must be ${OWN_TMUX_BASH_BUNDLE}`);
   }
+  if (extension.entry !== OWN_EXTENSION_ENTRY) {
+    throw new Error(`pi-tmux-bash extension.entry must be ${OWN_EXTENSION_ENTRY}`);
+  }
+  if (extension.core !== OWN_EXTENSION_CORE) {
+    throw new Error(`pi-tmux-bash extension.core must be ${OWN_EXTENSION_CORE}`);
+  }
   if (extension.upstream !== "not-used") {
     throw new Error("pi-tmux-bash eval must record that published upstream packages are not used");
   }
@@ -179,6 +187,14 @@ export function loadPiTmuxBashEval(file) {
   }
   if (raw.result_schema?.tmux_id !== "taskId") {
     throw new Error("pi-tmux-bash result schema must identify jobs by taskId, not @window");
+  }
+  if (!Array.isArray(raw.result_schema?.bash_details)
+    || raw.result_schema.bash_details.join(",") !== "taskId,status,exitCode,output") {
+    throw new Error("pi-tmux-bash public details must be taskId/status/exitCode/output");
+  }
+  if (!Array.isArray(raw.result_schema?.internal_snapshots)
+    || raw.result_schema.internal_snapshots.join(",") !== "startedAt,endedAt") {
+    throw new Error("pi-tmux-bash internal snapshots must be startedAt/endedAt");
   }
   if (raw.harness?.headless !== true || raw.harness?.tui_independent !== true) {
     throw new Error("pi-tmux-bash eval must record a headless TUI-independent RPC harness");

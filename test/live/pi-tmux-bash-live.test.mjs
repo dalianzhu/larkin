@@ -166,7 +166,9 @@ test("pi-tmux-bash eval starts from the fixed scenario dataset", () => {
   assert.equal(DATASET.workspace.production_claim, "non-git-cwd-required");
   assert.match(DATASET.workspace.larkin_note, /does not fall back to native bash/);
   assert.equal(DATASET.grader.synthetic_fixtures, "unit-only");
-  assert.equal(DATASET.extension.bundle, "dist/runtime/pi-tmux-bash.bundle.js");
+  assert.equal(DATASET.extension.bundle, "dist/runtime/pi-tmux.bundle.js");
+  assert.equal(DATASET.extension.entry, "src/runtime/pi-tmux-extension.ts");
+  assert.equal(DATASET.extension.core, "src/runtime/pi-tmux.ts");
   assert.equal(DATASET.completion.customType, LARKIN_TMUX_COMPLETION_TYPE);
   assert.equal(DATASET.harness.headless, true);
   assert.equal(DATASET.harness.tui_independent, true);
