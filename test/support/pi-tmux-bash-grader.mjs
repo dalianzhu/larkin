@@ -47,6 +47,33 @@ export function extractTmuxBashCompletion(traceOrMessages) {
   return matches.length > 0 ? matches[0] : null;
 }
 
+export function extractTimedOutBackground(eventOrTrace) {
+  const nodes = Array.isArray(eventOrTrace) ? eventOrTrace : [eventOrTrace];
+  for (const node of nodes) {
+    if (!node) continue;
+    const details = node.result?.details || node.details;
+    if (details?.outcome === "timed-out-background") return details;
+    const encoded = typeof node === "string" ? node : JSON.stringify(node);
+    if (encoded.includes("timed-out-background")) return { outcome: "timed-out-background" };
+  }
+  return null;
+}
+
+export function findUnpromptedCompletionTurn(trace, firstAgentEnd) {
+  const events = Array.isArray(trace) ? trace : [];
+  const start = firstAgentEnd ? events.indexOf(firstAgentEnd) : events.findIndex((event) => event?.type === "agent_end");
+  if (start < 0) return null;
+  const after = events.slice(start + 1);
+  const completionEvent = after.find((event) => extractTmuxBashCompletion(event));
+  if (!completionEvent) return null;
+  return {
+    turnStart: after.find((event) => event?.type === "turn_start"),
+    agentEnd: after.find((event) => event?.type === "agent_end"),
+    completion: extractTmuxBashCompletion(completionEvent),
+    completionEvent,
+  };
+}
+
 export function loadPiTmuxBashEval(file) {
   const raw = JSON.parse(fs.readFileSync(file, "utf8"));
   if (raw.dataset !== "pi-tmux-bash") throw new Error("pi-tmux-bash eval dataset id mismatch");
@@ -65,6 +92,14 @@ export function loadPiTmuxBashEval(file) {
   }
   if (raw.plugin?.distribution !== "external-user-installed") {
     throw new Error("pi-tmux-bash plugin must be recorded as external-user-installed");
+  }
+  if (raw.harness?.headless !== true || raw.harness?.tui_independent !== true) {
+    throw new Error("pi-tmux-bash eval must record a headless TUI-independent RPC harness");
+  }
+  if (!Array.isArray(raw.harness?.pi_args) || !raw.harness.pi_args.includes("--mode")
+    || !raw.harness.pi_args.includes("rpc") || !raw.harness.pi_args.includes("--no-session")
+    || !raw.harness.pi_args.includes("--no-extensions") || !raw.harness.pi_args.includes("-e")) {
+    throw new Error("pi-tmux-bash eval must pin real Pi --mode rpc --no-session --no-extensions -e");
   }
   if (typeof raw.model?.selection !== "string" || !raw.model.selection) {
     throw new Error("eval model must be set");
@@ -141,7 +176,8 @@ export function gradePiTmuxBashTrace(scenario, trace) {
   const results = {
     uses_bash: bashStarts.length > 0,
     no_forced_subagent: forced.length === 0,
-    wait_timeout_not_failure: STILL_RUNNING_RE.test(bashText) || ids.length > 0,
+    wait_timeout_not_failure: STILL_RUNNING_RE.test(bashText) || ids.length > 0
+      || extractTimedOutBackground(bashEnds) !== null,
     returned_id: ids.length > 0,
     inspects_by_returned_id: tmuxStarts.some((event) => {
       const action = event.args?.action;

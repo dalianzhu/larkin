@@ -17,6 +17,12 @@
     "adapter": "pi",
     "selection": "external-pi"
   },
+  "harness": {
+    "headless": true,
+    "tui_independent": true,
+    "intended_script": "test:eval:pi-tmux-bash",
+    "pi_args": ["--mode", "rpc", "--no-session", "--no-extensions", "-e"]
+  },
   "model": {
     "selection": "opencode-go/deepseek-v4-flash",
     "standing_prompt_version": "larkin-standing-v30"

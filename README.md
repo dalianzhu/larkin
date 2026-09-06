@@ -91,7 +91,11 @@ Feishu (https://open.feishu.cn) and Lark (https://open.larksuite.com) are differ
 
 During setup, choose one of the three externally installed runtimes: Pi (`pi`), Codex (`codex`), or Claude Code (`claude`). Larkin does not ship a runtime and does not store provider credentials. Install the runtime yourself and complete its own login (`pi` login flow, `codex login`, or `claude login`) before setup. Interactive setup lists each runtime as installed or not installed and refuses a missing binary; non-interactive setup requires `--runtime` and exits non-zero with the same missing-install message.
 
-`larkin setup --model <id>` optionally stores a catalog model for that runtime. After setup, use `larkin model` and `larkin runtime` to inspect or switch. For Pi, Larkin talks to your installed `pi --mode rpc` and verifies the RPC handshake and compaction capability contract. Larkin does not inject Pi extensions or redistribute `@richardgill/pi-tmux-bash`. Install that plugin through Pi's own package settings if you want long-running bash; if it is present, Pi loads it itself. If published 0.0.12 is installed, it registers bash and then fails outside a git working tree (`not in a git repository`). Larkin does not fall back to native bash, run `git init`, or add `-e` flags. Unowned Pi turns occupy Runtime busy state and do not schedule a second host prompt.
+`larkin setup --model <id>` optionally stores a catalog model for that runtime. After setup, use `larkin model` and `larkin runtime` to inspect or switch. For Pi, Larkin talks to your installed `pi --mode rpc` and verifies the RPC handshake and compaction capability contract. Larkin does not inject Pi extensions.
+
+### Optional Pi tmux-backed bash
+
+`@richardgill/pi-tmux-bash` is an optional, user-installed Pi extension; Larkin does not ship or redistribute it. Pi loads it itself through normal package discovery. It requires `tmux` on `PATH`. Published 0.0.12 registers bash and then fails outside a git working tree (`not in a git repository`); it does not fall back to native bash. Ordinary Larkin Agent workspaces are usually not Git repositories, so do not enable this version there without resolving that compatibility limitation. Larkin does not initialize Git repositories or install the plugin automatically.
 
 ### Optional Inbox Audit
 

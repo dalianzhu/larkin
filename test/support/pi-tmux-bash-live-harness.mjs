@@ -9,6 +9,10 @@ export const DEFAULT_ISOLATED_PACKAGE =
 export const DEFAULT_EXTRACTED_PACKAGE = DEFAULT_ISOLATED_PACKAGE;
 export const PINNED_PLUGIN = { name: "@richardgill/pi-tmux-bash", version: "0.0.12" };
 export const UPSTREAM_NON_GIT_ERROR = /not in a git repository/i;
+export const INTENDED_EVAL_SCRIPT = "test:eval:pi-tmux-bash";
+export const INTENDED_EVAL_COMMAND =
+  "bun run build && LARKIN_RUN_PI_TMUX_BASH_EVAL=1 bun test --max-concurrency 1 test/live/pi-tmux-bash-live.test.mjs";
+export const HEADLESS_PI_RPC_PREFIX = ["--mode", "rpc", "--no-session", "--no-context-files"];
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -97,13 +101,27 @@ export function prepareIsolatedTmuxBashPackage(sourceDir, destDir) {
 }
 
 export function buildPiRpcArgs({ packagePath, loadMode, model, extraArgs = [] }) {
-  const args = ["--mode", "rpc", "--no-session", "--no-context-files", ...extraArgs];
+  const args = [...HEADLESS_PI_RPC_PREFIX, ...extraArgs];
   if (model) args.push("--model", model);
   if (loadMode === "extension") {
     if (!packagePath) throw new Error("extension load mode requires a local package path");
     args.push("--no-extensions", "-e", packagePath);
   }
   return args;
+}
+
+export function assertHeadlessExtensionFixtureArgs(args, packagePath) {
+  if (!Array.isArray(args)) throw new Error("Pi RPC args must be an array");
+  for (const flag of HEADLESS_PI_RPC_PREFIX) {
+    if (!args.includes(flag)) throw new Error(`headless Pi fixture missing ${flag}`);
+  }
+  if (!args.includes("--no-extensions")) throw new Error("headless Pi fixture missing --no-extensions");
+  const extensionIndex = args.indexOf("-e");
+  if (extensionIndex < 0) throw new Error("headless Pi fixture missing -e");
+  if (packagePath && args[extensionIndex + 1] !== packagePath) {
+    throw new Error(`headless Pi fixture -e path mismatch: ${args[extensionIndex + 1]}`);
+  }
+  return true;
 }
 
 export function createIsolatedTmuxWorkspace(prefixOrOptions = "larkin-tmux-eval-") {

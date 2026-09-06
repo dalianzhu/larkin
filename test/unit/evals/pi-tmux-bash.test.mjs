@@ -8,14 +8,19 @@ import {
   PI_TMUX_BASH_GUIDANCE,
 } from "../../../dist/agent/context-prompt.mjs";
 import {
+  extractTimedOutBackground,
   extractTmuxBashCompletion,
+  findUnpromptedCompletionTurn,
   gradePiTmuxBashTrace,
   loadPiTmuxBashEval,
   summarizePiTmuxBashEval,
 } from "../../support/pi-tmux-bash-grader.mjs";
 import {
   DEFAULT_ISOLATED_PACKAGE,
+  HEADLESS_PI_RPC_PREFIX,
+  INTENDED_EVAL_SCRIPT,
   UPSTREAM_NON_GIT_ERROR,
+  assertHeadlessExtensionFixtureArgs,
   assertUserPiSettingsUnchanged,
   buildPiRpcArgs,
   createIsolatedTmuxWorkspace,
@@ -54,6 +59,10 @@ test("pi-tmux-bash dataset pins version, threshold, external plugin 0.0.12, and 
   assert.equal(DATASET.workspace.production_claim, "not-assumed");
   assert.match(DATASET.workspace.upstream_limitation, /not in a git repository/);
   assert.match(DATASET.workspace.larkin_note, /usually not git/);
+  assert.equal(DATASET.harness.headless, true);
+  assert.equal(DATASET.harness.tui_independent, true);
+  assert.equal(DATASET.harness.intended_script, INTENDED_EVAL_SCRIPT);
+  assert.deepEqual(DATASET.harness.pi_args, ["--mode", "rpc", "--no-session", "--no-extensions", "-e"]);
   assert.equal(DATASET.model.selection, "opencode-go/deepseek-v4-flash");
   assert.equal(DATASET.threshold, 0.6);
   assert.equal(DATASET.grader.version, 1);
@@ -111,7 +120,7 @@ test("golden traces reach the registered threshold and reject forced subagent ro
     ],
     "wait-timeout-is-not-failure": [
       { type: "tool_execution_start", toolName: "bash", args: { command: "sleep 12 && echo larkin-tmux-eval-timeout", timeout: 3 } },
-      { type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "Still running after 3s in background tmux. Use tmux peek/list/kill. @99" }] } },
+      { type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "Still running after 3s in background tmux. Use tmux peek/list/kill. @99" }], details: { outcome: "timed-out-background" } } },
       { type: "agent_end" },
     ],
     "inspect-by-returned-id": [
@@ -178,6 +187,29 @@ test("completion extractor only accepts tmux-bash-completion followUp", () => {
   assert.equal(extractTmuxBashCompletion(completionEvent("done"))?.customType, "tmux-bash-completion");
 });
 
+test("headless RPC fixture args and unprompted completion turn are independent of TUI", () => {
+  const args = buildPiRpcArgs({
+    packagePath: "/tmp/fixture-pkg",
+    loadMode: "extension",
+    model: "openai-codex/gpt-5.6-luna",
+  });
+  assert.deepEqual(args.slice(0, 4), HEADLESS_PI_RPC_PREFIX);
+  assert.equal(assertHeadlessExtensionFixtureArgs(args, "/tmp/fixture-pkg"), true);
+  const timeoutEnd = {
+    type: "tool_execution_end",
+    toolName: "bash",
+    result: { details: { outcome: "timed-out-background" }, content: [{ type: "text", text: "Still running after 5s" }] },
+  };
+  assert.equal(extractTimedOutBackground(timeoutEnd)?.outcome, "timed-out-background");
+  const firstEnd = { type: "agent_end" };
+  const secondStart = { type: "turn_start" };
+  const secondEnd = completionEvent("larkin-tmux-eval-done");
+  const found = findUnpromptedCompletionTurn([timeoutEnd, firstEnd, secondStart, secondEnd], firstEnd);
+  assert.equal(found?.completion?.customType, "tmux-bash-completion");
+  assert.equal(found.turnStart, secondStart);
+  assert.equal(findUnpromptedCompletionTurn([timeoutEnd, firstEnd], firstEnd), null);
+});
+
 test("isolated harness uses configurable local package or normal discovery and does not write user Pi settings", () => {
   const snapshot = snapshotUserPiSettings();
   const workspace = createIsolatedTmuxWorkspace("larkin-tmux-unit-");
@@ -189,9 +221,8 @@ test("isolated harness uses configurable local package or normal discovery and d
       loadMode: "extension",
       model: DATASET.model.selection,
     });
-    assert.deepEqual(extensionArgs.slice(0, 4), ["--mode", "rpc", "--no-session", "--no-context-files"]);
-    assert.equal(extensionArgs.includes("--no-extensions"), true);
-    assert.equal(extensionArgs[extensionArgs.indexOf("-e") + 1], workspace.packageDir);
+    assert.deepEqual(extensionArgs.slice(0, 4), HEADLESS_PI_RPC_PREFIX);
+    assert.equal(assertHeadlessExtensionFixtureArgs(extensionArgs, workspace.packageDir), true);
     const discoveryArgs = buildPiRpcArgs({ loadMode: "discovery" });
     assert.equal(discoveryArgs.includes("-e"), false);
     assert.equal(discoveryArgs.includes("--no-extensions"), false);
