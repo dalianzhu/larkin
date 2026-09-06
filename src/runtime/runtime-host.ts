@@ -1674,33 +1674,40 @@ export function createRuntimeHost(options: {
 
   const ensureSession = async (agent: ManagedAgent): Promise<RuntimeSession> => {
     if (agent.disabledReason) throw new Error(agent.disabledReason);
+    if (agent.stopped) throw new Error("runtime Agent is stopped");
     if (agent.session) return agent.session;
     if (agent.starting) return agent.starting;
-    const probeEnv = runtimeEnv(agent.config);
-    await assertOfficialCliReady(agent.config, probeEnv);
-    const readiness = agent.adapter.probe ? await agent.adapter.probe({ agentId: agent.config.agentId,
-      workspaceDir: agent.config.workspaceDir, stateDir: agent.config.stateDir,
-      env: { LARKIN_PI_COMMAND: process.env.LARKIN_PI_COMMAND, LARKIN_CODEX_COMMAND: process.env.LARKIN_CODEX_COMMAND,
-        LARKIN_CLAUDE_COMMAND: process.env.LARKIN_CLAUDE_COMMAND, ...probeEnv } })
-      : { runtime: agent.adapter.id, state: "ready" as const };
-    if (!agent.authFailureActive) agent.readiness = readiness;
-    if (readiness.state !== "ready") throw new RuntimePrerequisiteError(readiness);
-    const standingPrompt = options.promptBuilder.build({
-      agentId: agent.config.agentId, name: agent.config.displayName || agent.config.name,
-      description: agent.config.description || "", runtime: agent.adapter.id,
-      cli: agentCliPromptCapabilities("larkin"), previousSession: agent.previousSession,
-    });
-    const generation = ++agent.generation;
     let completedSession: RuntimeSession | null = null;
-    const sessionEnv = runtimeEnv(agent.config, `${agent.launchId}:${generation}`);
-    agent.starting = agent.adapter.createSession({
-      agentId: agent.config.agentId, model: agent.config.model, reasoningEffort: agent.config.effort || null,
-      workspaceDir: agent.config.workspaceDir, stateDir: agent.config.stateDir,
-      resumeSessionId: agent.config.sessionId || null, standingPrompt,
-      env: sessionEnv,
-    }).then((session) => {
+    agent.starting = (async () => {
+      const probeEnv = runtimeEnv(agent.config);
+      await assertOfficialCliReady(agent.config, probeEnv);
+      if (agent.stopped) throw new Error("runtime Agent is stopped");
+      const readiness = agent.adapter.probe ? await agent.adapter.probe({ agentId: agent.config.agentId,
+        workspaceDir: agent.config.workspaceDir, stateDir: agent.config.stateDir,
+        env: { LARKIN_PI_COMMAND: process.env.LARKIN_PI_COMMAND, LARKIN_CODEX_COMMAND: process.env.LARKIN_CODEX_COMMAND,
+          LARKIN_CLAUDE_COMMAND: process.env.LARKIN_CLAUDE_COMMAND, ...probeEnv } })
+        : { runtime: agent.adapter.id, state: "ready" as const };
+      if (!agent.authFailureActive) agent.readiness = readiness;
+      if (readiness.state !== "ready") throw new RuntimePrerequisiteError(readiness);
+      if (agent.stopped) throw new Error("runtime Agent is stopped");
+      const standingPrompt = options.promptBuilder.build({
+        agentId: agent.config.agentId, name: agent.config.displayName || agent.config.name,
+        description: agent.config.description || "", runtime: agent.adapter.id,
+        cli: agentCliPromptCapabilities("larkin"), previousSession: agent.previousSession,
+      });
+      const generation = ++agent.generation;
+      const sessionEnv = runtimeEnv(agent.config, `${agent.launchId}:${generation}`);
+      const session = await agent.adapter.createSession({
+        agentId: agent.config.agentId, model: agent.config.model, reasoningEffort: agent.config.effort || null,
+        workspaceDir: agent.config.workspaceDir, stateDir: agent.config.stateDir,
+        resumeSessionId: agent.config.sessionId || null, standingPrompt,
+        env: sessionEnv,
+      });
       completedSession = session;
-      if (agent.stopped || generation !== agent.generation) { void session.close("stale creation"); throw new Error("stale runtime session creation"); }
+      if (agent.stopped || generation !== agent.generation) {
+        await session.close("stale creation");
+        throw new Error("stale runtime session creation");
+      }
       agent.session = session;
       agent.piSessionOwner = sessionEnv[PI_SUBAGENT_SESSION_OWNER_ENV];
       session.subscribe((event) => observe(agent, session, event));
@@ -1717,7 +1724,7 @@ export function createRuntimeHost(options: {
       agent.stabilityTimer = setTimeout(() => markSessionStable(agent, session), retryPolicy.stableWindowMs);
       agent.stabilityTimer.unref?.();
       return session;
-    }).finally(() => {
+    })().finally(() => {
       agent.starting = null;
       if (completedSession && !agent.session && !agent.stopped) {
         scheduleRecreate(agent, agent.recreateReason || "runtime closed during session initialization");
@@ -2275,15 +2282,18 @@ export function createRuntimeHost(options: {
         emitConsumed(agent, [...startupConsumed, ...persist(agent)]);
         try {
           await ensureSession(agent);
+          if (agent.stopped) return;
           reconcileSubagentLedger(agent, { forceMissing: true, missingReason: "runtime restarted" });
           enqueueUndeliveredTerminalWakes(agent);
           await recoverStalePiCompaction(agent);
           const startupSession = agent.session;
           const proactive = startupSession ? proactivelyCompactPiAtIdle(agent, startupSession) : null;
           if (proactive) await proactive;
+          if (agent.stopped) return;
           activeCount += 1;
           await retryPending(agent);
         } catch (error) {
+          if (agent.stopped) return;
           const reason = error instanceof Error ? error.message : String(error);
           const transient = error instanceof RuntimePrerequisiteError && error.readiness.state === "unavailable";
           agent.disabledReason = transient ? null : reason;
@@ -2294,6 +2304,7 @@ export function createRuntimeHost(options: {
           emit({ type: "agent-status", agentId: config.agentId, status: "error", error: reason,
             ...(error instanceof RuntimePrerequisiteError ? { readiness: error.readiness } : {}) });
         }
+        if (agent.stopped) return;
         const visibleQuarantines = startupQuarantined.filter(({ record }) => agent.records.get(record.deliveryId)?.status === "error");
         for (const { record, code } of visibleQuarantines) emit({ type: "delivery", agentId: config.agentId,
           deliveryId: record.deliveryId, messageId: record.messageId, status: "error", reason: replayFailureReason(code) });
@@ -2374,13 +2385,19 @@ export function createRuntimeHost(options: {
     },
     async stop(agentId, reason): Promise<void> {
       const agent = managed.get(agentId); if (!agent) return; agent.stopped = true;
+      const starting = agent.starting;
       if (agent.poller) clearInterval(agent.poller);
       if (agent.retryTimer) clearTimeout(agent.retryTimer);
       if (agent.stabilityTimer) clearTimeout(agent.stabilityTimer);
       if (agent.backgroundCompletionRetryTimer) clearTimeout(agent.backgroundCompletionRetryTimer);
       if (agent.subagentReconcileTimer) clearInterval(agent.subagentReconcileTimer);
       if (agent.busy) await agent.session?.cancel(reason);
-      await agent.session?.close(reason); managed.delete(agentId);
+      await agent.session?.close(reason);
+      // A queued Pi initializer cannot be cancelled through the public adapter
+      // contract. Drain it before removing the Agent; ensureSession sees stopped
+      // and closes any session created after this point.
+      await starting?.catch(() => {});
+      managed.delete(agentId);
       emit({ type: "agent-status", agentId, status: "inactive" });
     },
     async shutdown(reason): Promise<void> { await Promise.allSettled([...managed.keys()].map((id) => this.stop(id, reason))); },

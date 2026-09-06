@@ -109,6 +109,28 @@ export interface NativeRuntimeAdapterDependencies {
   env?: NodeJS.ProcessEnv;
 }
 
+const PI_INITIALIZATION_CONCURRENCY = 2;
+
+/** Limits short-lived Pi startup handshakes without serializing live sessions. */
+function createInitializationLimiter(limit: number): <T>(operation: () => Promise<T>) => Promise<T> {
+  let active = 0;
+  const waiters: Array<() => void> = [];
+  const release = (): void => {
+    const next = waiters.shift();
+    if (next) next();
+    else active -= 1;
+  };
+  return async <T>(operation: () => Promise<T>): Promise<T> => {
+    if (active >= limit) await new Promise<void>((resolve) => waiters.push(resolve));
+    else active += 1;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  };
+}
+
 type Listener = (event: NormalizedRuntimeEvent) => void;
 
 interface CodexTurnOwnership {
@@ -1126,11 +1148,17 @@ async function createPiRpcBackend(input: RuntimeSessionCreate, dependencies: Nat
   commandArgs.push(...extensionArgs);
   let probedModel: PiProbeResult | null = null;
   if (productionSpawn) {
-    // 隔离探测用户自己的 Pi home（无 PI_CODING_AGENT_DIR），再把 15% reserve 写到工作区项目设置。
-    probedModel = await discoverEffectivePiContextWindow(
-      input, command, commandPrefix, requestedModel,
-      childEnv, spawn, dependencies.piRpcClientOptions,
-    );
+    try {
+      // Isolated probes must share the same prerequisite contract as the
+      // session handshake, so a cold-start timeout can use bounded recovery.
+      probedModel = await discoverEffectivePiContextWindow(
+        input, command, commandPrefix, requestedModel,
+        childEnv, spawn, dependencies.piRpcClientOptions,
+      );
+    } catch (error) {
+      if (error instanceof RuntimePrerequisiteError) throw error;
+      throw new RuntimePrerequisiteError(classifyRuntimePrerequisite("pi", error, command));
+    }
     writeOwnedPiSettings(input.workspaceDir, calculatePiCompactionSettings(probedModel.contextWindow));
   }
   const child = spawn(command, commandArgs, {
@@ -1197,6 +1225,7 @@ export function createNativeRuntimeAdapter(id: RuntimeId | string, dependencies:
       ? dependencies.codexCommand ?? dependencies.env?.LARKIN_CODEX_COMMAND ?? "codex"
       : dependencies.claudeCommand ?? dependencies.env?.LARKIN_CLAUDE_COMMAND ?? "claude";
   const codexCommand = dependencies.codexCommand ?? dependencies.env?.LARKIN_CODEX_COMMAND ?? "codex";
+  const runPiInitialization = createInitializationLimiter(PI_INITIALIZATION_CONCURRENCY);
   let codexUpdateAttempt: Promise<{ recovered: boolean; reason: string }> | null = null;
   let codexUpdateAttempted = false;
   const runCodexUpdate = (): Promise<{ recovered: boolean; reason: string }> => new Promise((resolve) => {
@@ -1286,9 +1315,9 @@ export function createNativeRuntimeAdapter(id: RuntimeId | string, dependencies:
         if (readiness.state !== "ready") throw new RuntimePrerequisiteError(readiness);
       }
       if (id === "pi") {
-        return new PiSession(await (dependencies.createPiSession
-        ? dependencies.createPiSession(input)
-        : createPiRpcBackend(input, { ...dependencies, piCommand: resolvedExecutable! }, spawn, productionSpawn)));
+        return runPiInitialization(async () => new PiSession(await (dependencies.createPiSession
+          ? dependencies.createPiSession(input)
+          : createPiRpcBackend(input, { ...dependencies, piCommand: resolvedExecutable! }, spawn, productionSpawn))));
       }
       if (id === "codex") {
         const codexInput = dependencies.codexModelOverride?.trim()

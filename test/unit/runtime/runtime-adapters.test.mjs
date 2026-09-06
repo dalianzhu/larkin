@@ -21,6 +21,7 @@ import {
   buildCanonicalPiSubagentNotificationContent,
 } from "../../../dist/runtime/pi-subagents-notification.mjs";
 import { classifyStrictProviderError } from "../../../dist/runtime/provider-error-classifier.mjs";
+import { RuntimePrerequisiteError } from "../../../dist/runtime/runtime-readiness.mjs";
 
 const fakeProcesses = new Set();
 const temporaryRoots = new Set();
@@ -106,8 +107,9 @@ process.stdin.on("data", (chunk) => {
     if (newline < 0) break;
     const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
     const request = JSON.parse(line); record({ kind: "request", probe, type: request.type });
-    if (request.type === "get_state") respond(request, state());
-    else if (request.type === "get_available_models") respond(request, {
+    if (request.type === "get_state") {
+      if (!(${JSON.stringify(mode)} === "probe-timeout" && args.includes("--no-extensions"))) respond(request, state());
+    } else if (request.type === "get_available_models") respond(request, {
       models: process.env.PI_CODING_AGENT_DIR ? [] : [{ provider: "test-provider", id: "test-model" }],
     });
     else if (request.type === "prompt" || request.type === "steer" || request.type === "compact") respond(request, {});
@@ -896,6 +898,27 @@ test("Pi adapter maps prompt, steer and abort to its process backend", async () 
   assert.deepEqual(calls, [["prompt", "one"], ["steer", "two"], ["abort"]]);
 });
 
+test("Pi initialization caps eight concurrent adapters and releases a failed permit", async () => {
+  let active = 0;
+  let maximum = 0;
+  const adapter = createNativeRuntimeAdapter("pi", { createPiSession: async (input) => {
+    active += 1;
+    maximum = Math.max(maximum, active);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    active -= 1;
+    if (input.agentId === "cli_piInit0") throw new Error("fixture startup failure");
+    return {
+      sessionId: input.agentId,
+      prompt: async () => {}, steer: async () => {}, abort: async () => {},
+    };
+  } });
+  const results = await Promise.allSettled(Array.from({ length: 8 }, (_, index) =>
+    adapter.createSession(create({ agentId: `cli_piInit${index}` }))));
+  assert.equal(maximum, 2);
+  assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 7);
+});
+
 test.each(["win32", "linux"])("Pi retains all -e extension args on simulated %s", (platform) => {
   const args = resolvePiProcessExtensionArgs({
     distribution: "external", piCommand: "external-pi", env: {}, platform,
@@ -971,7 +994,12 @@ test("inherited PI_PACKAGE_DIR does not drop production extension version probes
   const { command, commandArgs, log } = makeProductionPiCommand(root);
   const input = create({
     workspaceDir: path.join(root, "workspace"), stateDir: path.join(root, "state"), model: "test-provider/test-model",
-    env: { LARKIN_PI_TEST_LOG: log },
+    env: {
+      HOME: path.join(root, "home"),
+      LARKIN_HOME: path.join(root, "config"),
+      LARKIN_CONFIG_DIR: path.join(root, "config"),
+      LARKIN_PI_TEST_LOG: log,
+    },
   });
   fs.mkdirSync(input.workspaceDir, { recursive: true });
   let session;
@@ -1031,6 +1059,37 @@ test("production Pi child env strips inherited PI_CODING_AGENT_DIR and still sta
     assert.equal(fs.existsSync(path.join(input.stateDir, "pi-agent")), false);
   } finally {
     await session?.close("strip PI_CODING_AGENT_DIR test complete").catch(() => {});
+  }
+});
+
+test("production Pi isolated get_state timeout is an unavailable prerequisite", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-pi-probe-timeout-"));
+  const { command, commandArgs, log } = makeProductionPiCommand(root, "probe-timeout");
+  const input = create({
+    workspaceDir: path.join(root, "workspace"), stateDir: path.join(root, "state"), model: "test-provider/test-model",
+    env: {
+      HOME: path.join(root, "home"),
+      LARKIN_HOME: path.join(root, "config"),
+      LARKIN_CONFIG_DIR: path.join(root, "config"),
+      LARKIN_PI_TEST_LOG: log,
+    },
+  });
+  fs.mkdirSync(input.workspaceDir, { recursive: true });
+  try {
+    const adapter = createNativeRuntimeAdapter("pi", {
+      piCommand: command, piCommandArgs: commandArgs,
+      resolvePiProcessExtensionArgs: () => [],
+      piRpcClientOptions: { requestTimeoutMs: 20, shutdownGraceMs: 20 },
+    });
+    assert.equal((await adapter.probe(input)).state, "ready");
+    await assert.rejects(adapter.createSession(input), (error) => {
+      assert.ok(error instanceof RuntimePrerequisiteError);
+      assert.equal(error.readiness.state, "unavailable");
+      assert.match(error.readiness.reason || "", /get_state timed out/i);
+      return true;
+    });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
