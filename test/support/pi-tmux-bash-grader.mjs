@@ -34,7 +34,7 @@ const STILL_RUNNING_RE = /still running|started in background|background tmux|ti
 const HARD_KILL_RE = /hard-capped at 60|never pass a bash timeout above 60|total lifetime is 600s|supervised_start|run_in_background:\s*true/i;
 const NEW_TARGET_RE = /new conversation|start a new (?:chat|dm|conversation)|direct message for (?:status|subagent)/i;
 const IS_TEXT_DELTA = (event) => event?.type === "message_update"
-  && /^text/.test(String(event.assistantMessageEvent?.type || ""));
+  && event.assistantMessageEvent?.type === "text_delta";
 
 function collectCustomMessages(node, customType, found = []) {
   if (node == null) return found;

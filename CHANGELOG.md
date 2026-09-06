@@ -2,7 +2,9 @@
 
 ## 0.5.5
 
-Pi no longer injects Larkin-managed `pi-subagents`, the 60-second bash timeout guard, or the supervised-command bundle. User-installed Pi packages load through normal Pi discovery; Larkin does not scan package settings or redistribute `@richardgill/pi-tmux-bash`. If published 0.0.12 is installed, it registers bash and then fails in a non-git directory; Larkin does not claim a native-bash fallback. Unowned Pi `turn_start` / `agent_settled` events occupy Runtime busy state and do not schedule a second host prompt. Historical `pi-subagent-ledger.json` files on disk are left inert and are no longer read.
+Pi uses a small Larkin-owned tmux Bash extension when tmux is available on macOS/Linux. Commands preserve their working directory, including non-Git paths with spaces; a foreground wait can return while the same command continues. The returned task ID supports inspection and cancellation, and background completion resumes the Agent. Native Windows and environments without tmux retain Pi's native Bash.
+
+Removed the injected subagent plugin, its ledger/watchdog and supervised-command infrastructure, the 60-second Bash hard-kill rule, and mandatory delegation guidance. Pi-owned turns now occupy Runtime busy state without a second host prompt. Historical subagent files are left untouched. Background commands survive Pi shutdown in tmux; notification recovery across Pi restarts is not provided. No third-party tmux plugin is installed or redistributed.
 
 ## 0.5.4
 

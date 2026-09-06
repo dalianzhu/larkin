@@ -262,6 +262,7 @@ test.skipIf(!liveEnabled)("opt-in live RPC: >60s wait-timeout background and unp
       `Start exactly: ${timedCommand}`,
       "Use a short wait timeout (2-5 seconds) so the wait returns first. That timeout is not failure.",
       "Report any taskId and end the turn. Do not kill the process. Do not send a second host prompt.",
+      `When the completion notification arrives, include the final output marker ${marker} in your completion reply.`,
     ].join(" "));
     const bashStart = await waitFor(session.trace, (event) =>
       event?.type === "tool_execution_start" && event.toolName === "bash"
