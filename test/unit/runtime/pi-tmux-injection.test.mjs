@@ -14,7 +14,12 @@ afterEach(() => {
 
 test("native Windows does not inject the tmux extension", () => {
   assert.equal(resolvePiTmuxExtensionArg({ env: {}, platform: "win32" }, () => "/tmp/pi-tmux.bundle.js"), null);
-  assert.equal(resolvePiTmuxExtensionArg({ env: {}, platform: "linux" }, () => "/tmp/pi-tmux.bundle.js"), "/tmp/pi-tmux.bundle.js");
+  assert.equal(resolvePiTmuxExtensionArg({ env: {}, platform: "linux" }, () => "/tmp/pi-tmux.bundle.js", () => true), "/tmp/pi-tmux.bundle.js");
+});
+
+test("missing tmux is native fallback; a missing bundle when tmux is supported is an error", () => {
+  assert.equal(resolvePiTmuxExtensionArg({ env: {}, platform: "linux" }, () => null, () => false), null);
+  assert.throws(() => resolvePiTmuxExtensionArg({ env: {}, platform: "linux" }, () => null, () => true), /bundle is missing/);
 });
 
 test("embedded standalone bundle materializes as a private file", () => {
@@ -39,7 +44,7 @@ test("materialize refuses a symlink extensions directory and does not write outs
     fs.mkdirSync(outside);
     fs.symlinkSync(outside, path.join(dir, "extensions"));
     globalThis.__LARKIN_EMBEDDED_PI_TMUX_BUNDLE__ = "export default function() {}";
-    assert.equal(materializeEmbeddedPiTmuxBundle(root), null);
+    assert.throws(() => materializeEmbeddedPiTmuxBundle(root), /Could not materialize/);
     assert.equal(fs.readdirSync(outside).length, 0);
     assert.equal(fs.lstatSync(path.join(dir, "extensions")).isSymbolicLink(), true);
   } finally {
@@ -56,7 +61,7 @@ test("materialize refuses a symlink target and does not write through it", () =>
     fs.writeFileSync(outside, "keep\n");
     fs.symlinkSync(outside, path.join(dir, "pi-tmux.bundle.js"));
     globalThis.__LARKIN_EMBEDDED_PI_TMUX_BUNDLE__ = "export default function() {}";
-    assert.equal(materializeEmbeddedPiTmuxBundle(root), null);
+    assert.throws(() => materializeEmbeddedPiTmuxBundle(root), /Could not materialize/);
     assert.equal(fs.readFileSync(outside, "utf8"), "keep\n");
     assert.equal(fs.lstatSync(path.join(dir, "pi-tmux.bundle.js")).isSymbolicLink(), true);
   } finally {

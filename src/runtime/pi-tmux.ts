@@ -115,15 +115,16 @@ function tmuxClientEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const next = { ...env };
   delete next.TMUX;
   delete next.TMUX_PANE;
+  delete next.BASH_ENV;
   return next;
 }
 
 function tmuxHasSession(name: string, env: NodeJS.ProcessEnv): boolean {
-  return spawnSync("tmux", ["has-session", "-t", name], { env: tmuxClientEnv(env), encoding: "utf8", timeout: 5_000 }).status === 0;
+  return spawnSync("tmux", ["has-session", "-t", `=${name}`], { env: tmuxClientEnv(env), encoding: "utf8", timeout: 5_000 }).status === 0;
 }
 
 function killSession(name: string, env: NodeJS.ProcessEnv): void {
-  spawnSync("tmux", ["kill-session", "-t", name], { env: tmuxClientEnv(env), encoding: "utf8", timeout: 5_000 });
+  spawnSync("tmux", ["kill-session", "-t", `=${name}`], { env: tmuxClientEnv(env), encoding: "utf8", timeout: 5_000 });
 }
 
 function parseExitCode(raw: string | null): number | null {
@@ -151,7 +152,7 @@ function processTable(): ProcessRow[] {
 
 function liveOwnedPanePid(session: string, env: NodeJS.ProcessEnv): number | null {
   if (!tmuxHasSession(session, env)) return null;
-  const listed = spawnSync("tmux", ["list-panes", "-t", session, "-F", "#{pane_pid}"], {
+  const listed = spawnSync("tmux", ["list-panes", "-t", `=${session}`, "-F", "#{pane_pid}"], {
     env: tmuxClientEnv(env), encoding: "utf8", timeout: 5_000,
   });
   if (listed.status !== 0) return null;
@@ -330,14 +331,13 @@ export function createLarkinTmux(input: {
       `if [ -n "$PANE_TMUX_PANE" ]; then export TMUX_PANE="$PANE_TMUX_PANE"; fi`,
       `cd ${posixQuote(cwd)} || { date -u +%Y-%m-%dT%H:%M:%SZ > ${posixQuote(endedFile)}; printf '%s\\n' 127 > ${posixQuote(exitFile)}; exit 127; }`,
       `date -u +%Y-%m-%dT%H:%M:%SZ > ${posixQuote(startedFile)}`,
-      // macOS /bin/bash 3.2 没有 BASHPID；同 pid exec 把 $$ 暴露给用户脚本。
-      `/bin/bash -c ${posixQuote('if [ -z "${BASHPID:-}" ]; then export BASHPID=$$; fi; exec /bin/bash -o pipefail "$1"')} _ ${posixQuote(commandFile)} > ${posixQuote(outputFile)} 2>&1`,
+      `/bin/bash -o pipefail ${posixQuote(commandFile)} > ${posixQuote(outputFile)} 2>&1`,
       `status=$?`,
       `date -u +%Y-%m-%dT%H:%M:%SZ > ${posixQuote(endedFile)}`,
       `printf '%s\\n' "$status" > ${posixQuote(exitFile)}`,
       "",
     ].join("\n"));
-    const created = spawnSync("tmux", ["new-session", "-d", "-s", session, "-n", "bash", "/bin/bash", path.join(dir, "run.sh")], {
+    const created = spawnSync("tmux", ["new-session", "-d", "-s", session, "-n", "bash", "-e", "BASH_ENV=", "/usr/bin/env", "-u", "BASH_ENV", "/bin/bash", path.join(dir, "run.sh")], {
       env: tmuxClientEnv(env),
       encoding: "utf8",
       timeout: 5_000,
@@ -384,6 +384,7 @@ export function createLarkinTmux(input: {
   const kill = (taskId: string): TmuxTaskSnapshot => {
     const dir = requireOwned(taskId);
     const session = expectedSession(taskId);
+    if (parseExitCode(readText(path.join(dir, "exit_code"))) !== null) return snapshotFromDir(dir, taskId, env, session);
     const live = tmuxHasSession(session, env) || liveOwnedPanePid(session, env) !== null;
     if (live) {
       writePrivate(path.join(dir, "cancelled"), "1\n");

@@ -34,6 +34,65 @@ function makeTmux(root, instanceId, agentId = "cli_tmuxSameA1") {
   });
 }
 
+test.skipIf(!tmuxAvailable())("BASH_ENV runs once for the user command, never in the internal runner", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-bashenv-"));
+  const hook = path.join(root, "hook.sh");
+  const hits = path.join(root, "hits");
+  fs.writeFileSync(hook, "printf 'hit\\n' >> \"$LARKIN_HOOK_LOG\"\n", { mode: 0o600 });
+  const manager = createLarkinTmux({ stateDir: path.join(root, "state"), agentId: "hook-test", env: {
+    ...process.env, TMUX_TMPDIR: root, BASH_ENV: hook, LARKIN_HOOK_LOG: hits,
+  } });
+  let task;
+  try {
+    task = manager.start("printf 'user-command\\n'", root);
+    const done = await manager.wait(task.taskId, 5);
+    assert.equal(done.exitCode, 0);
+    assert.equal(done.output.trim(), "user-command");
+    assert.equal(fs.readFileSync(hits, "utf8"), "hit\n");
+  } finally {
+    if (task && manager.peek(task.taskId).status === "running") manager.kill(task.taskId);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(!tmuxAvailable())("an absent owned session never resolves to another session with its name as a prefix", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-prefix-"));
+  const manager = makeTmux(root, "prefix");
+  let neighbor;
+  try {
+    const task = track(manager, manager.start("sleep 30", root));
+    const meta = JSON.parse(fs.readFileSync(path.join(manager.root, task.taskId, "meta.json"), "utf8"));
+    spawnSync("tmux", ["kill-session", "-t", `=${meta.session}`]);
+    neighbor = `${meta.session}-neighbor`;
+    assert.equal(spawnSync("tmux", ["new-session", "-d", "-s", neighbor, "sleep 30"]).status, 0);
+    assert.equal(manager.peek(task.taskId).status, "failed");
+    manager.kill(task.taskId);
+    assert.equal(spawnSync("tmux", ["has-session", "-t", `=${neighbor}`]).status, 0);
+  } finally {
+    if (neighbor) spawnSync("tmux", ["kill-session", "-t", `=${neighbor}`]);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(!tmuxAvailable())("terminal exit metadata is not rewritten as cancelled while the pane is still closing", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-terminal-"));
+  const manager = makeTmux(root, "terminal");
+  let session;
+  try {
+    const task = manager.start("sleep 30", root);
+    const dir = path.join(manager.root, task.taskId);
+    session = JSON.parse(fs.readFileSync(path.join(dir, "meta.json"), "utf8")).session;
+    // Stage the producer's terminal-metadata/session-close race deterministically.
+    fs.writeFileSync(path.join(dir, "exit_code"), "0\n");
+    assert.equal(manager.kill(task.taskId).status, "completed");
+    assert.equal(fs.existsSync(path.join(dir, "cancelled")), false);
+    assert.equal(spawnSync("tmux", ["has-session", "-t", `=${session}`]).status, 0);
+  } finally {
+    if (session) spawnSync("tmux", ["kill-session", "-t", `=${session}`]);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("start refuses a symlink owned tree before writing env secrets", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-owned-link-"));
   const secret = "larkin-tmux-boundary-secret";
@@ -195,7 +254,7 @@ test.skipIf(!tmuxAvailable())("kill ends a Bash command that ignores TERM and HU
   fs.mkdirSync(cwd, { recursive: true });
   const tmux = makeTmux(root, "inst-trap");
   try {
-    const started = track(tmux, tmux.start("trap '' HUP TERM\nprintf '%s\\n' \"$BASHPID\" > cancelled.pid\nsleep 120", cwd));
+    const started = track(tmux, tmux.start("trap '' HUP TERM\nprintf '%s\\n' \"$$\" > cancelled.pid\nsleep 120", cwd));
     const pidFile = path.join(cwd, "cancelled.pid");
     let cancelPid = NaN;
     for (let attempt = 0; attempt < 100; attempt += 1) {

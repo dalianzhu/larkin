@@ -25,7 +25,7 @@ test.skipIf(!enabled)("real tmux preserves non-Git Bash cwd, >60s command lifeti
       "parts=(ordinary directory)",
       "[[ ${parts[1]} == directory ]] || exit 41",
       "printf '%s\\n' \"$PWD\" > cwd.txt",
-      "printf '%s\\n' \"$BASHPID\" > command.pid",
+      "printf '%s\\n' \"$$\" > command.pid",
       "date +%s > started.txt",
       "sleep 65",
       "date +%s > finished.txt",
@@ -61,7 +61,7 @@ test.skipIf(!enabled)("real tmux preserves non-Git Bash cwd, >60s command lifeti
     const finishedSeconds = Number(fs.readFileSync(path.join(cwd, "finished.txt"), "utf8").trim());
     assert.ok(finishedSeconds - startedSeconds >= 65, "real command lifetime must exceed 60 seconds");
 
-    const cancellable = first.start("trap '' HUP TERM\nprintf '%s\\n' \"$BASHPID\" > cancelled.pid\nsleep 120", cwd);
+    const cancellable = first.start("trap '' HUP TERM\nprintf '%s\\n' \"$$\" > cancelled.pid\nsleep 120", cwd);
     owned.push(cancellable.taskId);
     for (let attempt = 0; !fs.existsSync(path.join(cwd, "cancelled.pid")) && attempt < 100; attempt++) await sleep(50);
     const cancelPid = Number(fs.readFileSync(path.join(cwd, "cancelled.pid"), "utf8").trim());
