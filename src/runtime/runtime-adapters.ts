@@ -38,6 +38,7 @@ import {
   buildStrictProviderErrorInput,
   classifyStrictProviderError,
   INTERNAL_CONTEXT_WINDOW_PROJECTION_REASON,
+  safeProviderDiagnostic,
 } from "./provider-error-classifier.js";
 import {
   assertEffectivePiCompactionSettings,
@@ -869,14 +870,7 @@ interface PiProviderErrorDetails {
 }
 
 function safeProviderText(value: unknown, fallback: string): string {
-  const source = typeof value === "string" ? value : fallback;
-  return source
-    .replace(/\b(?:authorization|proxy-authorization)\s*[:=]\s*(?:Bearer\s+)?[^\s,;]+/gi, (match) => `${match.split(/[:=]/, 1)[0]}=[redacted]`)
-    .replace(/\b(?:cookie|set-cookie|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|secret)\s*[:=]\s*[^\s,;]+/gi, (match) => `${match.split(/[:=]/, 1)[0]}=[redacted]`)
-    .replace(/(["'](?:authorization|cookie|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret)["']\s*:\s*)["'][^"']*["']/gi, "$1\"[redacted]\"")
-    .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, "Bearer [redacted]")
-    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "[redacted]")
-    .replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 2_000) || fallback;
+  return safeProviderDiagnostic(value, fallback);
 }
 
 function piAssistantProviderError(message: Record<string, any>): PiProviderErrorDetails {

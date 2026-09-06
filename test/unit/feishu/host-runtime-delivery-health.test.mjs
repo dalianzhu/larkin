@@ -13,7 +13,8 @@ for (const { mode, explicitReadiness, runtimeError } of [
   { mode: "throw-after-persist", explicitReadiness: "unauthenticated" },
   { mode: "async-input-error", explicitReadiness: "incompatible" },
   { mode: "generic-error", explicitReadiness: null },
-  { mode: "provider-403-delivery", explicitReadiness: null, runtimeError: "provider request failed with HTTP 403" },
+  { mode: "provider-403-delivery", explicitReadiness: null,
+    runtimeError: "provider request failed with HTTP 403 Authorization: Bearer issue124-status-token\nCookie: session=issue124-status-cookie\n/Users/issue124/private/settings.json" },
 ]) {
   test(`HostShell ${mode} keeps Inbox durable and degrades visible health without raw Runtime error data`, { timeout: 10_000 }, async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), `larkin-host-delivery-health-${mode}-`));
@@ -105,7 +106,7 @@ for (const { mode, explicitReadiness, runtimeError } of [
       const errorDeliveryLog = (status.deliverLog || []).filter((entry) => entry.status === "error");
       const visible = JSON.stringify({ health: status.inboundDeliveryHealth, readiness: status.runtimeReadiness,
         recentErrors: status.recentErrors, errorDeliveryLog, logs });
-      assert.doesNotMatch(visible, /issue124-super-secret|raw rejected payload|raw asynchronous|unsafe next action|raw inbound body/);
+      assert.doesNotMatch(visible, /issue124-super-secret|issue124-status-token|issue124-status-cookie|Users\/issue124|raw rejected payload|raw asynchronous|unsafe next action|raw inbound body/);
 
       await host.ingest(agentId, event);
       assert.equal(deliveries, 1, "transport duplicate must not create a second delivery attempt");

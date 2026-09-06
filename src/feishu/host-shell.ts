@@ -34,6 +34,7 @@ import {
   RuntimePrerequisiteError,
   type PersistedAuthFailure,
 } from "../runtime/runtime-readiness.js";
+import { safeProviderDiagnostic } from "../runtime/provider-error-classifier.js";
 import { readDocumentCommentSubscription, verifyCallbackProbe, type EffectiveDocumentCommentSubscription } from "../platform/callback-capability.js";
 import { loadConfig, resolveMentionPolicy } from "../platform/config.js";
 import { processCommandToken } from "../app/internal-command.js";
@@ -197,6 +198,9 @@ export function memberNamesFromPayloads(payloads: readonly unknown[]): Record<st
 }
 
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+function safeRuntimeStatusDiagnostic(error: unknown): string {
+  return safeProviderDiagnostic(error, "Runtime entered an error state", 500);
+}
 function agentConfigSignature(agent: ConfiguredAgent): string {
   return JSON.stringify({
     agentId: agent.agentId, runtime: agent.runtime, model: agent.model, effort: agent.effort ?? null,
@@ -1340,7 +1344,7 @@ export function createHostShell({
         } else {
           projectFallbackRuntimeReadiness(agent, observedAt, message.status === "error" ? {
             state: "unavailable",
-            reason: message.error || "Runtime entered an error state",
+            reason: safeRuntimeStatusDiagnostic(message.error),
             nextAction: "Inspect the Runtime status error, correct the Runtime availability issue, then retry.",
           } : {
             state: "missing",
@@ -1362,7 +1366,7 @@ export function createHostShell({
         }, 5_000);
         redeliveryTimer.unref?.();
       }
-      if (message.status === "error" && message.error) hostState.recordStatusError(agent, message.error);
+      if (message.status === "error" && message.error) hostState.recordStatusError(agent, safeRuntimeStatusDiagnostic(message.error));
       if (message.status === "error" || message.status === "inactive") {
         processingEyes.clear(agent, `agent-status:${message.status}`);
       }
