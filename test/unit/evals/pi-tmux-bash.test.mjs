@@ -199,7 +199,7 @@ test("synthetic grader fixtures are unit checks, not model-eval evidence", () =>
       { type: "agent_end" },
       { type: "turn_start" },
       { customType: LARKIN_TMUX_COMPLETION_TYPE, taskId: "task-12", exitCode: 0, content: "Command finished\nlarkin-tmux-eval-done" },
-      { type: "message_update", assistantMessageEvent: { type: "text", content: "larkin-tmux-eval-done finished here" } },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "larkin-tmux-eval-done finished here" } },
       { type: "agent_end" },
       { type: "agent_settled" },
     ],
@@ -321,7 +321,7 @@ test("headless RPC fixture args and unprompted completion turn are independent o
   const firstEnd = { type: "agent_end" };
   const secondStart = { type: "turn_start" };
   const completion = { customType: LARKIN_TMUX_COMPLETION_TYPE, taskId: "task-5", exitCode: 0, content: "Command finished\nlarkin-tmux-eval-done" };
-  const assistant = { type: "message_update", assistantMessageEvent: { type: "text", content: "larkin-tmux-eval-done finished here" } };
+  const assistant = { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "larkin-tmux-eval-done finished here" } };
   const settled = { type: "agent_settled" };
   const found = findAutonomousCompletionTurn([timeoutEnd, firstEnd, secondStart, completion, assistant, settled], firstEnd);
   assert.equal(found?.completion?.customType, LARKIN_TMUX_COMPLETION_TYPE);
