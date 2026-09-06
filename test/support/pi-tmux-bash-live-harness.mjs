@@ -306,7 +306,7 @@ export function inspectRunningTmuxChild(sessionName, taskId, cwd) {
     const manager = createLarkinTmux(instance);
     try { manager.peek(taskId); } catch { continue; }
     const meta = JSON.parse(fs.readFileSync(path.join(manager.root, taskId, "meta.json"), "utf8"));
-    if (meta.taskId !== taskId || path.resolve(meta.cwd) !== path.resolve(cwd)) continue;
+    if (meta.taskId !== taskId || fs.realpathSync(meta.cwd) !== fs.realpathSync(cwd)) continue;
     const listed = spawnSync("tmux", ["list-panes", "-t", `=${meta.session}`, "-F", "#{window_id}\t#{window_name}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}"], { encoding: "utf8" });
     if (listed.status === 0 && listed.stdout.trim()) return runningChildFromWindow(parseWindowLine(listed.stdout.trim().split("\n")[0]));
   }

@@ -238,12 +238,12 @@ test.skipIf(!liveEnabled)("opt-in live RPC: non-git cwd with spaces preserves ex
       "Then end the turn. Do not use an Agent or subagent.",
     ].join(" "));
     await waitFor(session.trace, (event) => event?.type === "tool_execution_end" && event.toolName === "bash", 180_000);
-    const bashEnd = matchingBashEnd(session.trace, `pwd && echo ${marker}`)
-      || session.trace.find((event) => event?.type === "tool_execution_end" && event.toolName === "bash");
+    const bashEnd = matchingBashEnd(session.trace, `pwd && echo ${marker}`);
+    assert.ok(bashEnd, "must execute the requested cwd command");
     const bashText = bashResultText(bashEnd);
     assert.match(bashText, new RegExp(marker));
-    assert.ok(bashText.includes(session.workspace.workDir),
-      `exact cwd must be preserved including spaces: expected ${session.workspace.workDir} in ${bashText.slice(0, 400)}`);
+    const pwdLine = String(bashEnd.result.details.output).trim().split("\n")[0];
+    assert.equal(fs.realpathSync(pwdLine), fs.realpathSync(session.workspace.workDir), "Pi's physical cwd must be the exact requested directory");
     console.log(`[live] non-git cwd with spaces preserved: ${session.workspace.workDir}`);
   } finally {
     await stopIsolatedPi(session);
