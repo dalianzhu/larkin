@@ -126,7 +126,8 @@ test("standing prompt v30 replaces forced subagent rules with conditional tmux-b
   assert.match(pi.content, /originating conversation/);
   assert.match(pi.content, /Do not assume tmux or extra inspect\/stop tools exist unless they appear in the current tool list/);
   assert.match(pi.content, /If an available tool refuses the current workspace/);
-  assert.match(pi.content, /Do not invent a second background mechanism/);
+  assert.match(pi.content, /Other authorized tools in the current list remain available/);
+  assert.doesNotMatch(pi.content, /Do not invent a second background mechanism/);
   assert.doesNotMatch(pi.content, /## Background subagents \(pi\)/);
   assert.doesNotMatch(pi.content, /hard-capped at 60/);
   assert.doesNotMatch(pi.content, /Total lifetime is 600s/);

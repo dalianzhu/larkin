@@ -242,8 +242,8 @@ test.skipIf(!liveEnabled)("opt-in live RPC: non-git cwd currently fails with ups
     await hostPrompt(session, [
       "Use only currently available tools and synthetic local commands. No Feishu.",
       "Run exactly: echo larkin-tmux-nongit",
-      "If the tool refuses this workspace, report the limitation and end the turn.",
-      "Do not invent a second background mechanism. Do not use an Agent or subagent.",
+      "If the tool refuses this workspace, report the limitation. Other authorized tools remain available.",
+      "Do not use an Agent or subagent.",
     ].join(" "));
     await waitFor(session.trace, (event) => event?.type === "tool_execution_end" && event.toolName === "bash", 180_000);
     const bashEnd = session.trace.find((event) => event?.type === "tool_execution_end" && event.toolName === "bash");
