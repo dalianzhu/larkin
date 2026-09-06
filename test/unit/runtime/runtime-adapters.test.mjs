@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { spawnSync } from "node:child_process";
+import { tmuxAvailable } from "../../../dist/runtime/pi-tmux.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -584,7 +584,7 @@ test("Pi injects its tmux extension only when the host capability is available",
   const linux = resolvePiProcessExtensionArgs({
     distribution: "external", piCommand: "external-pi", env: process.env, platform: process.platform,
   });
-  if (process.platform !== "win32" && spawnSync("tmux", ["-V"], { env: process.env }).status === 0) {
+  if (tmuxAvailable(process.env, process.platform)) {
     assert.equal(linux[0], "-e");
     assert.match(linux[1], /pi-tmux\.bundle\.js$/);
   } else assert.deepEqual(linux, []);
