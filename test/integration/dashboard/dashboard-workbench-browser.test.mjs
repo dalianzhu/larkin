@@ -124,7 +124,7 @@ test.skipIf(!RUN)("real Chromium exercises the Agent workbench at desktop and mo
     await assert.doesNotReject(page.getByText("Builder群", { exact: true }).waitFor({ timeout: 5_000 }));
     assert.equal(await page.getByText(/覆盖链|effective|source|override/i).count(), 0, "implementation-oriented precedence details stay out of the UI");
     await assert.doesNotReject(page.getByText("累计 12,345 tokens").waitFor());
-    await assert.doesNotReject(page.getByText("最近 678 tokens").waitFor());
+    await assert.doesNotReject(page.getByText("最近一轮 678 tokens").waitFor());
     await assert.doesNotReject(page.getByText("Compact 1 次 · idle").waitFor());
     assert.match(page.url(), new RegExp(`agent=${APP_B}.*tab=configuration`));
 
