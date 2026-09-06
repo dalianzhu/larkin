@@ -95,9 +95,9 @@ During setup, choose one of the three externally installed runtimes: Pi (`pi`), 
 
 ### Optional Pi tmux-backed bash
 
-On macOS and Linux with `tmux` installed, Larkin provides a small tmux-backed Bash tool. Commands run in their requested directory, including non-Git directories and paths with spaces. By default the tool waits up to 30 seconds, then returns a `taskId` while the same command continues; `background: true` returns immediately. The `tmux` tool lists, inspects and stops tasks owned by that Pi instance. Completed background commands notify the Agent. There is no Larkin-imposed 60-second kill or ten-minute command limit.
+On macOS and Linux with `tmux` 3.2 or newer installed, Larkin provides a small tmux-backed Bash tool. Commands run in their requested directory, including non-Git directories and paths with spaces. By default the tool waits up to 30 seconds, then returns a `taskId` while the same command continues; `background: true` returns immediately. The `tmux` tool lists, inspects and stops tasks owned by that Pi instance. Completed background commands notify the Agent. There is no Larkin-imposed 60-second kill or ten-minute command limit.
 
-Without tmux, or on native Windows, Pi keeps native bash. After Pi shuts down, background commands remain in tmux, but automatic completion notifications are not restored; use `tmux list-sessions` to find the session containing the task ID and attach manually. Larkin does not require a third-party tmux plugin.
+Without a supported tmux version, or on native Windows, Pi keeps native bash. After Pi shuts down, background commands remain in tmux, but automatic completion notifications are not restored; use `tmux list-sessions` to find the session containing the task ID and attach manually. Larkin does not require a third-party tmux plugin.
 
 ### Optional Inbox Audit
 

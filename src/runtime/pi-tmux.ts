@@ -31,7 +31,9 @@ export class ForeignTmuxTaskError extends Error {
 export function tmuxAvailable(env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): boolean {
   if (platform === "win32") return false;
   const result = spawnSync("tmux", ["-V"], { env: tmuxClientEnv(env), encoding: "utf8", timeout: 5_000 });
-  return result.status === 0 && /tmux\s+\d/i.test(`${result.stdout || ""} ${result.stderr || ""}`);
+  const version = /tmux\s+(\d+)\.(\d+)/i.exec(`${result.stdout || ""} ${result.stderr || ""}`);
+  return result.status === 0 && version !== null
+    && (Number(version[1]) > 3 || (Number(version[1]) === 3 && Number(version[2]) >= 2));
 }
 
 function posixQuote(value: string): string {

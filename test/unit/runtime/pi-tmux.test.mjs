@@ -34,6 +34,16 @@ function makeTmux(root, instanceId, agentId = "cli_tmuxSameA1") {
   });
 }
 
+test.skipIf(process.platform === "win32")("tmux capability probe refuses versions without the required session environment support", () => {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-version-"));
+  fs.writeFileSync(path.join(bin, "tmux"), "#!/bin/sh\nprintf 'tmux %s\\n' \"$LARKIN_TEST_TMUX_VERSION\"\n", { mode: 0o700 });
+  try {
+    for (const [version, expected] of [["2.9a", false], ["3.1c", false], ["3.2a", true], ["3.6a", true], ["4.0", true], ["unknown", false]]) {
+      assert.equal(tmuxAvailable({ PATH: bin, LARKIN_TEST_TMUX_VERSION: version }, "linux"), expected, version);
+    }
+  } finally { fs.rmSync(bin, { recursive: true, force: true }); }
+});
+
 test.skipIf(!tmuxAvailable())("BASH_ENV runs once for the user command, never in the internal runner", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-tmux-bashenv-"));
   const hook = path.join(root, "hook.sh");
