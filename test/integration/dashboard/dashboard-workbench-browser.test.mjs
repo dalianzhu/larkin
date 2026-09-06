@@ -75,7 +75,7 @@ test.skipIf(!RUN)("real Chromium exercises the Agent workbench at desktop and mo
     { type: "event_msg", timestamp: "2026-07-24T09:02:00.000Z", payload: { type: "token_count", info: { total_token_usage: { total_tokens: 12_345 }, last_token_usage: { total_tokens: 678 }, model_context_window: 2_000 } } },
   ].map(JSON.stringify).join("\n") + "\n");
   fs.writeFileSync(path.join(temp, "config.json"), `${JSON.stringify({
-    version: 4, serverId: "server-workbench-browser", mentionPolicy: "free", activeAgent: APP_B,
+    version: 4, serverId: "server-workbench-browser", mentionPolicy: "free", inboxAudit: { enabled: false, intervalMs: 15 * 60_000 }, activeAgent: APP_B,
     agents: {
       [APP_A]: { runtime: "pi", model: "default", chatMentionPolicies: { oc_ResearchRoom: "free" }, createdAt: "2026-07-24T00:00:00.000Z" },
       [APP_B]: { runtime: "codex", model: "gpt-5.6-sol", effort: "high", mentionPolicy: "require", chatMentionPolicies: { oc_BuildRoom: "free" }, createdAt: "2026-07-24T00:00:00.000Z" },
@@ -124,7 +124,7 @@ test.skipIf(!RUN)("real Chromium exercises the Agent workbench at desktop and mo
     await assert.doesNotReject(page.getByText("Builder群", { exact: true }).waitFor({ timeout: 5_000 }));
     assert.equal(await page.getByText(/覆盖链|effective|source|override/i).count(), 0, "implementation-oriented precedence details stay out of the UI");
     await assert.doesNotReject(page.getByText("累计 12,345 tokens").waitFor());
-    await assert.doesNotReject(page.getByText("最近 678 tokens").waitFor());
+    await assert.doesNotReject(page.getByText("最近一轮 678 tokens").waitFor());
     await assert.doesNotReject(page.getByText("Compact 1 次 · idle").waitFor());
     assert.match(page.url(), new RegExp(`agent=${APP_B}.*tab=configuration`));
 
@@ -159,9 +159,13 @@ test.skipIf(!RUN)("real Chromium exercises the Agent workbench at desktop and mo
     await page.getByRole("alert").waitFor({ state: "hidden" });
     await page.getByRole("button", { name: "全局设置" }).click();
     await page.getByRole("dialog").getByLabel("真人群消息默认策略").selectOption("require");
+    await page.getByRole("dialog").getByRole("checkbox").check();
+    await page.getByRole("dialog").getByLabel("全局巡检间隔（分钟）").fill("30");
+    await page.screenshot({ path: path.join(evidence, "desktop-inbox-audit-settings.png"), fullPage: true });
     await page.getByRole("dialog").getByRole("button", { name: "保存全局设置" }).click();
     await assert.doesNotReject(page.getByRole("dialog").getByText(/已保存/).waitFor());
     await page.getByRole("dialog").getByRole("button", { name: "关闭面板" }).click();
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(temp, "config.json"), "utf8")).inboxAudit, { enabled: true, intervalMs: 30 * 60_000 });
 
     await page.getByLabel("Runtime").selectOption("claude");
     page.once("dialog", (dialog) => void dialog.dismiss());

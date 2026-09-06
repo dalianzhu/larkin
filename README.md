@@ -93,6 +93,21 @@ During setup, choose one of the three externally installed runtimes: Pi (`pi`), 
 
 `larkin setup --model <id>` optionally stores a catalog model for that runtime. After setup, use `larkin model` and `larkin runtime` to inspect or switch. For Pi, Larkin talks to your installed `pi --mode rpc`, verifies the RPC handshake and compaction capability contract, and injects its supported extensions through `pi -e` (background subagents and the 60-second foreground bash timeout guard).
 
+### Optional Inbox Audit
+
+Inbox Audit is **off by default**. In the Dashboard, use **Global settings → Inbox 巡检** to configure the switch and inspection gap, or the selected Agent's **Configuration → Inbox 巡检** to override either value. The gap defaults to 15 minutes and supports 1 minute to 24 hours. Saving a gap alone keeps auditing disabled; saved settings survive restart and update later scheduling without replacing the Agent Runtime session.
+
+The same settings are available through the CLI:
+
+```bash
+larkin config inbox-audit global on --interval 15m
+larkin config inbox-audit agent off --agent <App-ID>
+larkin config inbox-audit agent inherit --agent <App-ID> --interval inherit
+larkin config inbox-audit global off
+```
+
+When enabled, audit only revisits originally wake-eligible human group/topic work and does not wake a model for an empty work list. Reading an audit list does not complete it: the managed Agent follows the returned inspection instructions and explicitly confirms the receipt after checking. A failed check remains retryable; newer messages cannot be completed by an older receipt. Old audit-index records without proven eligibility or observation identity are ignored; ordinary Inbox messages and conversation history are preserved.
+
 <details>
 <summary>Windows support and optional autostart</summary>
 

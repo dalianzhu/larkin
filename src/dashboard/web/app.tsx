@@ -68,6 +68,21 @@ function formatNumber(value: unknown): string {
   return Number.isFinite(Number(value)) ? Number(value).toLocaleString("en-US") : "—";
 }
 
+const MIN_AUDIT_GAP_MINUTES = 1;
+const MAX_AUDIT_GAP_MINUTES = 24 * 60;
+
+function formatAuditGapMinutes(intervalMs: number): string {
+  return String(intervalMs / 60_000);
+}
+
+function auditGapFromMinutes(value: unknown): number | null {
+  const minutes = Number(String(value).trim());
+  const candidateMs = minutes * 60_000;
+  const intervalMs = Math.round(candidateMs);
+  return Number.isFinite(minutes) && minutes >= MIN_AUDIT_GAP_MINUTES && minutes <= MAX_AUDIT_GAP_MINUTES
+    && Number.isSafeInteger(intervalMs) && Math.abs(candidateMs - intervalMs) <= 0.000_001 ? intervalMs : null;
+}
+
 function activityLabel(agent: DashboardAgent): string {
   if (agent.issue) return "异常";
   if (agent.lastActivity?.state) return String(agent.lastActivity.state);
@@ -187,9 +202,12 @@ function AgentSidebar({ agents, selectedId, onSelect, compact = false }: {
 function GlobalSettingsSheet({ open, onOpenChange, onSaved }: { open: boolean; onOpenChange: (open: boolean) => void; onSaved: () => void }) {
   const [serverValue, setServerValue] = useState<"require" | "free">("require");
   const [draft, setDraft] = useState<"require" | "free">("require");
+  const [serverAudit, setServerAudit] = useState({ enabled: false, intervalMs: 15 * 60_000 });
+  const [draftAudit, setDraftAudit] = useState({ enabled: false, intervalMs: 15 * 60_000 });
+  const [draftAuditGapMinutes, setDraftAuditGapMinutes] = useState("15");
   const [loading, setLoading] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
-  const dirty = draft !== serverValue;
+  const dirty = draft !== serverValue || draftAudit.enabled !== serverAudit.enabled || draftAuditGapMinutes !== formatAuditGapMinutes(serverAudit.intervalMs);
   useEffect(() => {
     if (!open) return;
     const controller = new AbortController();
@@ -197,6 +215,9 @@ function GlobalSettingsSheet({ open, onOpenChange, onSaved }: { open: boolean; o
     void privateGet<ConfigResponse>("/api/config", { signal: controller.signal }).then((value) => {
       setServerValue(value.mentionPolicy);
       setDraft(value.mentionPolicy);
+      setServerAudit(value.inboxAudit);
+      setDraftAudit(value.inboxAudit);
+      setDraftAuditGapMinutes(formatAuditGapMinutes(value.inboxAudit.intervalMs));
       setFeedback(null);
     }).catch((error) => { if (!controller.signal.aborted) setFeedback(error.message); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
@@ -207,11 +228,29 @@ function GlobalSettingsSheet({ open, onOpenChange, onSaved }: { open: boolean; o
     onOpenChange(next);
   };
   const save = async () => {
+    const auditChanged = draftAudit.enabled !== serverAudit.enabled || draftAuditGapMinutes !== formatAuditGapMinutes(serverAudit.intervalMs);
+    const editedIntervalMs = auditChanged ? auditGapFromMinutes(draftAuditGapMinutes) : null;
+    if (auditChanged && editedIntervalMs === null) {
+      setFeedback("巡检间隔必须在 1 到 1440 分钟之间。");
+      return;
+    }
+    const intervalMs = editedIntervalMs ?? serverAudit.intervalMs;
     setLoading(true);
     try {
-      const result = await mutateConfig({ operation: "set-global-mention", value: draft });
+      let result: { revision: string; applyState: string } | null = null;
+      if (draft !== serverValue) result = await mutateConfig({ operation: "set-global-mention", value: draft });
+      if (auditChanged) {
+        result = await mutateConfig({
+          operation: "set-global-inbox-audit",
+          ...(draftAudit.enabled !== serverAudit.enabled ? { enabled: draftAudit.enabled } : {}),
+          ...(draftAuditGapMinutes !== formatAuditGapMinutes(serverAudit.intervalMs) ? { intervalMs } : {}),
+        });
+      }
       setServerValue(draft);
-      setFeedback(`已保存 · ${result.applyState} · ${result.revision.slice(0, 20)}…`);
+      setServerAudit({ ...draftAudit, intervalMs });
+      setDraftAudit((current) => ({ ...current, intervalMs }));
+      setDraftAuditGapMinutes(formatAuditGapMinutes(intervalMs));
+      setFeedback(result ? `已保存 · ${result.applyState} · ${result.revision.slice(0, 20)}…` : "没有需要保存的修改");
       onSaved();
     } catch (error) { setFeedback(error instanceof Error ? error.message : String(error)); }
     finally { setLoading(false); }
@@ -225,7 +264,12 @@ function GlobalSettingsSheet({ open, onOpenChange, onSaved }: { open: boolean; o
         </select>
       </label>
       <p className="field-help">未单独设置的 Agent 和群会使用这个值。机器人消息仍必须精确 @ 当前 Agent。</p>
-      <div className="form-actions"><Button onClick={() => setDraft(serverValue)} disabled={!dirty || loading}>放弃草稿</Button><Button className="primary" onClick={save} disabled={!dirty || loading}>{loading ? "保存中…" : "保存全局设置"}</Button></div>
+      <div className="audit-controls" aria-labelledby="global-inbox-audit-title">
+        <div className="audit-heading"><div><h3 id="global-inbox-audit-title">Inbox 巡检</h3><p>定时检查仍待处理的入站工作；关闭时不会安排巡检。</p></div><label className="audit-switch"><input type="checkbox" checked={draftAudit.enabled} disabled={loading} onChange={(event) => setDraftAudit((current) => ({ ...current, enabled: event.target.checked }))} /><span aria-hidden="true" /><b>{draftAudit.enabled ? "已开启" : "已关闭"}</b></label></div>
+        <label><span>巡检间隔（分钟）</span><input aria-label="全局巡检间隔（分钟）" type="number" min={MIN_AUDIT_GAP_MINUTES} max={MAX_AUDIT_GAP_MINUTES} step="any" inputMode="decimal" value={draftAuditGapMinutes} disabled={loading} onChange={(event) => setDraftAuditGapMinutes(event.target.value)} /></label>
+        <p className="field-help">可在关闭时预先调整；保存间隔本身不会开启巡检。</p>
+      </div>
+      <div className="form-actions"><Button onClick={() => { setDraft(serverValue); setDraftAudit(serverAudit); setDraftAuditGapMinutes(formatAuditGapMinutes(serverAudit.intervalMs)); }} disabled={!dirty || loading}>放弃草稿</Button><Button className="primary" onClick={save} disabled={!dirty || loading}>{loading ? "保存中…" : "保存全局设置"}</Button></div>
       {feedback ? <p role="status" className="feedback">{feedback}</p> : null}
     </div>
   </Sheet>;
@@ -300,7 +344,14 @@ function AgentConfiguration({ agentId, readiness, onDirtyChange, refreshKey }: {
       if (!gate.current.accepts(token)) return;
       const agent = next.agents[0];
       if (!agent) throw new Error("配置投影中没有当前 Agent");
-      const values = { runtime: agent.runtimeOption || agent.runtime, model: agent.model, effort: agent.effort || "default", mention: agent.mention.override };
+      const intervalMs = agent.inboxAudit.override.intervalMs === "inherit"
+        ? agent.inboxAudit.effective.intervalMs : agent.inboxAudit.override.intervalMs;
+      const values = {
+        runtime: agent.runtimeOption || agent.runtime, model: agent.model, effort: agent.effort || "default", mention: agent.mention.override,
+        auditEnabled: agent.inboxAudit.override.enabled,
+        auditIntervalInherited: agent.inboxAudit.override.intervalMs === "inherit",
+        auditGapMinutes: formatAuditGapMinutes(intervalMs),
+      };
       setResponse(next);
       setServerDraft(values);
       if (!preserveDraft || !dirty) setDraft(values);
@@ -341,6 +392,12 @@ function AgentConfiguration({ agentId, readiness, onDirtyChange, refreshKey }: {
     : [{ id: model, label: unavailableLabel }];
   const efforts = directoryReady && model !== "default" ? models.find((item) => item.id === model)?.supportedReasoningEfforts || [] : [];
   const runtimeDirty = draft.runtime !== serverDraft.runtime || draft.model !== serverDraft.model || draft.effort !== serverDraft.effort;
+  const auditEnabled = draft.auditEnabled === "on" || draft.auditEnabled === "off" ? draft.auditEnabled : "inherit";
+  const auditIntervalInherited = draft.auditIntervalInherited === true;
+  const auditGapMinutes = String(draft.auditGapMinutes || "");
+  const auditDirty = draft.auditEnabled !== serverDraft.auditEnabled
+    || draft.auditIntervalInherited !== serverDraft.auditIntervalInherited
+    || draft.auditGapMinutes !== serverDraft.auditGapMinutes;
 
   const requestApply = () => jsonFetch<{ agentId: string; applyState: string }>("/api/config/apply", {
     method: "POST",
@@ -350,6 +407,11 @@ function AgentConfiguration({ agentId, readiness, onDirtyChange, refreshKey }: {
 
   const save = async () => {
     if (!config) return;
+    const auditIntervalMs = auditGapFromMinutes(draft.auditGapMinutes);
+    if (auditDirty && !auditIntervalInherited && auditIntervalMs === null) {
+      setFeedback("巡检间隔必须在 1 到 1440 分钟之间；草稿已保留。");
+      return;
+    }
     setLoading(true);
     try {
       const operations: Array<Record<string, unknown>> = [];
@@ -357,6 +419,12 @@ function AgentConfiguration({ agentId, readiness, onDirtyChange, refreshKey }: {
       else if (draft.model !== serverDraft.model) operations.push({ operation: "set-agent-model", agentId, model: draft.model });
       if (draft.effort !== serverDraft.effort) operations.push({ operation: "set-agent-effort", agentId, effort: draft.effort });
       if (draft.mention !== serverDraft.mention) operations.push({ operation: "set-agent-mention", agentId, value: draft.mention });
+      if (auditDirty) operations.push({
+        operation: "set-agent-inbox-audit", agentId,
+        ...(draft.auditEnabled !== serverDraft.auditEnabled ? { enabled: auditEnabled === "inherit" ? "inherit" : auditEnabled === "on" } : {}),
+        ...(draft.auditIntervalInherited !== serverDraft.auditIntervalInherited || draft.auditGapMinutes !== serverDraft.auditGapMinutes
+          ? { intervalMs: auditIntervalInherited ? "inherit" : auditIntervalMs! } : {}),
+      });
       let latest: { revision: string; applyState: string } | null = null;
       for (const operation of operations) latest = await mutateConfig(operation);
       if (runtimeDirty) {
@@ -394,6 +462,9 @@ function AgentConfiguration({ agentId, readiness, onDirtyChange, refreshKey }: {
 
   if (!config && loading) return <EmptyState title="加载 Agent 配置…" />;
   if (!config) return <EmptyState title="配置不可用" detail={feedback || "请重试"} />;
+  const auditEffective = config.inboxAudit.effective;
+  const auditSource = config.inboxAudit.source;
+  const auditStateDescription = `${auditSource.enabled === "agent" ? "当前 Agent 已单独设置" : auditSource.enabled === "global" ? "当前使用全局设置" : "当前使用默认设置"}：${auditEffective.enabled ? "已开启" : "已关闭"}，每 ${formatAuditGapMinutes(auditEffective.intervalMs)} 分钟`;
   const applyStateLabel = config.apply.applyState === "pending" ? "待应用" : config.apply.applyState === "applied" ? "已应用" : "状态未知";
   return <div className="configuration-page">
     <section className="config-section"><div className="section-heading"><div><h3>Agent 配置</h3><p>只作用于 {agentId}；运行配置会在安全时机自动应用，Agent 正忙时会保留待处理。</p></div><Badge className={config.apply.applyState === "pending" ? "warning" : "success"}>{applyStateLabel}</Badge></div>
@@ -404,6 +475,15 @@ function AgentConfiguration({ agentId, readiness, onDirtyChange, refreshKey }: {
         <label><span>Model</span><select value={model} disabled={loading || !directoryReady} onChange={(event) => { update("model", event.target.value); if (event.target.value === "default") update("effort", "default"); }}>{visibleModels.map((item) => <option value={item.id} key={item.id}>{item.label || item.id}</option>)}</select></label>
         <label><span>Effort</span><select value={String(draft.effort || "default")} disabled={loading || !directoryReady || model === "default" || !efforts.length} onChange={(event) => update("effort", event.target.value)}><option value="default">default · 不指定</option>{efforts.map((value) => <option value={value} key={value}>{value}</option>)}</select></label>
         <label><span>群消息策略</span><select value={String(draft.mention || "inherit")} disabled={loading} onChange={(event) => update("mention", event.target.value)}><option value="inherit">跟随全局设置</option><option value="require">需要 @</option><option value="free">无需 @</option></select></label>
+      </div>
+      <div className="audit-controls" aria-labelledby="agent-inbox-audit-title">
+        <div className="audit-heading"><div><h3 id="agent-inbox-audit-title">Inbox 巡检</h3><p>{auditStateDescription}。</p></div></div>
+        <div className="config-grid audit-grid">
+          <label><span>巡检设置</span><select aria-label="Inbox 巡检设置" value={auditEnabled} disabled={loading} onChange={(event) => update("auditEnabled", event.target.value)}><option value="inherit">跟随全局设置</option><option value="on">为此 Agent 开启</option><option value="off">为此 Agent 关闭</option></select></label>
+          <label><span>巡检间隔（分钟）</span><input aria-label="Agent 巡检间隔（分钟）" type="number" min={MIN_AUDIT_GAP_MINUTES} max={MAX_AUDIT_GAP_MINUTES} step="any" inputMode="decimal" value={auditGapMinutes} disabled={loading} onChange={(event) => setDraft((current) => ({ ...current, auditGapMinutes: event.target.value, auditIntervalInherited: false }))} /></label>
+        </div>
+        <div className="audit-inline-actions"><span>{auditIntervalInherited ? "间隔跟随全局设置；编辑数字后会仅作用于此 Agent。" : "此 Agent 使用单独的巡检间隔。"}</span>{!auditIntervalInherited ? <Button disabled={loading} onClick={() => setDraft((current) => ({ ...current, auditIntervalInherited: true, auditGapMinutes: formatAuditGapMinutes(auditEffective.intervalMs) }))}>间隔跟随全局设置</Button> : null}</div>
+        <p className="field-help">即使关闭巡检，也可保存间隔；间隔修改不会开启巡检。</p>
       </div>
       {dirty || config.apply.applyState === "pending" ? <div className="form-actions">
         {dirty ? <Button disabled={loading} onClick={() => setDraft(serverDraft)}>放弃草稿</Button> : null}

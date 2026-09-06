@@ -19,8 +19,8 @@ import {
 import { ProcessingEyeOrchestrator } from "./host-processing-eye.js";
 import { projectInboxEnvelope, targetKeyOfInboxEnvelope } from "../agent/inbox-projection.js";
 import { HostReminderOrchestrator } from "../agent/host-reminder-orchestrator.js";
-import { InboxAuditHeartbeat } from "../agent/inbox-audit-heartbeat.js";
-import { inboxAuditRegistryFile, observeInboxAuditTarget } from "../agent/missed-outbound-scan.js";
+import { boundedInboxAuditDiagnostic, InboxAuditHeartbeat, INBOX_AUDIT_CADENCE_MS } from "../agent/inbox-audit-heartbeat.js";
+import { discardInboxAuditTargetRetry, enqueueInboxAuditTargetRetry, hasPendingInboxAuditTargets, inboxAuditRegistryFile, inboxAuditRetryFile, observeInboxAuditTarget, reconcileInboxAuditTargetRetries } from "../agent/missed-outbound-scan.js";
 import { HostChannelBusiness } from "./host-channel-business.js";
 import { HostInteractionOrchestrator } from "./interaction-orchestrator.js";
 import { targetFor, type FeishuInboundEvent } from "./message-policy.js";
@@ -36,7 +36,7 @@ import {
 } from "../runtime/runtime-readiness.js";
 import { safeProviderDiagnostic } from "../runtime/provider-error-classifier.js";
 import { readDocumentCommentSubscription, verifyCallbackProbe, type EffectiveDocumentCommentSubscription } from "../platform/callback-capability.js";
-import { loadConfig, resolveMentionPolicy } from "../platform/config.js";
+import { loadConfig, resolveInboxAuditSchedule, resolveMentionPolicy } from "../platform/config.js";
 import { processCommandToken } from "../app/internal-command.js";
 import { managedOfficialLarkCli } from "../app/agent-lark-cli-workspace.js";
 import { isChannelReconnecting, isRuntimeReadinessCurrent } from "../app/agent-readiness.js";
@@ -516,13 +516,45 @@ export function createHostShell({
   };
   for (const agent of agents) prepareAgentState(agent);
   const reminder = new HostReminderOrchestrator({ agents, stateStore, envelopeProjector, deliveryTarget: runtimeHost, log });
+  const auditRegistry = inboxAuditRegistryFile(larkinHome);
+  const auditRetryJournal = inboxAuditRetryFile(larkinHome);
+  let auditRetryTimer: NodeJS.Timeout | null = null;
+  let auditRetryAttempt = 0;
+  const reconcileAuditRetries = (): number => {
+    try { return reconcileInboxAuditTargetRetries(auditRegistry, auditRetryJournal).remaining; }
+    catch (error) { log(`inbox audit retry 读取失败: ${boundedInboxAuditDiagnostic(error)}`); return 1; }
+  };
+  const scheduleAuditRetry = (): void => {
+    if (auditRetryTimer || auditRetryAttempt >= 5) return;
+    const delay = [100, 250, 1_000, 3_000, 10_000][auditRetryAttempt++]!;
+    auditRetryTimer = setTimeout(() => {
+      auditRetryTimer = null;
+      if (reconcileAuditRetries() > 0) scheduleAuditRetry();
+      else auditRetryAttempt = 0;
+    }, delay);
+    auditRetryTimer.unref?.();
+  };
   const inboxAudit = new InboxAuditHeartbeat({
     agents,
     stateStore,
     runtimeHost,
     log,
+    configFile: path.join(larkinHome, "config.json"),
+    schedule(agent) {
+      try { return resolveInboxAuditSchedule(loadConfig(env).config, agent.agentId); }
+      catch (error) {
+        log(`inbox audit schedule 读取失败 agent=${agent.agentId}: ${errorMessage(error)}`);
+        return { enabled: false, intervalMs: INBOX_AUDIT_CADENCE_MS };
+      }
+    },
+    shouldDispatch(agent) {
+      try { return hasPendingInboxAuditTargets(auditRegistry, agent.agentId); }
+      catch (error) {
+        log(`inbox audit pending 读取失败 agent=${agent.agentId}: ${errorMessage(error)}`);
+        return false;
+      }
+    },
   });
-  const auditRegistry = inboxAuditRegistryFile(larkinHome);
   const seenEventIds = new Set<string>();
   const inFlightEventIds = new Set<string>();
   const onFeishuMessage = async (agent: ConfiguredAgent, event: FeishuInboundEvent, options?: { wake?: boolean }): Promise<void> => {
@@ -557,12 +589,18 @@ export function createHostShell({
         // An event becomes permanently transport-seen only after the canonical
         // append/dedupe decision is durable. Agent model-seen state is untouched.
         if (event.event_id) seenEventIds.add(eventKey);
-        try {
-          observeInboxAuditTarget(auditRegistry, agent.agentId, event);
-        } catch (error) {
-          log(`inbox audit target 未持久化: ${(error as Error).message}`);
-        }
         if (append.status === "duplicate_consumed") return null;
+        const auditSourceSeq = Number((append.envelope as { target_seq?: unknown }).target_seq);
+        try {
+          observeInboxAuditTarget(auditRegistry, agent.agentId, { ...event, wake, source_seq: auditSourceSeq });
+          discardInboxAuditTargetRetry(auditRetryJournal, agent.agentId, { ...event, source_seq: auditSourceSeq });
+        } catch (error) {
+          try {
+            enqueueInboxAuditTargetRetry(auditRetryJournal, agent.agentId, { ...event, wake, source_seq: auditSourceSeq });
+            scheduleAuditRetry();
+            log(`inbox audit target 延后重试: ${boundedInboxAuditDiagnostic(error)}`);
+          } catch (retryError) { log(`inbox audit target 未持久化: ${boundedInboxAuditDiagnostic(retryError)}`); }
+        }
         const inboxEnvelope = append.envelope;
         if (append.status === "appended") hostState.appendConversation(agent, {
           direction: "in", from: inboxEnvelope.sender_name, senderType: inboxEnvelope.sender_type,
@@ -1440,6 +1478,8 @@ export function createHostShell({
       eventSourceStartTimer = null;
       await Promise.resolve(eventSourceStop());
       reminder.stopSync();
+      if (auditRetryTimer) clearTimeout(auditRetryTimer);
+      auditRetryTimer = null;
       inboxAudit.stop();
       interaction.stopSync();
       await runtimeHost.shutdown(reason);
@@ -1647,6 +1687,7 @@ export function createHostShell({
           previousSession: agentStates.get(agent.agentId)?.state.previousSessions?.[agent.runtime] ?? null,
         })));
         reminder.startSync();
+        if (reconcileAuditRetries() > 0) scheduleAuditRetry();
         inboxAudit.start();
         interaction.startSync();
         eventSourceStartTimer = setTimeout(() => { eventSourceStartTimer = null; startEventSource(); }, eventSourceStartDelayMs);

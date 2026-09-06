@@ -32,7 +32,7 @@ export function agentCliPromptCapabilities(executable = "larkin"): AgentCliCapab
     operations.map((operation) => ({
       command: `${group} ${operation}`,
       purpose: group === "inbox" ? (operation === "check" ? "Read pending target summaries without consuming messages."
-        : operation === "audit" ? "Read bounded observed group/topic audit targets and instructions."
+        : operation === "audit" ? "Read bounded observed group/topic audit targets; inspect first, then explicitly confirm the returned receipt."
           : "Poll full messages and direct-ack the returned batch.") :
         group === "comment" ? "Reply once to the exact cloud-document comment bound by a polled Inbox message id." :
         group === "reminder" ? "Manage this Agent's durable reminders." :
