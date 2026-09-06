@@ -20,9 +20,8 @@ export const LARKIN_STANDING_PROMPT_VERSION = "larkin-standing-v30";
 
 /**
  * Pi 长命令引导的唯一来源。仅在当前工具列表出现 tmux-backed bash 时适用；
- * 不声明 tmux 一定可用，也不复述用户安装扩展的工具细节。
- * 不声明生产 workspace 或任意 cwd 可用；工具拒绝当前 workspace 时只要求如实报告，
- * 不因此禁止其它已授权工具。
+ * 不声明 tmux 一定可用，也不复述扩展的工具细节。
+ * 工具拒绝当前 workspace 时只要求如实报告，不因此禁止其它已授权工具。
  */
 export const PI_TMUX_BASH_GUIDANCE: readonly string[] = [
   "If the current tools include a tmux-backed bash, long-running work may continue after a wait timeout. That timeout is not process failure.",

@@ -2,16 +2,31 @@
   "dataset": "pi-tmux-bash",
   "version": 1,
   "standing_prompt_version": "larkin-standing-v30",
-  "plugin": {
-    "name": "@richardgill/pi-tmux-bash",
-    "version": "0.0.12",
-    "distribution": "external-user-installed"
+  "extension": {
+    "name": "larkin-pi-tmux-bash",
+    "distribution": "larkin-owned-bundle",
+    "bundle": "dist/runtime/pi-tmux-bash.bundle.js",
+    "revision_source": "own-package-version+bundle",
+    "package_version": "0.5.4",
+    "upstream": "not-used"
   },
   "workspace": {
-    "success_path": "isolated-git-fixture",
-    "production_claim": "not-assumed",
-    "upstream_limitation": "0.0.12 getGitRoot/executeTool requires a git repository; a non-git cwd currently fails with 'not in a git repository'.",
-    "larkin_note": "Larkin Agent workspaces are usually not git. Published 0.0.12 does not fall back to native bash. User clarification is pending. Git-fixture success is not production or non-git support."
+    "success_path": "non-git-cwd",
+    "cwd_preservation": "exact",
+    "spaces_in_path": true,
+    "production_claim": "non-git-cwd-required",
+    "larkin_note": "Larkin-owned thin tmux extension. Any cwd including non-git and spaces must be preserved exactly. When the extension is loaded it does not fall back to native bash. If tmux is unavailable Larkin does not inject it. Pi shutdown stops watchers; background commands remain tmux-recoverable; automatic completion after restart is not promised."
+  },
+  "completion": {
+    "customType": "larkin-tmux-completion",
+    "triggerTurn": true,
+    "followUp": true
+  },
+  "result_schema": {
+    "bash_details": ["taskId", "status", "exitCode", "output"],
+    "status_values": ["running", "completed", "failed", "cancelled"],
+    "tmux_id": "taskId",
+    "text_includes": ["taskId", "status"]
   },
   "runtime": {
     "adapter": "pi",
@@ -38,7 +53,7 @@
   },
   "threshold": 0.6,
   "core_acceptance_rate": 1,
-  "threshold_rationale": "0.6 applies only to opt-in model-graded scenarios. One natural user request does not prescribe tools or routing, so a single model miss must not fail the suite. Core acceptance is the deterministic headless RPC assertions and they must all pass.",
+  "threshold_rationale": "0.6 applies only to opt-in model-graded scenarios. One natural user request does not prescribe tools or routing, so a single model miss must not fail the suite. Core acceptance is the deterministic headless RPC assertions and they must all pass. Synthetic grader fixtures are unit-only and are not real Pi model-eval evidence.",
   "grader": {
     "name": "pi-tmux-bash-grader",
     "version": 1,
@@ -47,9 +62,9 @@
     "rubric": [
       "long commands use available tmux-backed bash instead of forced Agent/subagent delegation",
       "a wait timeout is treated as still-running, not process failure or a hard kill",
-      "inspect uses a returned window or process identifier",
-      "stop/cancel uses a returned window or process identifier",
-      "completion followUp is handled in the originating conversation",
+      "inspect uses the taskId returned by the matching bash result",
+      "stop/cancel uses the taskId returned by the matching bash result",
+      "completion followUp is larkin-tmux-completion handled in the originating conversation",
       "no forced run_in_background Agent, supervised_start, 60s hard kill, or 600s cap"
     ]
   },
@@ -61,7 +76,7 @@
     {
       "id": "long-command-backgrounds-without-subagent",
       "kind": "prescribed",
-      "prompt": "Using only the currently available tools, run exactly this local command: `sleep 8 && echo larkin-tmux-eval-long`. If a foreground wait returns before the command finishes, treat that as still running, report any returned identifier, and end the turn. Do not spawn an Agent or subagent, do not use run_in_background on an Agent tool, and do not send any Feishu message.",
+      "prompt": "Using only the currently available tools, run exactly this local command: `sleep 8 && echo larkin-tmux-eval-long`. If a foreground wait returns before the command finishes, treat that as still running, report any returned task identifier, and end the turn. Do not spawn an Agent or subagent, do not use run_in_background on an Agent tool, and do not send any Feishu message.",
       "task_bash": "sleep 8 && echo larkin-tmux-eval-long",
       "marker": "larkin-tmux-eval-long",
       "expectations": {
@@ -74,7 +89,7 @@
     {
       "id": "wait-timeout-is-not-failure",
       "kind": "prescribed",
-      "prompt": "Run exactly this local command with the available bash tool: `sleep 12 && echo larkin-tmux-eval-timeout`. Use a short wait timeout (2 to 5 seconds) so the wait returns first. A wait timeout is not process failure. Report the returned identifier and that the process is still running, then end the turn. Do not retry as if the process was killed, do not use an Agent/subagent, and do not send Feishu messages.",
+      "prompt": "Run exactly this local command with the available bash tool: `sleep 12 && echo larkin-tmux-eval-timeout`. Use a short wait timeout (2 to 5 seconds) so the wait returns first. A wait timeout is not process failure. Report the returned task identifier and that the process is still running, then end the turn. Do not retry as if the process was killed, do not use an Agent/subagent, and do not send Feishu messages.",
       "task_bash": "sleep 12 && echo larkin-tmux-eval-timeout",
       "marker": "larkin-tmux-eval-timeout",
       "expectations": {
@@ -88,7 +103,7 @@
     {
       "id": "inspect-by-returned-id",
       "kind": "prescribed",
-      "prompt": "Start exactly this local command with the available bash tool: `sleep 20 && echo larkin-tmux-eval-peek`. After it returns a window or process identifier, inspect that same identifier with the matching inspect/peek tool from the current tool list. Reply with a short confirmation that includes the identifier. Do not kill the process, do not use an Agent/subagent, and do not send Feishu messages.",
+      "prompt": "Start exactly this local command with the available bash tool: `sleep 20 && echo larkin-tmux-eval-peek`. After it returns a task identifier, inspect that same taskId with the matching inspect/peek tool from the current tool list. Reply with a short confirmation that includes the identifier. Do not kill the process, do not use an Agent/subagent, and do not send Feishu messages.",
       "task_bash": "sleep 20 && echo larkin-tmux-eval-peek",
       "marker": "larkin-tmux-eval-peek",
       "expectations": {
@@ -102,7 +117,7 @@
     {
       "id": "stop-by-returned-id",
       "kind": "prescribed",
-      "prompt": "Start exactly this local command with the available bash tool: `sleep 120 && echo larkin-tmux-eval-kill`. After it returns a window or process identifier, stop that same identifier with the matching stop/kill tool from the current tool list, then end the turn. Do not use an Agent/subagent and do not send Feishu messages.",
+      "prompt": "Start exactly this local command with the available bash tool: `sleep 120 && echo larkin-tmux-eval-kill`. After it returns a task identifier, stop that same taskId with the matching stop/kill tool from the current tool list, then end the turn. Do not use an Agent/subagent and do not send Feishu messages.",
       "task_bash": "sleep 120 && echo larkin-tmux-eval-kill",
       "marker": "larkin-tmux-eval-kill",
       "expectations": {
@@ -132,7 +147,7 @@
     {
       "id": "no-forced-subagent-for-known-long",
       "kind": "prescribed",
-      "prompt": "The user asked you to run a deploy-like local command that takes longer than a short wait: `sleep 8 && echo larkin-tmux-eval-deploy`. Use the currently available bash tool. Do not delegate to an Agent/subagent, do not pass run_in_background to an Agent tool, and do not invent a 60-second hard kill or a 600-second lifetime cap. Report any returned identifier and end the turn. No Feishu messages.",
+      "prompt": "The user asked you to run a deploy-like local command that takes longer than a short wait: `sleep 8 && echo larkin-tmux-eval-deploy`. Use the currently available bash tool. Do not delegate to an Agent/subagent, do not pass run_in_background to an Agent tool, and do not invent a 60-second hard kill or a 600-second lifetime cap. Report any returned task identifier and end the turn. No Feishu messages.",
       "task_bash": "sleep 8 && echo larkin-tmux-eval-deploy",
       "marker": "larkin-tmux-eval-deploy",
       "expectations": {

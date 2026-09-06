@@ -3,9 +3,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { OWN_EXTENSION_NAME, OWN_TMUX_BASH_BUNDLE } from "./pi-tmux-bash-grader.mjs";
 
-export const PINNED_PLUGIN = { name: "@richardgill/pi-tmux-bash", version: "0.0.12" };
-export const UPSTREAM_NON_GIT_ERROR = /not in a git repository/i;
+export { OWN_EXTENSION_NAME, OWN_TMUX_BASH_BUNDLE };
 export const INTENDED_EVAL_SCRIPT = "test:eval:pi-tmux-bash";
 export const INTENDED_EVAL_COMMAND =
   "bun run build && LARKIN_RUN_PI_TMUX_BASH_EVAL=1 LARKIN_PI_TMUX_BASH_EVAL_MODEL=openai-codex/gpt-5.6-luna bun test --max-concurrency 1 test/live/pi-tmux-bash-live.test.mjs";
@@ -23,93 +23,30 @@ export function userPiAgentDir(env = process.env) {
   return env.PI_CODING_AGENT_DIR || path.join(env.HOME || os.homedir(), ".pi", "agent");
 }
 
-export function resolveUserInstalledTmuxBashPackage(env = process.env) {
-  const agentDir = userPiAgentDir(env);
-  const candidates = [
-    path.join(agentDir, "npm", "node_modules", PINNED_PLUGIN.name),
-    path.join(agentDir, "node_modules", PINNED_PLUGIN.name),
-  ];
-  const settingsFile = path.join(agentDir, "settings.json");
-  if (fs.existsSync(settingsFile)) {
-    try {
-      const settings = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
-      const packages = Array.isArray(settings.packages) ? settings.packages : [];
-      for (const entry of packages) {
-        const spec = String(entry || "").replace(/^npm:/, "");
-        if (spec === PINNED_PLUGIN.name || spec.startsWith(`${PINNED_PLUGIN.name}@`)) {
-          candidates.unshift(path.join(agentDir, "npm", "node_modules", PINNED_PLUGIN.name));
-        }
-      }
-    } catch {
-      // settings are only a discovery hint
-    }
-  }
-  const seen = new Set();
-  for (const candidate of candidates) {
-    const resolved = path.resolve(candidate);
-    if (seen.has(resolved)) continue;
-    seen.add(resolved);
-    const manifestFile = path.join(resolved, "package.json");
-    if (!fs.existsSync(manifestFile)) continue;
-    try {
-      const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
-      if (manifest.name === PINNED_PLUGIN.name && manifest.version === PINNED_PLUGIN.version) {
-        return resolved;
-      }
-    } catch {
-      // skip unreadable manifests
-    }
-  }
-  return null;
+export function resolveOwnTmuxBashBundle(root = ROOT) {
+  return path.join(root, OWN_TMUX_BASH_BUNDLE);
 }
 
-export function resolveTmuxBashPackagePath(env = process.env) {
-  const configured = String(env.LARKIN_PI_TMUX_BASH_PACKAGE || "").trim();
-  if (configured) {
-    const resolved = path.resolve(configured);
-    if (!fs.existsSync(path.join(resolved, "package.json"))) {
-      throw new Error(`LARKIN_PI_TMUX_BASH_PACKAGE is not a package directory: ${resolved}`);
-    }
-    return resolved;
-  }
-  return resolveUserInstalledTmuxBashPackage(env);
+export function readOwnBuildRevision(root = ROOT) {
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+  const bundle = resolveOwnTmuxBashBundle(root);
+  return {
+    name: OWN_EXTENSION_NAME,
+    distribution: "larkin-owned-bundle",
+    bundle: OWN_TMUX_BASH_BUNDLE,
+    package_version: pkg.version,
+    bundle_ready: fs.existsSync(bundle),
+    revision_source: "own-package-version+bundle",
+    upstream: "not-used",
+  };
 }
 
-export function packageHasResolvableDependencies(packageDir) {
-  let current = path.resolve(packageDir);
-  for (let i = 0; i < 6; i += 1) {
-    const modules = path.join(current, "node_modules");
-    if (fs.existsSync(path.join(modules, "zod"))
-      && fs.existsSync(path.join(modules, "@richardgill", "lib"))) {
-      return true;
-    }
-    const parent = path.dirname(current);
-    if (parent === current) break;
-    current = parent;
-  }
-  return false;
-}
-
-export function resolveTmuxBashLoadMode(env = process.env) {
-  const explicit = String(env.LARKIN_PI_TMUX_BASH_LOAD || "").trim();
-  if (explicit === "discovery" || explicit === "extension") return explicit;
-  return resolveTmuxBashPackagePath(env) ? "extension" : "discovery";
-}
-
-export function requireTmuxBashPackagePath(env = process.env) {
-  const resolved = resolveTmuxBashPackagePath(env);
-  if (!resolved) {
-    throw new Error("real Pi runs require LARKIN_PI_TMUX_BASH_PACKAGE or a user-installed @richardgill/pi-tmux-bash@0.0.12; refusing silent discovery fallback");
+export function requireOwnTmuxBashBundle(root = ROOT) {
+  const resolved = resolveOwnTmuxBashBundle(root);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Larkin tmux bundle not ready: ${resolved}; wait for runtime integration; refusing upstream plugin`);
   }
   return resolved;
-}
-
-export function readPinnedPluginManifest(packageDir) {
-  const manifest = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8"));
-  if (manifest.name !== PINNED_PLUGIN.name || manifest.version !== PINNED_PLUGIN.version) {
-    throw new Error(`expected ${PINNED_PLUGIN.name}@${PINNED_PLUGIN.version}, got ${manifest.name}@${manifest.version}`);
-  }
-  return manifest;
 }
 
 export function snapshotUserPiSettings(env = process.env) {
@@ -138,33 +75,17 @@ export function assertUserPiSettingsUnchanged(snapshot, env = process.env) {
   }
 }
 
-export function prepareIsolatedTmuxBashPackage(sourceDir, destDir) {
-  readPinnedPluginManifest(sourceDir);
-  if (packageHasResolvableDependencies(sourceDir)) return path.resolve(sourceDir);
-  fs.cpSync(sourceDir, destDir, { recursive: true });
-  const install = spawnSync("npm", ["install", "--omit=dev", "--ignore-scripts", "--no-fund", "--no-audit"], {
-    cwd: destDir,
-    encoding: "utf8",
-    timeout: 120_000,
-  });
-  if (install.status !== 0) {
-    throw new Error(`isolated npm install failed: ${install.stderr || install.stdout}`);
-  }
-  readPinnedPluginManifest(destDir);
-  return destDir;
-}
-
-export function buildPiRpcArgs({ packagePath, loadMode, model, extraArgs = [] }) {
+export function buildPiRpcArgs({ bundlePath, loadMode = "extension", model, extraArgs = [] }) {
   const args = [...HEADLESS_PI_RPC_PREFIX, ...extraArgs];
   if (model) args.push("--model", model);
   if (loadMode === "extension") {
-    if (!packagePath) throw new Error("extension load mode requires a local package path");
-    args.push("--no-extensions", "-e", packagePath);
+    if (!bundlePath) throw new Error("extension load mode requires the Larkin tmux bundle path");
+    args.push("--no-extensions", "-e", bundlePath);
   }
   return args;
 }
 
-export function assertHeadlessExtensionFixtureArgs(args, packagePath) {
+export function assertHeadlessExtensionFixtureArgs(args, bundlePath) {
   if (!Array.isArray(args)) throw new Error("Pi RPC args must be an array");
   for (const flag of HEADLESS_PI_RPC_PREFIX) {
     if (!args.includes(flag)) throw new Error(`headless Pi fixture missing ${flag}`);
@@ -172,7 +93,7 @@ export function assertHeadlessExtensionFixtureArgs(args, packagePath) {
   if (!args.includes("--no-extensions")) throw new Error("headless Pi fixture missing --no-extensions");
   const extensionIndex = args.indexOf("-e");
   if (extensionIndex < 0) throw new Error("headless Pi fixture missing -e");
-  if (packagePath && args[extensionIndex + 1] !== packagePath) {
+  if (bundlePath && args[extensionIndex + 1] !== bundlePath) {
     throw new Error(`headless Pi fixture -e path mismatch: ${args[extensionIndex + 1]}`);
   }
   return true;
@@ -181,12 +102,12 @@ export function assertHeadlessExtensionFixtureArgs(args, packagePath) {
 export function createIsolatedTmuxWorkspace(prefixOrOptions = "larkin-tmux-eval-") {
   const options = typeof prefixOrOptions === "string" ? { prefix: prefixOrOptions } : { ...prefixOrOptions };
   const prefix = options.prefix || "larkin-tmux-eval-";
-  const gitFixture = options.git !== false;
+  const gitFixture = options.git === true;
+  const withSpaces = options.spaces !== false;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-  const workDir = path.join(root, "work");
+  const workDir = path.join(root, withSpaces ? "work dir" : "work");
   const extConfigDir = path.join(root, "ext-config");
   const outputDir = path.join(root, "tmux-out");
-  const packageDir = path.join(root, "package");
   fs.mkdirSync(workDir, { recursive: true, mode: 0o700 });
   fs.mkdirSync(extConfigDir, { recursive: true, mode: 0o700 });
   fs.mkdirSync(outputDir, { recursive: true, mode: 0o700 });
@@ -196,18 +117,15 @@ export function createIsolatedTmuxWorkspace(prefixOrOptions = "larkin-tmux-eval-
   }
   const sessionName = options.sessionName
     || `larkin-tmux-${path.basename(root).replace(/[^a-zA-Z0-9-]/g, "").slice(-16)}`;
-  const config = {
-    tmuxSessionScope: "global",
-    globalTmuxSessionName: sessionName,
-    tmuxWindowScope: "pi-session",
+  return {
+    root,
+    workDir,
+    extConfigDir,
     outputDir,
-    autoCloseWindowsOnCompletion: false,
-    defaultTimeoutSeconds: 5,
-    defaultTimeoutAction: "background",
-    maxTimeoutSeconds: 60,
+    sessionName,
+    gitFixture,
+    spacesInPath: workDir.includes(" "),
   };
-  fs.writeFileSync(path.join(extConfigDir, "tmux-bash.jsonc"), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
-  return { root, workDir, extConfigDir, outputDir, packageDir, sessionName, config, gitFixture };
 }
 
 export function childEnvForIsolatedPi(workspace, env = process.env) {
@@ -297,40 +215,84 @@ export function descendantProcesses(rows, rootPid) {
   return descendants;
 }
 
+function parseWindowLine(line) {
+  const [id, name, panePid, command, panePath, owner] = String(line).split("\t");
+  return {
+    id,
+    name,
+    panePid,
+    command,
+    panePath: panePath || "",
+    owner: owner || "",
+    taskId: name || "",
+  };
+}
+
 export function listIsolatedTmuxWindows(sessionName) {
   const listed = spawnSync("tmux", [
     "list-windows", "-t", sessionName, "-F",
-    "#{window_id}\t#{window_name}\t#{pane_pid}\t#{pane_current_command}\t#{@pi-tmux-bash-pi-session-id}",
+    "#{window_id}\t#{window_name}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}\t#{@larkin-tmux-owner}",
   ], { encoding: "utf8" });
   if (listed.status !== 0) return [];
+  return listed.stdout.split("\n").filter(Boolean).map(parseWindowLine);
+}
+
+export function listTmuxPanesForCwd(cwd) {
+  const listed = spawnSync("tmux", [
+    "list-panes", "-a", "-F",
+    "#{session_name}\t#{window_id}\t#{window_name}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}",
+  ], { encoding: "utf8" });
+  if (listed.status !== 0) return [];
+  const wanted = path.resolve(cwd);
   return listed.stdout.split("\n").filter(Boolean).map((line) => {
-    const [id, name, panePid, command, piSessionId] = line.split("\t");
-    return { id, name, panePid, command, piSessionId: piSessionId || "" };
-  });
+    const [session, id, name, panePid, command, panePath] = line.split("\t");
+    return { sessionName: session, id, name, panePid, command, panePath, taskId: name || "" };
+  }).filter((pane) => path.resolve(pane.panePath || "") === wanted);
 }
 
-export function windowsOwnedBy(windows, piSessionId) {
-  return (windows || []).filter((window) => window.piSessionId && window.piSessionId === piSessionId);
+export function windowsOwnedBy(windows, owner) {
+  return (windows || []).filter((window) => window.owner && window.owner === owner);
 }
 
-export function windowIdFromBashResult(resultText) {
-  const match = String(resultText || "").match(/@\d+/);
-  return match ? match[0] : null;
+export function taskIdFromBashResult(resultOrText) {
+  if (resultOrText && typeof resultOrText === "object") {
+    const details = resultOrText.details || resultOrText.result?.details;
+    if (details?.taskId != null && String(details.taskId).trim()) return String(details.taskId).trim();
+    if (resultOrText.taskId != null && String(resultOrText.taskId).trim()) return String(resultOrText.taskId).trim();
+  }
+  const text = typeof resultOrText === "string" ? resultOrText : JSON.stringify(resultOrText || "");
+  try {
+    const parsed = JSON.parse(text);
+    const nested = parsed?.details?.taskId || parsed?.taskId;
+    if (nested != null && String(nested).trim()) return String(nested).trim();
+  } catch {
+    // result text is not JSON
+  }
+  const quoted = /"taskId"\s*:\s*"([^"]+)"/.exec(text);
+  return quoted?.[1] || null;
 }
 
 export function piSessionIdFromState(state) {
   return String(state?.sessionId || state?.session?.id || state?.id || "");
 }
 
-export function inspectRunningTmuxChild(sessionName, windowId) {
-  const windows = listIsolatedTmuxWindows(sessionName);
-  const window = windows.find((item) => item.id === windowId);
+function runningChildFromWindow(window) {
   if (!window?.panePid) return { window: window || null, running: false, processes: [] };
   const listed = spawnSync("ps", ["-ax", "-o", "pid=,ppid=,command="], { encoding: "utf8" });
   const processes = descendantProcesses(parsePsAxRows(listed.stdout), window.panePid);
   const running = processes.some((proc) => /\b(sleep|python3?)\b/.test(proc.command))
     || /\b(sleep|python3?)\b/.test(window.command || "");
   return { window, panePid: window.panePid, processes, running };
+}
+
+export function inspectRunningTmuxChild(sessionName, taskId, cwd) {
+  const windows = listIsolatedTmuxWindows(sessionName);
+  const byTask = windows.find((item) => item.taskId === taskId || item.name === taskId);
+  if (byTask) return runningChildFromWindow(byTask);
+  const byCwd = cwd ? listTmuxPanesForCwd(cwd) : [];
+  if (byCwd.length === 1) return runningChildFromWindow(byCwd[0]);
+  if (windows.length === 1) return runningChildFromWindow(windows[0]);
+  return { window: null, running: false, processes: [] };
 }
 
 export function killIsolatedTmuxSession(sessionName) {

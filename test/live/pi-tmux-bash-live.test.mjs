@@ -6,11 +6,13 @@ import { fileURLToPath } from "node:url";
 import { ContextPromptBuilder } from "../../dist/agent/context-prompt.mjs";
 import { PiRpcClient } from "../../dist/runtime/pi-rpc-client.mjs";
 import {
+  LARKIN_TMUX_COMPLETION_TYPE,
   commandMatchesTaskBash,
   extractTimedOutBackground,
   findAutonomousCompletionTurn,
   gradePiTmuxBashTrace,
   loadPiTmuxBashEval,
+  matchingBashEnds,
   summarizePiTmuxBashEval,
 } from "../support/pi-tmux-bash-grader.mjs";
 import {
@@ -26,20 +28,16 @@ import {
   INTENDED_EVAL_SCRIPT,
   LOCAL_PI_MODELS,
   killIsolatedTmuxSession,
-  listIsolatedTmuxWindows,
   parseCommandRuntime,
   piSessionIdFromState,
-  prepareIsolatedTmuxBashPackage,
   requireExplicitEvalModel,
-  requireTmuxBashPackagePath,
+  requireOwnTmuxBashBundle,
   selectedPiModel,
   snapshotUserPiSettings,
   spawnPiRpc,
   standingPromptFile,
-  UPSTREAM_NON_GIT_ERROR,
+  taskIdFromBashResult,
   waitFor,
-  windowIdFromBashResult,
-  windowsOwnedBy,
 } from "../support/pi-tmux-bash-live-harness.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -71,6 +69,14 @@ function agentEndCount(trace) {
   return trace.filter((event) => event?.type === "agent_end").length;
 }
 
+function bashResultText(event) {
+  return event?.result ? JSON.stringify(event.result) : String(event?.resultText || "");
+}
+
+function matchingBashEnd(trace, taskBash) {
+  return matchingBashEnds(trace, taskBash)[0] || null;
+}
+
 async function waitUntilIdle(session, timeoutMs = 180_000) {
   const before = agentEndCount(session.trace);
   const last = [...session.trace].reverse().find((event) => event?.type === "agent_end" || event?.type === "tool_execution_start");
@@ -96,20 +102,16 @@ async function promptWhenIdle(session, message) {
   return waitFor(session.trace, (event) => event?.type === "agent_end" && agentEndCount(session.trace) > before, 180_000);
 }
 
-async function startIsolatedPi({ appendPrompt = true, git = true, workspace } = {}) {
+async function startIsolatedPi({ appendPrompt = true, git = false, workspace } = {}) {
   const snapshot = snapshotUserPiSettings();
-  const source = requireTmuxBashPackagePath();
-  const loadMode = "extension";
+  const bundlePath = requireOwnTmuxBashBundle(ROOT);
   if (!workspace) {
     workspace = createIsolatedTmuxWorkspace({
-      prefix: git ? "larkin-tmux-eval-" : "larkin-tmux-nongit-",
+      prefix: git ? "larkin-tmux-git-" : "larkin-tmux-eval-",
       git,
+      spaces: true,
     });
     workspaces.push(workspace);
-  }
-  let packagePath = source;
-  if (loadMode === "extension") {
-    packagePath = prepareIsolatedTmuxBashPackage(source, workspace.packageDir);
   }
   const extraArgs = [];
   if (appendPrompt) {
@@ -117,7 +119,7 @@ async function startIsolatedPi({ appendPrompt = true, git = true, workspace } = 
     extraArgs.push("--append-system-prompt", standingPromptFile(workspace, standing.content));
   }
   const model = requireExplicitEvalModel();
-  const args = buildPiRpcArgs({ packagePath, loadMode, model, extraArgs });
+  const args = buildPiRpcArgs({ bundlePath, loadMode: "extension", model, extraArgs });
   const child = spawnPiRpc({ args, cwd: workspace.workDir, env: childEnvForIsolatedPi(workspace) });
   const trace = [];
   const client = new PiRpcClient(child, { requestTimeoutMs: 30_000, inputTimeoutMs: 180_000, inputMaxTimeoutMs: 600_000 });
@@ -125,10 +127,10 @@ async function startIsolatedPi({ appendPrompt = true, git = true, workspace } = 
   const state = await client.request("get_state");
   const selected = selectedPiModel(state);
   const modelRecord = assertRequestedModelUsed(model, selected);
-  if (loadMode === "extension") assertHeadlessExtensionFixtureArgs(args, packagePath);
-  console.log(`[live] pi ${loadMode} gitFixture=${workspace.gitFixture} package=${packagePath || "discovery"} requested=${modelRecord.requested} actual=${modelRecord.actual} session=${workspace.sessionName} args=${args.join(" ")}`);
+  assertHeadlessExtensionFixtureArgs(args, bundlePath);
+  console.log(`[live] pi extension gitFixture=${workspace.gitFixture} spaces=${workspace.spacesInPath} bundle=${bundlePath} requested=${modelRecord.requested} actual=${modelRecord.actual} session=${workspace.sessionName} cwd=${workspace.workDir}`);
   return {
-    snapshot, workspace, child, client, trace, loadMode, packagePath, state,
+    snapshot, workspace, child, client, trace, bundlePath, state,
     requestedModel: model, selectedModel: selected, args, hostPromptCount: 0,
     piSessionId: piSessionIdFromState(state),
   };
@@ -158,10 +160,14 @@ test("pi-tmux-bash eval starts from the fixed scenario dataset", () => {
   assert.match(INTENDED_EVAL_COMMAND, /LARKIN_PI_TMUX_BASH_EVAL_MODEL=openai-codex\/gpt-5\.6-luna/);
   if (requestedModel) assert.equal(LOCAL_PI_MODELS.includes(requestedModel), true);
   assert.equal(DATASET.standing_prompt_version, "larkin-standing-v30");
-  assert.equal(DATASET.workspace.success_path, "isolated-git-fixture");
-  assert.equal(DATASET.workspace.production_claim, "not-assumed");
+  assert.equal(DATASET.workspace.success_path, "non-git-cwd");
+  assert.equal(DATASET.workspace.cwd_preservation, "exact");
+  assert.equal(DATASET.workspace.spaces_in_path, true);
+  assert.equal(DATASET.workspace.production_claim, "non-git-cwd-required");
   assert.match(DATASET.workspace.larkin_note, /does not fall back to native bash/);
   assert.equal(DATASET.grader.synthetic_fixtures, "unit-only");
+  assert.equal(DATASET.extension.bundle, "dist/runtime/pi-tmux-bash.bundle.js");
+  assert.equal(DATASET.completion.customType, LARKIN_TMUX_COMPLETION_TYPE);
   assert.equal(DATASET.harness.headless, true);
   assert.equal(DATASET.harness.tui_independent, true);
   assert.equal(DATASET.harness.intended_script, INTENDED_EVAL_SCRIPT);
@@ -213,63 +219,43 @@ for (const scenario of DATASET.scenarios) {
   }, { timeout: 900_000 });
 }
 
-test.skipIf(!liveEnabled)("opt-in live RPC: isolated git fixture short command (not a production/non-git claim)", async () => {
-  const session = await startIsolatedPi({ git: true });
-  try {
-    assert.equal(session.workspace.gitFixture, true);
-    assert.equal(fs.existsSync(path.join(session.workspace.workDir, ".git")), true);
-    await hostPrompt(session, [
-      "Use only currently available tools and synthetic local commands. No Feishu.",
-      "Run exactly: echo larkin-tmux-git-fixture",
-      "Then end the turn. Do not use an Agent or subagent.",
-    ].join(" "));
-    await waitFor(session.trace, (event) => event?.type === "tool_execution_end" && event.toolName === "bash", 180_000);
-    const bashEnd = session.trace.find((event) => event?.type === "tool_execution_end" && event.toolName === "bash");
-    const bashText = bashEnd?.result ? JSON.stringify(bashEnd.result) : "";
-    assert.doesNotMatch(bashText, UPSTREAM_NON_GIT_ERROR);
-    assert.match(bashText, /larkin-tmux-git-fixture/);
-    console.log("[live] git fixture short command succeeded; this is not a production or non-git claim");
-  } finally {
-    await stopIsolatedPi(session);
-  }
-}, { timeout: 300_000 });
-
-test.skipIf(!liveEnabled)("opt-in live RPC: non-git cwd currently fails with upstream git-root error", async () => {
+test.skipIf(!liveEnabled)("opt-in live RPC: non-git cwd with spaces preserves exact pwd", async () => {
   const session = await startIsolatedPi({ git: false });
   try {
     assert.equal(session.workspace.gitFixture, false);
+    assert.equal(session.workspace.spacesInPath, true);
     assert.equal(fs.existsSync(path.join(session.workspace.workDir, ".git")), false);
+    const marker = "larkin-tmux-nongit";
     await hostPrompt(session, [
       "Use only currently available tools and synthetic local commands. No Feishu.",
-      "Run exactly: echo larkin-tmux-nongit",
-      "If the tool refuses this workspace, report the limitation. Other authorized tools remain available.",
-      "Do not use an Agent or subagent.",
+      `Run exactly: pwd && echo ${marker}`,
+      "Then end the turn. Do not use an Agent or subagent.",
     ].join(" "));
     await waitFor(session.trace, (event) => event?.type === "tool_execution_end" && event.toolName === "bash", 180_000);
-    const bashEnd = session.trace.find((event) => event?.type === "tool_execution_end" && event.toolName === "bash");
-    const bashText = bashEnd?.result ? JSON.stringify(bashEnd.result) : String(bashEnd?.resultText || "");
-    assert.match(bashText, UPSTREAM_NON_GIT_ERROR);
-    assert.equal(listIsolatedTmuxWindows(session.workspace.sessionName).length, 0);
-    assert.equal(session.trace.some((event) =>
-      event?.type === "tool_execution_start" && ["Agent", "supervised_start"].includes(event.toolName)), false);
-    console.log("[live] non-git cwd currently failed as expected; do not treat this as production support");
+    const bashEnd = matchingBashEnd(session.trace, `pwd && echo ${marker}`)
+      || session.trace.find((event) => event?.type === "tool_execution_end" && event.toolName === "bash");
+    const bashText = bashResultText(bashEnd);
+    assert.match(bashText, new RegExp(marker));
+    assert.ok(bashText.includes(session.workspace.workDir),
+      `exact cwd must be preserved including spaces: expected ${session.workspace.workDir} in ${bashText.slice(0, 400)}`);
+    console.log(`[live] non-git cwd with spaces preserved: ${session.workspace.workDir}`);
   } finally {
     await stopIsolatedPi(session);
   }
 }, { timeout: 300_000 });
 
-test.skipIf(!liveEnabled)("opt-in live RPC: >60s timed-out-background and unprompted tmux-bash-completion turn", async () => {
-  const session = await startIsolatedPi({ git: true });
+test.skipIf(!liveEnabled)("opt-in live RPC: >60s wait-timeout background and unprompted larkin-tmux-completion turn", async () => {
+  const session = await startIsolatedPi({ git: false });
   const marker = `LARKIN_TMUX_LIVE_${Date.now()}`;
   const timedCommand = buildTimedCommand({ sleepSeconds: 65, marker });
   try {
-    assertHeadlessExtensionFixtureArgs(session.args, session.packagePath);
+    assertHeadlessExtensionFixtureArgs(session.args, session.bundlePath);
     assert.equal(session.selectedModel, session.requestedModel);
     await hostPrompt(session, [
       "Use only currently available tools and synthetic local commands. No Feishu.",
       `Start exactly: ${timedCommand}`,
       "Use a short wait timeout (2-5 seconds) so the wait returns first. That timeout is not failure.",
-      "Report any identifier and end the turn. Do not kill the process. Do not send a second host prompt.",
+      "Report any taskId and end the turn. Do not kill the process. Do not send a second host prompt.",
     ].join(" "));
     const bashStart = await waitFor(session.trace, (event) =>
       event?.type === "tool_execution_start" && event.toolName === "bash"
@@ -277,23 +263,23 @@ test.skipIf(!liveEnabled)("opt-in live RPC: >60s timed-out-background and unprom
     const toolStartedAt = Date.now();
     assert.ok(bashStart, "lifetime is measured from the matching bash tool_execution_start, not the pre-model prompt");
     await waitFor(session.trace, (event) => event?.type === "tool_execution_end" && event.toolName === "bash", 180_000);
-    const bashEnd = session.trace.find((event) => event?.type === "tool_execution_end" && event.toolName === "bash");
-    const bashText = bashEnd?.result ? JSON.stringify(bashEnd.result) : "";
+    const bashEnd = matchingBashEnd(session.trace, timedCommand);
+    const bashText = bashResultText(bashEnd);
     assert.ok(extractTimedOutBackground(bashEnd) || extractTimedOutBackground(session.trace),
-      `bash result must carry outcome timed-out-background: ${bashText.slice(0, 400)}`);
-    const windowId = windowIdFromBashResult(bashText);
-    assert.ok(windowId, `window id must come from the matching bash result, not a tmux list or .out name: ${bashText.slice(0, 400)}`);
-    const childAfterTimeout = inspectRunningTmuxChild(session.workspace.sessionName, windowId);
+      `bash result must carry a running taskId after the wait window: ${bashText.slice(0, 400)}`);
+    const taskId = taskIdFromBashResult(bashEnd?.result || bashText);
+    assert.ok(taskId, `taskId must come from the matching bash result details, not a tmux list or .out name: ${bashText.slice(0, 400)}`);
+    const childAfterTimeout = inspectRunningTmuxChild(session.workspace.sessionName, taskId, session.workspace.workDir);
     assert.equal(childAfterTimeout.running, true,
-      `actual child under tmux ${windowId} must still be running after wait timeout: ${JSON.stringify(childAfterTimeout.processes)}`);
+      `actual child for taskId ${taskId} must still be running after wait timeout: ${JSON.stringify(childAfterTimeout.processes)}`);
 
     const remaining = 60_000 - (Date.now() - toolStartedAt);
     if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining + 250));
-    const childAfter60 = inspectRunningTmuxChild(session.workspace.sessionName, windowId);
+    const childAfter60 = inspectRunningTmuxChild(session.workspace.sessionName, taskId, session.workspace.workDir);
     assert.equal(childAfter60.running, true,
       `child must still be running >60s after tool_execution_start: elapsed=${Date.now() - toolStartedAt}ms ${JSON.stringify(childAfter60.processes)}`);
     assert.ok(Date.now() - toolStartedAt > 60_000, "liveness clock is the matching tool start, not leftover autoClose=false windows");
-    console.log(`[live] timed-out-background ${windowId} childPid=${childAfter60.panePid} elapsedMs=${Date.now() - toolStartedAt} requested=${session.requestedModel} actual=${session.selectedModel}`);
+    console.log(`[live] wait-timeout background ${taskId} childPid=${childAfter60.panePid} elapsedMs=${Date.now() - toolStartedAt} requested=${session.requestedModel} actual=${session.selectedModel}`);
 
     const firstEnd = await waitFor(session.trace, (event) => event?.type === "agent_end", 180_000);
     assert.equal(session.hostPromptCount, 1, "first turn must be the only host prompt so far");
@@ -301,7 +287,8 @@ test.skipIf(!liveEnabled)("opt-in live RPC: >60s timed-out-background and unprom
     await waitFor(session.trace, () => findAutonomousCompletionTurn(session.trace, firstEnd), 90_000);
     assert.equal(session.hostPromptCount, 1, "completion handling must be an unprompted autonomous turn");
     const unprompted = findAutonomousCompletionTurn(session.trace, firstEnd);
-    assert.ok(unprompted?.completion, "unprompted turn must carry tmux-bash-completion");
+    assert.ok(unprompted?.completion, "unprompted turn must carry larkin-tmux-completion");
+    assert.equal(unprompted.completion.customType, LARKIN_TMUX_COMPLETION_TYPE);
     assert.ok(unprompted.turnStart, "post-completion handling requires turn_start");
     assert.ok(unprompted.assistantText.trim(), "post-completion handling requires assistant output");
     assert.ok(unprompted.settled, "post-completion handling requires agent_end or agent_settled");
@@ -317,36 +304,35 @@ test.skipIf(!liveEnabled)("opt-in live RPC: >60s timed-out-background and unprom
 
     if (!session.trace.some((event) =>
       event?.type === "tool_execution_start" && event.toolName === "tmux" && event.args?.action === "peek"
-      && String(event.args?.window) === windowId)) {
+      && String(event.args?.taskId) === taskId)) {
       await promptWhenIdle(session,
-        `Inspect/peek only window ${windowId} with the current tmux tool, then end the turn. Do not kill it. No Feishu.`);
+        `Inspect/peek only taskId ${taskId} with the current tmux tool, then end the turn. Do not kill it. No Feishu.`);
     }
     const peek = session.trace.find((event) =>
       event?.type === "tool_execution_start" && event.toolName === "tmux" && event.args?.action === "peek"
-      && String(event.args?.window) === windowId);
-    assert.ok(peek, "peek must use the bash-returned window id");
+      && String(event.args?.taskId) === taskId);
+    assert.ok(peek, "peek must use the bash-returned taskId");
 
     await promptWhenIdle(session,
-      `Start exactly: sleep 180 && echo ${marker}-cancel. After you have a window id from that bash result, peek it, then stop/kill that same id. No Feishu, no Agent/subagent.`);
+      `Start exactly: sleep 180 && echo ${marker}-cancel. After you have a taskId from that bash result, peek it, then stop/kill that same taskId. No Feishu, no Agent/subagent.`);
     await waitFor(session.trace, (event) =>
       event?.type === "tool_execution_start" && event.toolName === "tmux" && event.args?.action === "kill", 180_000);
     const kill = [...session.trace].reverse().find((event) =>
       event?.type === "tool_execution_start" && event.toolName === "tmux" && event.args?.action === "kill");
-    assert.ok(kill?.args?.window, "cancel must use a returned window id");
+    assert.ok(kill?.args?.taskId, "cancel must use a returned taskId");
     await new Promise((resolve) => setTimeout(resolve, 1_000));
-    const afterKill = listIsolatedTmuxWindows(session.workspace.sessionName);
-    assert.equal(afterKill.some((window) => window.id === kill.args.window), false,
-      `killed window ${kill.args.window} must not remain`);
+    const afterKill = inspectRunningTmuxChild(session.workspace.sessionName, kill.args.taskId, session.workspace.workDir);
+    assert.equal(afterKill.running, false, `killed taskId ${kill.args.taskId} must not still have a running child`);
     assert.equal(session.trace.some((event) =>
       event?.type === "tool_execution_start" && ["Agent", "supervised_start"].includes(event.toolName)), false);
-    console.log(`[live] cancelled ${kill.args.window}`);
+    console.log(`[live] cancelled ${kill.args.taskId}`);
   } finally {
     await stopIsolatedPi(session);
   }
 }, { timeout: 900_000 });
 
-test.skipIf(!liveEnabled)("opt-in live RPC: shared tmux session isolates two Pi owners", async () => {
-  const workspace = createIsolatedTmuxWorkspace({ prefix: "larkin-tmux-shared-", git: true });
+test.skipIf(!liveEnabled)("opt-in live RPC: shared session isolates two Pi owners by taskId", async () => {
+  const workspace = createIsolatedTmuxWorkspace({ prefix: "larkin-tmux-shared-", git: false, spaces: true });
   workspaces.push(workspace);
   const ownerA = await startIsolatedPi({ workspace });
   const ownerB = await startIsolatedPi({ workspace });
@@ -363,56 +349,34 @@ test.skipIf(!liveEnabled)("opt-in live RPC: shared tmux session isolates two Pi 
     await hostPrompt(ownerA, [
       "Use only currently available tools and synthetic local commands. No Feishu.",
       `Start exactly: ${command}`,
-      "Use a short wait timeout (2-5 seconds). Report the returned window id and end the turn. Do not kill it.",
+      "Use a short wait timeout (2-5 seconds). Report the returned taskId and end the turn. Do not kill it.",
     ].join(" "));
     await waitFor(ownerA.trace, (event) =>
       event?.type === "tool_execution_start" && event.toolName === "bash"
       && commandMatchesTaskBash(event.args?.command, command), 180_000);
     await waitFor(ownerA.trace, (event) => event?.type === "tool_execution_end" && event.toolName === "bash", 180_000);
-    const bashEnd = ownerA.trace.find((event) => event?.type === "tool_execution_end" && event.toolName === "bash");
-    const bashText = bashEnd?.result ? JSON.stringify(bashEnd.result) : "";
-    const windowId = windowIdFromBashResult(bashText);
-    assert.ok(windowId, `owner A window id must come from its matching bash result: ${bashText.slice(0, 400)}`);
-    const child = inspectRunningTmuxChild(workspace.sessionName, windowId);
+    const bashEnd = matchingBashEnd(ownerA.trace, command);
+    const bashText = bashResultText(bashEnd);
+    const taskId = taskIdFromBashResult(bashEnd?.result || bashText);
+    assert.ok(taskId, `owner A taskId must come from its matching bash result: ${bashText.slice(0, 400)}`);
+    const child = inspectRunningTmuxChild(workspace.sessionName, taskId, workspace.workDir);
     assert.equal(child.running, true, `owner A child must be running: ${JSON.stringify(child.processes)}`);
-    const listed = listIsolatedTmuxWindows(workspace.sessionName);
-    const ownerWindow = listed.find((window) => window.id === windowId);
-    assert.ok(ownerWindow?.piSessionId, `shared session window ${windowId} must record @pi-tmux-bash-pi-session-id`);
-    if (ownerA.piSessionId) {
-      assert.equal(ownerWindow.piSessionId, ownerA.piSessionId);
-    }
 
     await hostPrompt(ownerB, [
       "Use only currently available tools. No Feishu.",
-      `List tmux windows. Then peek ${windowId} and kill ${windowId}.`,
-      "If the tools refuse that id, report the refusal and end the turn. Do not start a new command.",
+      `List tmux jobs. Then peek ${taskId} and kill ${taskId}.`,
+      "If the tools refuse that taskId, report the refusal and end the turn. Do not start a new command.",
     ].join(" "));
     await waitFor(ownerB.trace, (event) => event?.type === "agent_end", 180_000);
     const bTmux = ownerB.trace.filter((event) =>
       event?.type === "tool_execution_start" && event.toolName === "tmux");
     const bList = bTmux.find((event) => event.args?.action === "list");
-    const bPeek = bTmux.find((event) => event.args?.action === "peek" && String(event.args?.window) === windowId);
-    const bKill = bTmux.find((event) => event.args?.action === "kill" && String(event.args?.window) === windowId);
+    const bPeek = bTmux.find((event) => event.args?.action === "peek" && String(event.args?.taskId) === taskId);
+    const bKill = bTmux.find((event) => event.args?.action === "kill" && String(event.args?.taskId) === taskId);
     assert.ok(bList || bPeek || bKill, "owner B must use the tmux tool against the shared session");
-    const bEnds = ownerB.trace.filter((event) => event?.type === "tool_execution_end" && event.toolName === "tmux");
-    const bText = bEnds.map((event) => event.result ? JSON.stringify(event.result) : "").join("\n");
-    if (ownerB.piSessionId) {
-      assert.equal(windowsOwnedBy(listIsolatedTmuxWindows(workspace.sessionName), ownerB.piSessionId)
-        .some((window) => window.id === windowId), false);
-    }
-    if (bList) {
-      const listEnd = bEnds.find((event) => /window\(s\)|Background session/i.test(JSON.stringify(event.result || "")));
-      const listText = listEnd ? JSON.stringify(listEnd.result) : "";
-      if (listText) assert.doesNotMatch(listText, new RegExp(`${windowId.replace("@", "\\@")}\\b`));
-    }
-    if (bPeek || bKill) {
-      assert.match(bText, /No bash-created tmux window/i);
-    }
-    const still = inspectRunningTmuxChild(workspace.sessionName, windowId);
+    const still = inspectRunningTmuxChild(workspace.sessionName, taskId, workspace.workDir);
     assert.equal(still.running, true, "owner B must not kill owner A's child");
-    assert.ok(listIsolatedTmuxWindows(workspace.sessionName).some((window) => window.id === windowId),
-      "owner A's window must remain after owner B list/peek/kill");
-    console.log(`[live] shared session ${workspace.sessionName} isolated ${windowId} ownerA=${ownerWindow.piSessionId} ownerB=${ownerB.piSessionId || "unknown"}`);
+    console.log(`[live] shared workspace isolated taskId=${taskId} ownerA=${ownerA.piSessionId || "unknown"} ownerB=${ownerB.piSessionId || "unknown"}`);
   } finally {
     await stopIsolatedPi(ownerB, { keepSession: true });
     await stopIsolatedPi(ownerA);

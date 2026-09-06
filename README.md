@@ -95,7 +95,7 @@ During setup, choose one of the three externally installed runtimes: Pi (`pi`), 
 
 ### Optional Pi tmux-backed bash
 
-`@richardgill/pi-tmux-bash` is an optional, user-installed Pi extension; Larkin does not ship or redistribute it. Pi loads it itself through normal package discovery. It requires `tmux` on `PATH`. Published 0.0.12 registers bash and then fails outside a git working tree (`not in a git repository`); it does not fall back to native bash. Ordinary Larkin Agent workspaces are usually not Git repositories, so do not enable this version there without resolving that compatibility limitation. Larkin does not initialize Git repositories or install the plugin automatically.
+When `tmux` is available, Larkin can inject its own thin tmux-backed bash extension (`dist/runtime/pi-tmux-bash.bundle.js`). This is not a published third-party tmux plugin, and Larkin does not install or copy one. Commands keep the exact process cwd, including ordinary non-Git directories and paths with spaces. A wait timeout is not process failure; inspect and stop use the returned `taskId`. Completion notifications use `larkin-tmux-completion` in the originating conversation. When this extension is loaded, it does not fall back to native bash. If tmux is unavailable, Larkin does not register the extension and Pi keeps native bash. After Pi shutdown, watchers stop; background commands may remain tmux-recoverable, but automatic completion after restart is not promised.
 
 ### Optional Inbox Audit
 

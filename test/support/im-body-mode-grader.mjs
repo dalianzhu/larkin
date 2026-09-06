@@ -132,8 +132,8 @@ export function summarizeImBodyModeEval(dataset, tracesById) {
 }
 
 export function v26PlainMultilineCounterfactual(standingPrompt) {
-  if (standingPrompt?.version !== "larkin-standing-v28" || typeof standingPrompt.content !== "string") {
-    throw new Error("v26 counterfactual requires a v27 standing prompt");
+  if (standingPrompt?.version !== "larkin-standing-v30" || typeof standingPrompt.content !== "string") {
+    throw new Error("v26 counterfactual requires the current standing prompt");
   }
   let content = standingPrompt.content;
   for (let index = 0; index < PLAIN_MULTILINE_V27_GUIDANCE.length; index += 1) {

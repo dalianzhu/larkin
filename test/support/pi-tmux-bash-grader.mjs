@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 
 const BOOLEAN_KEYS = [
   "uses_bash",
@@ -23,8 +24,11 @@ const FORCED_SUBAGENT_TOOLS = new Set([
   "supervised_kill",
 ]);
 
-const WINDOW_ID_RE = /@\d+/g;
-const STILL_RUNNING_RE = /still running|started in background|background tmux|timeoutAction["']?\s*[:=]\s*["']?background/i;
+export const LARKIN_TMUX_COMPLETION_TYPE = "larkin-tmux-completion";
+export const OWN_TMUX_BASH_BUNDLE = "dist/runtime/pi-tmux-bash.bundle.js";
+export const OWN_EXTENSION_NAME = "larkin-pi-tmux-bash";
+
+const STILL_RUNNING_RE = /still running|started in background|background tmux|timeoutAction["']?\s*[:=]\s*["']?background|status["']?\s*[:=]\s*["']?running/i;
 const HARD_KILL_RE = /hard-capped at 60|never pass a bash timeout above 60|total lifetime is 600s|supervised_start|run_in_background:\s*true/i;
 const NEW_TARGET_RE = /new conversation|start a new (?:chat|dm|conversation)|direct message for (?:status|subagent)/i;
 const IS_TEXT_DELTA = (event) => event?.type === "message_update"
@@ -42,9 +46,13 @@ function collectCustomMessages(node, customType, found = []) {
   return found;
 }
 
-export function extractTmuxBashCompletion(traceOrMessages) {
-  const matches = collectCustomMessages(traceOrMessages, "tmux-bash-completion");
+export function extractLarkinTmuxCompletion(traceOrMessages) {
+  const matches = collectCustomMessages(traceOrMessages, LARKIN_TMUX_COMPLETION_TYPE);
   return matches.length > 0 ? matches[0] : null;
+}
+
+export function extractTmuxBashCompletion(traceOrMessages) {
+  return extractLarkinTmuxCompletion(traceOrMessages);
 }
 
 export function extractTimedOutBackground(eventOrTrace) {
@@ -53,6 +61,9 @@ export function extractTimedOutBackground(eventOrTrace) {
     if (!node) continue;
     const details = node.result?.details || node.details;
     if (details?.outcome === "timed-out-background") return details;
+    if (details?.status === "running" && details?.taskId) {
+      return { ...details, outcome: details.outcome || "timed-out-background" };
+    }
     const encoded = typeof node === "string" ? node : JSON.stringify(node);
     if (encoded.includes("timed-out-background")) return { outcome: "timed-out-background" };
   }
@@ -70,7 +81,7 @@ export function findAutonomousCompletionTurn(trace, firstAgentEnd) {
   const start = firstAgentEnd ? events.indexOf(firstAgentEnd) : events.findIndex((event) => event?.type === "agent_end");
   if (start < 0) return null;
   const after = events.slice(start + 1);
-  const completionIndex = after.findIndex((event) => extractTmuxBashCompletion(event));
+  const completionIndex = after.findIndex((event) => extractLarkinTmuxCompletion(event));
   const turnIndex = after.findIndex((event) => event?.type === "turn_start");
   if (completionIndex < 0 || turnIndex < 0) return null;
   const afterBoth = after.slice(Math.max(completionIndex, turnIndex) + 1);
@@ -88,7 +99,7 @@ export function findAutonomousCompletionTurn(trace, firstAgentEnd) {
     agentEnd: afterBoth.find((event) => event?.type === "agent_end") || (settled.type === "agent_end" ? settled : null),
     settled,
     assistantText,
-    completion: extractTmuxBashCompletion(after[completionIndex]),
+    completion: extractLarkinTmuxCompletion(after[completionIndex]),
     completionEvent: after[completionIndex],
   };
 }
@@ -97,30 +108,77 @@ export function findUnpromptedCompletionTurn(trace, firstAgentEnd) {
   return findAutonomousCompletionTurn(trace, firstAgentEnd);
 }
 
+function assertOwnExtensionMetadata(raw, repoRoot) {
+  const extension = raw.extension;
+  if (!extension || typeof extension !== "object") {
+    throw new Error("pi-tmux-bash eval must record the Larkin-owned extension, not a published plugin pin");
+  }
+  if (extension.name !== OWN_EXTENSION_NAME) {
+    throw new Error(`pi-tmux-bash extension.name must be ${OWN_EXTENSION_NAME}`);
+  }
+  if (extension.distribution !== "larkin-owned-bundle") {
+    throw new Error("pi-tmux-bash extension must be recorded as larkin-owned-bundle");
+  }
+  if (extension.bundle !== OWN_TMUX_BASH_BUNDLE) {
+    throw new Error(`pi-tmux-bash extension.bundle must be ${OWN_TMUX_BASH_BUNDLE}`);
+  }
+  if (extension.upstream !== "not-used") {
+    throw new Error("pi-tmux-bash eval must record that published upstream packages are not used");
+  }
+  if (extension.revision_source !== "own-package-version+bundle") {
+    throw new Error("pi-tmux-bash eval must use own package version + bundle as build revision metadata");
+  }
+  const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+  if (extension.package_version !== pkg.version) {
+    throw new Error(`extension.package_version must match package.json version ${pkg.version}`);
+  }
+  if (raw.plugin) {
+    throw new Error("pi-tmux-bash eval must not pin a published plugin; use extension build revision metadata");
+  }
+}
+
 export function loadPiTmuxBashEval(file) {
   const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+  const repoRoot = path.resolve(path.dirname(file), "../..");
   if (raw.dataset !== "pi-tmux-bash") throw new Error("pi-tmux-bash eval dataset id mismatch");
   if (raw.version !== 1) throw new Error("pi-tmux-bash eval version must be 1");
   if (raw.standing_prompt_version !== "larkin-standing-v30") {
     throw new Error("pi-tmux-bash standing prompt version must be larkin-standing-v30");
   }
-  if (raw.workspace?.success_path !== "isolated-git-fixture") {
-    throw new Error("pi-tmux-bash eval success path must be isolated-git-fixture");
+  assertOwnExtensionMetadata(raw, repoRoot);
+  if (raw.workspace?.success_path !== "non-git-cwd") {
+    throw new Error("pi-tmux-bash eval success path must be non-git-cwd");
   }
-  if (raw.workspace?.production_claim !== "not-assumed") {
-    throw new Error("pi-tmux-bash eval must not claim production or non-git support");
+  if (raw.workspace?.cwd_preservation !== "exact") {
+    throw new Error("pi-tmux-bash eval must require exact cwd preservation");
+  }
+  if (raw.workspace?.spaces_in_path !== true) {
+    throw new Error("pi-tmux-bash eval must require cwd paths with spaces");
+  }
+  if (raw.workspace?.production_claim !== "non-git-cwd-required") {
+    throw new Error("pi-tmux-bash eval must require non-git cwd support");
   }
   if (!/does not fall back to native bash/i.test(String(raw.workspace?.larkin_note || ""))) {
-    throw new Error("eval must record that 0.0.12 does not fall back to native bash");
+    throw new Error("eval must record that the loaded Larkin extension does not fall back to native bash");
+  }
+  if (!/non-git/i.test(String(raw.workspace?.larkin_note || ""))
+    || !/spaces/i.test(String(raw.workspace?.larkin_note || ""))) {
+    throw new Error("eval must record exact non-git cwd and spaces preservation");
+  }
+  if (!/automatic completion after restart is not promised/i.test(String(raw.workspace?.larkin_note || ""))) {
+    throw new Error("eval must record that restart completion is not promised");
   }
   if (/those sessions stay on Pi's native bash|native bash is restored|(?<!does not )falls? back to native/i.test(String(raw.workspace?.larkin_note || ""))) {
-    throw new Error("eval must not claim a native bash fallback");
+    throw new Error("eval must not claim a native bash fallback while the extension is loaded");
   }
-  if (raw.plugin?.name !== "@richardgill/pi-tmux-bash" || raw.plugin?.version !== "0.0.12") {
-    throw new Error("pi-tmux-bash eval must pin external @richardgill/pi-tmux-bash@0.0.12");
+  if (raw.completion?.customType !== LARKIN_TMUX_COMPLETION_TYPE) {
+    throw new Error("pi-tmux-bash completion customType must be larkin-tmux-completion");
   }
-  if (raw.plugin?.distribution !== "external-user-installed") {
-    throw new Error("pi-tmux-bash plugin must be recorded as external-user-installed");
+  if (raw.completion?.triggerTurn !== true || raw.completion?.followUp !== true) {
+    throw new Error("pi-tmux-bash completion must be triggerTurn followUp");
+  }
+  if (raw.result_schema?.tmux_id !== "taskId") {
+    throw new Error("pi-tmux-bash result schema must identify jobs by taskId, not @window");
   }
   if (raw.harness?.headless !== true || raw.harness?.tui_independent !== true) {
     throw new Error("pi-tmux-bash eval must record a headless TUI-independent RPC harness");
@@ -161,6 +219,9 @@ export function loadPiTmuxBashEval(file) {
   if (typeof raw.threshold_rationale !== "string" || raw.threshold_rationale.length < 40) {
     throw new Error("pi-tmux-bash model-eval threshold needs a meaningful rationale");
   }
+  if (!/not real Pi model-eval evidence/i.test(raw.threshold_rationale)) {
+    throw new Error("threshold rationale must say synthetic fixtures are not real Pi model-eval evidence");
+  }
   if (!Array.isArray(raw.scenarios) || raw.scenarios.length === 0) {
     throw new Error("eval scenarios must be non-empty");
   }
@@ -197,18 +258,31 @@ function toolStarts(trace, toolName) {
   return trace.filter((event) => event?.type === "tool_execution_start" && event.toolName === toolName);
 }
 
-function toolEnds(trace, toolName) {
-  return trace.filter((event) => event?.type === "tool_execution_end" && event.toolName === toolName);
-}
-
 function stringifyResult(event) {
   if (!event) return "";
   if (typeof event.resultText === "string") return event.resultText;
   return event.result ? JSON.stringify(event.result) : "";
 }
 
-function collectWindowIds(text) {
-  return [...String(text || "").matchAll(WINDOW_ID_RE)].map((match) => match[0]);
+function detailsOf(event) {
+  return event?.result?.details || event?.details || {};
+}
+
+export function collectTaskIdsFromResult(event) {
+  const ids = [];
+  const details = detailsOf(event);
+  if (details.taskId != null && String(details.taskId).trim()) ids.push(String(details.taskId).trim());
+  const text = stringifyResult(event);
+  try {
+    const parsed = JSON.parse(text);
+    const nested = parsed?.details?.taskId || parsed?.taskId;
+    if (nested != null && String(nested).trim()) ids.push(String(nested).trim());
+  } catch {
+    // result text is not JSON
+  }
+  const quoted = /"taskId"\s*:\s*"([^"]+)"/.exec(text);
+  if (quoted?.[1]) ids.push(quoted[1]);
+  return [...new Set(ids.filter(Boolean))];
 }
 
 function assistantText(trace) {
@@ -231,7 +305,17 @@ export function matchingBashEnds(events, taskBash) {
 }
 
 export function idsFromMatchingBash(events, taskBash) {
-  return matchingBashEnds(events, taskBash).flatMap((event) => collectWindowIds(stringifyResult(event)));
+  return matchingBashEnds(events, taskBash).flatMap((event) => collectTaskIdsFromResult(event));
+}
+
+function tmuxTaskId(event) {
+  return String(event?.args?.taskId || "").trim();
+}
+
+function waitTimeoutLooksAlive(matchingEnds, matchingBashText) {
+  if (matchingEnds.some((event) => detailsOf(event).status === "running")) return true;
+  if (extractTimedOutBackground(matchingEnds) !== null) return true;
+  return STILL_RUNNING_RE.test(matchingBashText);
 }
 
 export function gradePiTmuxBashTrace(scenario, trace) {
@@ -254,13 +338,12 @@ export function gradePiTmuxBashTrace(scenario, trace) {
   const results = {
     uses_bash: matchingStarts.length > 0,
     no_forced_subagent: forced.length === 0,
-    wait_timeout_not_failure: STILL_RUNNING_RE.test(matchingBashText)
-      || extractTimedOutBackground(matchingEnds) !== null,
+    wait_timeout_not_failure: waitTimeoutLooksAlive(matchingEnds, matchingBashText),
     returned_id: ids.length > 0,
     inspects_by_returned_id: tmuxStarts.some((event) =>
-      event.args?.action === "peek" && ids.includes(String(event.args?.window || ""))),
+      event.args?.action === "peek" && ids.includes(tmuxTaskId(event))),
     stops_by_returned_id: tmuxStarts.some((event) =>
-      event.args?.action === "kill" && ids.includes(String(event.args?.window || ""))),
+      event.args?.action === "kill" && ids.includes(tmuxTaskId(event))),
     completion_followup: autonomous !== null,
     stays_in_originating_target: !NEW_TARGET_RE.test(text),
     final_summary: marker
