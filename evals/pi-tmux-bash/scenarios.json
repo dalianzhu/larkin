@@ -1,11 +1,17 @@
 {
   "dataset": "pi-tmux-bash",
   "version": 1,
-  "standing_prompt_version": "larkin-standing-v29",
+  "standing_prompt_version": "larkin-standing-v30",
   "plugin": {
     "name": "@richardgill/pi-tmux-bash",
     "version": "0.0.12",
     "distribution": "external-user-installed"
+  },
+  "workspace": {
+    "success_path": "isolated-git-fixture",
+    "production_claim": "not-assumed",
+    "upstream_limitation": "0.0.12 getGitRoot/executeTool requires a git repository; a non-git cwd currently fails with 'not in a git repository'.",
+    "larkin_note": "Larkin Agent workspaces are usually not git. User clarification is pending. Git-fixture success is not production or non-git support."
   },
   "runtime": {
     "adapter": "pi",
@@ -13,7 +19,7 @@
   },
   "model": {
     "selection": "opencode-go/deepseek-v4-flash",
-    "standing_prompt_version": "larkin-standing-v29"
+    "standing_prompt_version": "larkin-standing-v30"
   },
   "threshold": 0.6,
   "grader": {

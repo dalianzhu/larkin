@@ -16,16 +16,18 @@ import type { AgentCliCapabilities, RuntimeId, RuntimeInput, StandingPrompt } fr
  * 6. 用 eval 验证：行为变化必须配套固定场景 + rubric（evals/*、test/support/*-grader.mjs、live 测试）。
  */
 
-export const LARKIN_STANDING_PROMPT_VERSION = "larkin-standing-v29";
+export const LARKIN_STANDING_PROMPT_VERSION = "larkin-standing-v30";
 
 /**
  * Pi 长命令引导的唯一来源。仅在当前工具列表出现 tmux-backed bash 时适用；
  * 不声明 tmux 一定可用，也不复述用户安装扩展的工具细节。
+ * 不声明生产 workspace 或任意 cwd 可用；工具拒绝当前 workspace 时只要求如实报告。
  */
 export const PI_TMUX_BASH_GUIDANCE: readonly string[] = [
   "If the current tools include a tmux-backed bash, long-running work may continue after a wait timeout. That timeout is not process failure.",
   "Use the identifiers those tools return to inspect or stop the same process. When a command finishes, handle the completion notification in this originating conversation.",
   "The user-installed extension owns tool names, arguments, and other details. Do not assume tmux or extra inspect/stop tools exist unless they appear in the current tool list.",
+  "If an available tool refuses the current workspace, report that limitation. Do not invent a second background mechanism or assume these tools work in every workspace.",
 ];
 
 /**

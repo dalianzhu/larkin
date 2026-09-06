@@ -51,8 +51,14 @@ export function loadPiTmuxBashEval(file) {
   const raw = JSON.parse(fs.readFileSync(file, "utf8"));
   if (raw.dataset !== "pi-tmux-bash") throw new Error("pi-tmux-bash eval dataset id mismatch");
   if (raw.version !== 1) throw new Error("pi-tmux-bash eval version must be 1");
-  if (raw.standing_prompt_version !== "larkin-standing-v29") {
-    throw new Error("pi-tmux-bash standing prompt version must be larkin-standing-v29");
+  if (raw.standing_prompt_version !== "larkin-standing-v30") {
+    throw new Error("pi-tmux-bash standing prompt version must be larkin-standing-v30");
+  }
+  if (raw.workspace?.success_path !== "isolated-git-fixture") {
+    throw new Error("pi-tmux-bash eval success path must be isolated-git-fixture");
+  }
+  if (raw.workspace?.production_claim !== "not-assumed") {
+    throw new Error("pi-tmux-bash eval must not claim production or non-git support");
   }
   if (raw.plugin?.name !== "@richardgill/pi-tmux-bash" || raw.plugin?.version !== "0.0.12") {
     throw new Error("pi-tmux-bash eval must pin external @richardgill/pi-tmux-bash@0.0.12");

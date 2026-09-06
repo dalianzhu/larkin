@@ -25,6 +25,7 @@ import {
   snapshotUserPiSettings,
   spawnPiRpc,
   standingPromptFile,
+  UPSTREAM_NON_GIT_ERROR,
   waitFor,
 } from "../support/pi-tmux-bash-live-harness.mjs";
 
@@ -82,14 +83,17 @@ async function promptWhenIdle(session, message) {
   return waitFor(session.trace, (event) => event?.type === "agent_end" && agentEndCount(session.trace) > before, 180_000);
 }
 
-async function startIsolatedPi({ appendPrompt = true } = {}) {
+async function startIsolatedPi({ appendPrompt = true, git = true } = {}) {
   const snapshot = snapshotUserPiSettings();
   const source = resolveTmuxBashPackagePath();
   const loadMode = resolveTmuxBashLoadMode();
   if (loadMode === "extension" && !source) {
-    throw new Error("LARKIN_PI_TMUX_BASH_PACKAGE or the extracted 0.0.12 package is required for isolated extension load");
+    throw new Error("LARKIN_PI_TMUX_BASH_PACKAGE or the isolated published 0.0.12 package is required for extension load");
   }
-  const workspace = createIsolatedTmuxWorkspace();
+  const workspace = createIsolatedTmuxWorkspace({
+    prefix: git ? "larkin-tmux-eval-" : "larkin-tmux-nongit-",
+    git,
+  });
   workspaces.push(workspace);
   let packagePath = source;
   if (loadMode === "extension") {
@@ -109,7 +113,7 @@ async function startIsolatedPi({ appendPrompt = true } = {}) {
   const selected = state?.model?.provider && state?.model?.id
     ? `${state.model.provider}/${state.model.id}`
     : state?.model?.id || "unknown";
-  console.log(`[live] pi ${loadMode} package=${packagePath || "discovery"} model=${selected} session=${workspace.sessionName}`);
+  console.log(`[live] pi ${loadMode} gitFixture=${workspace.gitFixture} package=${packagePath || "discovery"} model=${selected} session=${workspace.sessionName}`);
   return { snapshot, workspace, child, client, trace, loadMode, packagePath, state, selectedModel: selected };
 }
 
@@ -121,7 +125,9 @@ async function stopIsolatedPi(session) {
 
 test("pi-tmux-bash eval starts from the fixed scenario dataset", () => {
   assert.equal(DATASET.model.selection, "opencode-go/deepseek-v4-flash");
-  assert.equal(DATASET.standing_prompt_version, "larkin-standing-v29");
+  assert.equal(DATASET.standing_prompt_version, "larkin-standing-v30");
+  assert.equal(DATASET.workspace.success_path, "isolated-git-fixture");
+  assert.equal(DATASET.workspace.production_claim, "not-assumed");
   assert.deepEqual(DATASET.scenarios.map((scenario) => scenario.id), [
     "long-command-backgrounds-without-subagent",
     "wait-timeout-is-not-failure",
@@ -167,9 +173,60 @@ for (const scenario of DATASET.scenarios) {
   }, { timeout: 900_000 });
 }
 
+test("opt-in live RPC: isolated git fixture short command (not a production/non-git claim)", async () => {
+  if (!liveEnabled) return;
+  const session = await startIsolatedPi({ git: true });
+  try {
+    assert.equal(session.workspace.gitFixture, true);
+    assert.equal(fs.existsSync(path.join(session.workspace.workDir, ".git")), true);
+    await session.client.request("prompt", {
+      message: [
+        "Use only currently available tools and synthetic local commands. No Feishu.",
+        "Run exactly: echo larkin-tmux-git-fixture",
+        "Then end the turn. Do not use an Agent or subagent.",
+      ].join(" "),
+    });
+    await waitFor(session.trace, (event) => event?.type === "tool_execution_end" && event.toolName === "bash", 180_000);
+    const bashEnd = session.trace.find((event) => event?.type === "tool_execution_end" && event.toolName === "bash");
+    const bashText = bashEnd?.result ? JSON.stringify(bashEnd.result) : "";
+    assert.doesNotMatch(bashText, UPSTREAM_NON_GIT_ERROR);
+    assert.match(bashText, /larkin-tmux-git-fixture/);
+    console.log("[live] git fixture short command succeeded; this is not a production or non-git claim");
+  } finally {
+    await stopIsolatedPi(session);
+  }
+}, { timeout: 300_000 });
+
+test("opt-in live RPC: non-git cwd currently fails with upstream git-root error", async () => {
+  if (!liveEnabled) return;
+  const session = await startIsolatedPi({ git: false });
+  try {
+    assert.equal(session.workspace.gitFixture, false);
+    assert.equal(fs.existsSync(path.join(session.workspace.workDir, ".git")), false);
+    await session.client.request("prompt", {
+      message: [
+        "Use only currently available tools and synthetic local commands. No Feishu.",
+        "Run exactly: echo larkin-tmux-nongit",
+        "If the tool refuses this workspace, report the limitation and end the turn.",
+        "Do not invent a second background mechanism. Do not use an Agent or subagent.",
+      ].join(" "),
+    });
+    await waitFor(session.trace, (event) => event?.type === "tool_execution_end" && event.toolName === "bash", 180_000);
+    const bashEnd = session.trace.find((event) => event?.type === "tool_execution_end" && event.toolName === "bash");
+    const bashText = bashEnd?.result ? JSON.stringify(bashEnd.result) : String(bashEnd?.resultText || "");
+    assert.match(bashText, UPSTREAM_NON_GIT_ERROR);
+    assert.equal(discoverIsolatedTmuxWindows(session.workspace).length, 0);
+    assert.equal(session.trace.some((event) =>
+      event?.type === "tool_execution_start" && ["Agent", "supervised_start"].includes(event.toolName)), false);
+    console.log("[live] non-git cwd currently failed as expected; do not treat this as production support");
+  } finally {
+    await stopIsolatedPi(session);
+  }
+}, { timeout: 300_000 });
+
 test("opt-in live RPC: >60s tmux process, peek, cancel, and completion followUp", async () => {
   if (!liveEnabled) return;
-  const session = await startIsolatedPi();
+  const session = await startIsolatedPi({ git: true });
   const marker = `LARKIN_TMUX_LIVE_${Date.now()}`;
   const startedAt = Date.now();
   try {

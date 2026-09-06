@@ -14,11 +14,14 @@ import {
   summarizePiTmuxBashEval,
 } from "../../support/pi-tmux-bash-grader.mjs";
 import {
-  DEFAULT_EXTRACTED_PACKAGE,
+  DEFAULT_ISOLATED_PACKAGE,
+  UPSTREAM_NON_GIT_ERROR,
   assertUserPiSettingsUnchanged,
   buildPiRpcArgs,
   createIsolatedTmuxWorkspace,
   killIsolatedTmuxSession,
+  packageHasResolvableDependencies,
+  prepareIsolatedTmuxBashPackage,
   readPinnedPluginManifest,
   resolveTmuxBashLoadMode,
   resolveTmuxBashPackagePath,
@@ -42,11 +45,15 @@ function completionEvent(marker) {
   };
 }
 
-test("pi-tmux-bash dataset pins version, threshold, external plugin 0.0.12, and standing v29", () => {
+test("pi-tmux-bash dataset pins version, threshold, external plugin 0.0.12, and standing v30", () => {
   assert.equal(DATASET.dataset, "pi-tmux-bash");
   assert.equal(DATASET.version, 1);
-  assert.equal(DATASET.standing_prompt_version, "larkin-standing-v29");
-  assert.equal(DATASET.model.standing_prompt_version, "larkin-standing-v29");
+  assert.equal(DATASET.standing_prompt_version, "larkin-standing-v30");
+  assert.equal(DATASET.model.standing_prompt_version, "larkin-standing-v30");
+  assert.equal(DATASET.workspace.success_path, "isolated-git-fixture");
+  assert.equal(DATASET.workspace.production_claim, "not-assumed");
+  assert.match(DATASET.workspace.upstream_limitation, /not in a git repository/);
+  assert.match(DATASET.workspace.larkin_note, /usually not git/);
   assert.equal(DATASET.model.selection, "opencode-go/deepseek-v4-flash");
   assert.equal(DATASET.threshold, 0.6);
   assert.equal(DATASET.grader.version, 1);
@@ -64,10 +71,10 @@ test("pi-tmux-bash dataset pins version, threshold, external plugin 0.0.12, and 
   ]);
 });
 
-test("standing prompt v29 replaces forced subagent rules with conditional tmux-backed bash guidance", () => {
-  assert.equal(LARKIN_STANDING_PROMPT_VERSION, "larkin-standing-v29");
+test("standing prompt v30 replaces forced subagent rules with conditional tmux-backed bash guidance", () => {
+  assert.equal(LARKIN_STANDING_PROMPT_VERSION, "larkin-standing-v30");
   const pi = buildPrompt("pi");
-  assert.equal(pi.version, "larkin-standing-v29");
+  assert.equal(pi.version, "larkin-standing-v30");
   assert.match(pi.content, /## Long-running commands \(pi\)/);
   for (const line of PI_TMUX_BASH_GUIDANCE) {
     assert.equal(pi.content.includes(line), true, line);
@@ -77,6 +84,8 @@ test("standing prompt v29 replaces forced subagent rules with conditional tmux-b
   assert.match(pi.content, /identifiers those tools return/);
   assert.match(pi.content, /originating conversation/);
   assert.match(pi.content, /Do not assume tmux or extra inspect\/stop tools exist unless they appear in the current tool list/);
+  assert.match(pi.content, /If an available tool refuses the current workspace/);
+  assert.match(pi.content, /Do not invent a second background mechanism/);
   assert.doesNotMatch(pi.content, /## Background subagents \(pi\)/);
   assert.doesNotMatch(pi.content, /hard-capped at 60/);
   assert.doesNotMatch(pi.content, /Total lifetime is 600s/);
@@ -85,6 +94,7 @@ test("standing prompt v29 replaces forced subagent rules with conditional tmux-b
   assert.doesNotMatch(pi.content, /nohup/);
   assert.doesNotMatch(pi.content, /supervised_start/);
   assert.doesNotMatch(pi.content, /ONLY supported background mechanism/);
+  assert.doesNotMatch(pi.content, /getGitRoot|git init|git repository|production workspace|Larkin Agent workspace/i);
   const remainder = PI_TMUX_BASH_GUIDANCE.reduce((text, line) => text.replaceAll(line, ""), pi.content);
   assert.doesNotMatch(remainder, /tmux-backed bash/);
   const other = buildPrompt("codex");
@@ -172,6 +182,8 @@ test("isolated harness uses configurable local package or normal discovery and d
   const snapshot = snapshotUserPiSettings();
   const workspace = createIsolatedTmuxWorkspace("larkin-tmux-unit-");
   try {
+    assert.equal(workspace.gitFixture, true);
+    assert.equal(fs.existsSync(path.join(workspace.workDir, ".git")), true);
     const extensionArgs = buildPiRpcArgs({
       packagePath: workspace.packageDir,
       loadMode: "extension",
@@ -184,8 +196,19 @@ test("isolated harness uses configurable local package or normal discovery and d
     assert.equal(discoveryArgs.includes("-e"), false);
     assert.equal(discoveryArgs.includes("--no-extensions"), false);
     assert.equal(resolveTmuxBashLoadMode({ LARKIN_PI_TMUX_BASH_LOAD: "discovery" }), "discovery");
+    const defaultPath = resolveTmuxBashPackagePath({});
+    if (defaultPath) {
+      assert.equal(defaultPath, path.resolve(DEFAULT_ISOLATED_PACKAGE));
+      const manifest = readPinnedPluginManifest(defaultPath);
+      assert.equal(manifest.name, "@richardgill/pi-tmux-bash");
+      assert.equal(manifest.version, "0.0.12");
+      assert.equal(packageHasResolvableDependencies(defaultPath), true);
+      const unusedDest = path.join(workspace.root, "must-not-copy");
+      assert.equal(prepareIsolatedTmuxBashPackage(defaultPath, unusedDest), path.resolve(defaultPath));
+      assert.equal(fs.existsSync(unusedDest), false);
+    }
     const packagePath = resolveTmuxBashPackagePath({
-      LARKIN_PI_TMUX_BASH_PACKAGE: DEFAULT_EXTRACTED_PACKAGE,
+      LARKIN_PI_TMUX_BASH_PACKAGE: DEFAULT_ISOLATED_PACKAGE,
     });
     if (packagePath) {
       const manifest = readPinnedPluginManifest(packagePath);
@@ -196,5 +219,24 @@ test("isolated harness uses configurable local package or normal discovery and d
   } finally {
     killIsolatedTmuxSession(workspace.sessionName);
     fs.rmSync(workspace.root, { recursive: true, force: true });
+  }
+});
+
+test("harness distinguishes isolated git fixture from explicit non-git cwd that currently fails", () => {
+  const git = createIsolatedTmuxWorkspace({ prefix: "larkin-tmux-git-", git: true });
+  const nongit = createIsolatedTmuxWorkspace({ prefix: "larkin-tmux-nongit-", git: false });
+  try {
+    assert.equal(git.gitFixture, true);
+    assert.equal(fs.existsSync(path.join(git.workDir, ".git")), true);
+    assert.equal(nongit.gitFixture, false);
+    assert.equal(fs.existsSync(path.join(nongit.workDir, ".git")), false);
+    assert.match("Error: not in a git repository.", UPSTREAM_NON_GIT_ERROR);
+    assert.equal(DEFAULT_ISOLATED_PACKAGE,
+      "/tmp/larkin-tmux-package.ypzqKm/node_modules/@richardgill/pi-tmux-bash");
+  } finally {
+    killIsolatedTmuxSession(git.sessionName);
+    killIsolatedTmuxSession(nongit.sessionName);
+    fs.rmSync(git.root, { recursive: true, force: true });
+    fs.rmSync(nongit.root, { recursive: true, force: true });
   }
 });

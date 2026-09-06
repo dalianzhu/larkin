@@ -4,8 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const DEFAULT_EXTRACTED_PACKAGE = "/tmp/larkin-tmux-package.ypzqKm/package";
+export const DEFAULT_ISOLATED_PACKAGE =
+  "/tmp/larkin-tmux-package.ypzqKm/node_modules/@richardgill/pi-tmux-bash";
+export const DEFAULT_EXTRACTED_PACKAGE = DEFAULT_ISOLATED_PACKAGE;
 export const PINNED_PLUGIN = { name: "@richardgill/pi-tmux-bash", version: "0.0.12" };
+export const UPSTREAM_NON_GIT_ERROR = /not in a git repository/i;
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -16,9 +19,24 @@ export function userPiAgentDir(env = process.env) {
 export function resolveTmuxBashPackagePath(env = process.env) {
   const configured = String(env.LARKIN_PI_TMUX_BASH_PACKAGE || "").trim();
   if (configured) return path.resolve(configured);
-  const fallback = String(env.LARKIN_PI_TMUX_BASH_DEFAULT_PACKAGE || DEFAULT_EXTRACTED_PACKAGE).trim();
+  const fallback = String(env.LARKIN_PI_TMUX_BASH_DEFAULT_PACKAGE || DEFAULT_ISOLATED_PACKAGE).trim();
   if (fallback && fs.existsSync(path.join(fallback, "package.json"))) return path.resolve(fallback);
   return null;
+}
+
+export function packageHasResolvableDependencies(packageDir) {
+  let current = path.resolve(packageDir);
+  for (let i = 0; i < 6; i += 1) {
+    const modules = path.join(current, "node_modules");
+    if (fs.existsSync(path.join(modules, "zod"))
+      && fs.existsSync(path.join(modules, "@richardgill", "lib"))) {
+      return true;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return false;
 }
 
 export function resolveTmuxBashLoadMode(env = process.env) {
@@ -64,6 +82,7 @@ export function assertUserPiSettingsUnchanged(snapshot, env = process.env) {
 
 export function prepareIsolatedTmuxBashPackage(sourceDir, destDir) {
   readPinnedPluginManifest(sourceDir);
+  if (packageHasResolvableDependencies(sourceDir)) return path.resolve(sourceDir);
   fs.cpSync(sourceDir, destDir, { recursive: true });
   const install = spawnSync("npm", ["install", "--omit=dev", "--ignore-scripts", "--no-fund", "--no-audit"], {
     cwd: destDir,
@@ -87,7 +106,10 @@ export function buildPiRpcArgs({ packagePath, loadMode, model, extraArgs = [] })
   return args;
 }
 
-export function createIsolatedTmuxWorkspace(prefix = "larkin-tmux-eval-") {
+export function createIsolatedTmuxWorkspace(prefixOrOptions = "larkin-tmux-eval-") {
+  const options = typeof prefixOrOptions === "string" ? { prefix: prefixOrOptions } : { ...prefixOrOptions };
+  const prefix = options.prefix || "larkin-tmux-eval-";
+  const gitFixture = options.git !== false;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   const workDir = path.join(root, "work");
   const extConfigDir = path.join(root, "ext-config");
@@ -96,8 +118,10 @@ export function createIsolatedTmuxWorkspace(prefix = "larkin-tmux-eval-") {
   fs.mkdirSync(workDir, { recursive: true, mode: 0o700 });
   fs.mkdirSync(extConfigDir, { recursive: true, mode: 0o700 });
   fs.mkdirSync(outputDir, { recursive: true, mode: 0o700 });
-  const init = spawnSync("git", ["init"], { cwd: workDir, encoding: "utf8" });
-  if (init.status !== 0) throw new Error(`git init failed: ${init.stderr || init.stdout}`);
+  if (gitFixture) {
+    const init = spawnSync("git", ["init"], { cwd: workDir, encoding: "utf8" });
+    if (init.status !== 0) throw new Error(`git init failed: ${init.stderr || init.stdout}`);
+  }
   const sessionName = `larkin-tmux-${path.basename(root).replace(/[^a-zA-Z0-9-]/g, "").slice(-16)}`;
   const config = {
     tmuxSessionScope: "global",
@@ -110,7 +134,7 @@ export function createIsolatedTmuxWorkspace(prefix = "larkin-tmux-eval-") {
     maxTimeoutSeconds: 60,
   };
   fs.writeFileSync(path.join(extConfigDir, "tmux-bash.jsonc"), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
-  return { root, workDir, extConfigDir, outputDir, packageDir, sessionName, config };
+  return { root, workDir, extConfigDir, outputDir, packageDir, sessionName, config, gitFixture };
 }
 
 export function childEnvForIsolatedPi(workspace, env = process.env) {
