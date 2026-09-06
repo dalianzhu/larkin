@@ -231,7 +231,9 @@ export function observeInboxAuditTarget(file: string, agentId: string, event: {
   if (!parsed) return false;
   return mutate(file, (registry) => {
     const existing = registry.targets.find((row) => row.agent_id === agentId && row.target === parsed.target);
-    if (existing?.status === "completed" && existing.anchor === parsed.anchor) return false;
+    // Redelivery of the same original source is not new evidence and must not
+    // rotate a receipt generation. A different anchor deliberately reopens it.
+    if (existing?.anchor === parsed.anchor) return false;
     registry.targets = registry.targets.filter((row) => row.agent_id !== agentId || row.target !== parsed.target);
     registry.targets.unshift({ agent_id: agentId, generation: crypto.randomUUID(), ...parsed, observed_at: now.toISOString(), status: "pending" });
     registry.targets = registry.targets.slice(0, MAX_STORED_TARGETS);
