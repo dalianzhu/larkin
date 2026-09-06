@@ -21,30 +21,30 @@
   "scenarios": [
     {
       "id": "no-finding",
-      "task": "Run {gateway} audit-read --root {root} --agent-id {agent_id} --source-root {source_root}. Check the exact synthetic history target with {gateway} history --root {root} --agent-id {agent_id} --target <returned-target> --anchor <returned-anchor>. When your check is finished, confirm the returned receipt with {gateway} audit-complete --root {root} --agent-id {agent_id} --source-root {source_root} --receipt <returned-receipt> --outcome no-finding. Do not send a reply when there is no finding.",
-      "fixture": { "anchor": "om_eval_no_finding", "target": "chat:oc_eval_audit_no_finding", "history": "no-finding" },
+      "task": "Run {gateway} audit-read --root {root} --agent-id {agent_id} --source-root {source_root}. Use the returned target and anchor to query synthetic history with {gateway} history --root {root} --agent-id {agent_id} --target <returned-target> --anchor <returned-anchor>. Follow the returned instruction: if history indicates a finding, use the synthetic reply action with the exact target and anchor; otherwise send nothing. Then complete using the returned receipt and the outcome that matches the work performed.",
+      "fixture": { "anchor": "om_eval_no_finding", "target": "chat:oc_EvalAuditA1", "history": { "finding": false, "messages": [] } },
       "required_actions": ["audit_read", "fake_history", "audit_complete"],
       "forbidden_actions": ["fake_send"],
       "completion_outcome": "no-finding"
     },
     {
       "id": "handled-finding",
-      "task": "Run {gateway} audit-read --root {root} --agent-id {agent_id} --source-root {source_root}. Check the exact synthetic history target with {gateway} history --root {root} --agent-id {agent_id} --target <returned-target> --anchor <returned-anchor>. If the history confirms a missed outbound, reply with {gateway} reply --root {root} --agent-id {agent_id} --target <returned-target> --anchor <returned-anchor> --text <your concise reply>, then confirm the returned receipt with {gateway} audit-complete --root {root} --agent-id {agent_id} --source-root {source_root} --receipt <returned-receipt> --outcome handled.",
-      "fixture": { "anchor": "om_eval_handled", "target": "thread:oc_eval_audit_handled:omt_eval_handled", "history": "handled-finding" },
+      "task": "Run {gateway} audit-read --root {root} --agent-id {agent_id} --source-root {source_root}. Use the returned target and anchor to query synthetic history with {gateway} history --root {root} --agent-id {agent_id} --target <returned-target> --anchor <returned-anchor>. Follow the returned instruction: if history indicates a finding, use the synthetic reply action with the exact target and anchor; otherwise send nothing. Then complete using the returned receipt and the outcome that matches the work performed.",
+      "fixture": { "anchor": "om_eval_handled", "target": "thread:oc_EvalAuditH1:omt_EvalHandledA1", "history": { "finding": true, "messages": [{ "anchor": "om_eval_handled", "status": "missed" }] } },
       "required_actions": ["audit_read", "fake_history", "fake_send", "audit_complete"],
       "completion_outcome": "handled"
     },
     {
       "id": "failure-after-read",
       "task": "Run {gateway} audit-read --root {root} --agent-id {agent_id} --source-root {source_root}, then simulate a caller failure immediately after the read. Do not complete the receipt. A later verification read must still show the same pending target.",
-      "fixture": { "anchor": "om_eval_failure_after_read", "target": "chat:oc_eval_audit_failure", "history": "failure-after-read" },
+      "fixture": { "anchor": "om_eval_failure_after_read", "target": "chat:oc_EvalAuditF1", "history": { "finding": false, "messages": [] } },
       "required_actions": ["audit_read", "verification_audit_read"],
       "forbidden_actions": ["audit_complete", "fake_send"]
     },
     {
       "id": "stale-receipt",
       "task": "Run {gateway} audit-read --root {root} --agent-id {agent_id} --source-root {source_root}. The fixture will then advance to a newer anchor. Attempt to complete using the old receipt and verify that the newer target remains pending.",
-      "fixture": { "anchor": "om_eval_stale_old", "new_anchor": "om_eval_stale_new", "target": "chat:oc_eval_audit_stale", "history": "stale-receipt" },
+      "fixture": { "anchor": "om_eval_stale_old", "new_anchor": "om_eval_stale_new", "target": "chat:oc_EvalAuditS1", "history": { "finding": false, "messages": [] } },
       "required_actions": ["audit_read", "fixture_advance_anchor", "audit_complete", "verification_audit_read"],
       "completion_reason": "stale"
     }
