@@ -335,7 +335,7 @@ process.exit(1);
   } finally { fs.rmSync(temp, { recursive: true, force: true }); }
 });
 
-test("inbox audit returns bounded group/topic instructions without a delivery side effect", () => {
+test("inbox audit read is public and completion requires its current receipt", () => {
   const f = fixture();
   try {
     fs.writeFileSync(path.join(f.root, "inbox-audit.json"), JSON.stringify({ version: 2, targets: [{
@@ -346,10 +346,31 @@ test("inbox audit returns bounded group/topic instructions without a delivery si
     const body = JSON.parse(result.stdout);
     assert.deepEqual(body.targets.map((row) => ({ target: row.target, anchor: row.anchor })), [{ target: "thread:oc_audit:omt_audit", anchor: "om_audit" }]);
     assert.match(body.targets[0].instruction, /threads-messages-list/);
+    assert.match(body.targets[0].instruction, /audit complete --receipt/);
+    assert.equal(typeof body.targets[0].receipt, "string");
+    assert.match(body.targets[0].revision, /^sha256:/);
     assert.equal(body.no_finding, "stay_silent");
     const second = f.run(["inbox", "audit", "--json"]);
     assert.equal(second.code, 0, second.stderr);
-    assert.deepEqual(JSON.parse(second.stdout).targets, [], "reported targets must not be scanned again");
+    assert.equal(JSON.parse(second.stdout).targets.length, 1, "reading has no delivery or completion side effect");
+    const complete = f.run(["inbox", "audit", "complete", "--receipt", body.targets[0].receipt, "--outcome", "no-finding", "--json"]);
+    assert.equal(complete.code, 0, complete.stderr);
+    assert.deepEqual(JSON.parse(complete.stdout), { completed: true, reason: "completed" });
+    assert.deepEqual(JSON.parse(f.run(["inbox", "audit", "--json"]).stdout).targets, [], "explicit completion suppresses unchanged work");
+    const repeat = f.run(["inbox", "audit", "complete", "--receipt", body.targets[0].receipt, "--outcome", "no-finding", "--json"]);
+    assert.equal(repeat.code, 0, repeat.stderr);
+    assert.deepEqual(JSON.parse(repeat.stdout), { completed: false, reason: "already_completed" });
+
+    fs.writeFileSync(path.join(f.root, "inbox-audit.json"), JSON.stringify({ version: 2, targets: [{
+      agent_id: f.agentId, target: "chat:oc_audit", anchor: "om_audit_process", observed_at: "2026-07-21T00:00:00.000Z", status: "pending",
+    }] }), { mode: 0o600 });
+    const entry = path.join(ROOT, "dist", "app", "agent-cli.mjs");
+    const processRead = spawnSync(process.execPath, [entry, "inbox", "audit", "--json"], { encoding: "utf8", env: { ...process.env, ...f.env } });
+    assert.equal(processRead.status, 0, processRead.stderr);
+    const processBody = JSON.parse(processRead.stdout);
+    const processComplete = spawnSync(process.execPath, [entry, "inbox", "audit", "complete", "--receipt", processBody.targets[0].receipt, "--outcome", "handled", "--json"], { encoding: "utf8", env: { ...process.env, ...f.env } });
+    assert.equal(processComplete.status, 0, processComplete.stderr);
+    assert.deepEqual(JSON.parse(processComplete.stdout), { completed: true, reason: "completed" }, "compiled public CLI completes only the exact read receipt");
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 

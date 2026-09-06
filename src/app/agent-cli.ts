@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { createAgentStateStore, type AgentStateStore } from "../agent/agent-state-store.js";
 import * as larkinConfig from "../platform/config.js";
 import { projectInboxCheck, projectInboxEvents, type InboxEnvelope } from "../agent/inbox-projection.js";
-import { completeInboxAuditTargets, inboxAuditRegistryFile, readInboxAuditTargets } from "../agent/missed-outbound-scan.js";
+import { completeInboxAuditTarget, inboxAuditRegistryFile, readInboxAuditTargets } from "../agent/missed-outbound-scan.js";
 import { createReminderRoutes } from "../agent/reminder-routes.js";
 import { InteractionStateMachine } from "../agent/interaction-state-machine.js";
 import { issueCallbackProbe, readCallbackCapability } from "../platform/callback-capability.js";
@@ -515,12 +515,20 @@ export function runAgentCli(
       }
       const options = parseOptions(rest, new Set(["--json"]));
       if (subcommand === "audit") {
-        if (options.positionals.length || options.values.size || options.booleans.size > 1) {
-          throw new Error("inbox audit 只接受 --json");
-        }
         const file = inboxAuditRegistryFile(config.larkinHome);
+        if (options.positionals[0] === "complete") {
+          if (options.positionals.length !== 1 || options.booleans.size > 1 || [...options.values.keys()].some((key) => !["--receipt", "--outcome"].includes(key))) {
+            throw new Error("用法: larkin inbox audit complete --receipt <receipt> --outcome <no-finding|handled> [--json]");
+          }
+          const receipt = options.values.get("--receipt");
+          const outcome = options.values.get("--outcome");
+          if (!receipt || !outcome) throw new Error("用法: larkin inbox audit complete --receipt <receipt> --outcome <no-finding|handled> [--json]");
+          const completion = completeInboxAuditTarget(file, agent.agentId, receipt, outcome);
+          emitJson(io, completion);
+          return completion.reason === "invalid_receipt" || completion.reason === "invalid_outcome" ? 2 : 0;
+        }
+        if (options.positionals.length || options.values.size || options.booleans.size > 1) throw new Error("inbox audit 只接受 --json；完成检查用 inbox audit complete");
         const audit = readInboxAuditTargets(file, agent.agentId);
-        completeInboxAuditTargets(file, agent.agentId);
         emitJson(io, audit);
         return 0;
       }

@@ -522,6 +522,7 @@ export function createHostShell({
     stateStore,
     runtimeHost,
     log,
+    configFile: path.join(larkinHome, "config.json"),
     schedule(agent) {
       try { return resolveInboxAuditSchedule(loadConfig(env).config, agent.agentId); }
       catch (error) {
