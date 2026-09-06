@@ -30,8 +30,11 @@ interface StoredTarget extends InboxAuditTarget {
 }
 interface AuditRegistry { version: 3; targets: StoredTarget[] }
 interface ReceiptPayload { v: 1; agent_id: string; target: string; anchor: string; revision: string }
+interface RetryTarget { agent_id: string; target: string; anchor: string; chat_id: string; thread_id: string | null; queued_at: string }
+interface RetryJournal { version: 1; targets: RetryTarget[] }
 
 export function inboxAuditRegistryFile(larkinHome: string): string { return path.join(larkinHome, "inbox-audit.json"); }
+export function inboxAuditRetryFile(larkinHome: string): string { return path.join(larkinHome, "inbox-audit-retry.json"); }
 
 function parseTarget(event: { chat_id?: string; thread_id?: string | null; message_id?: string }): { target: string; anchor: string } | null {
   const chatId = String(event.chat_id || "");
@@ -120,10 +123,49 @@ function save(file: string, registry: AuditRegistry): void {
   catch (error) { try { fs.unlinkSync(temporary); } catch { /* best effort */ } throw error; }
 }
 
+function emptyRetryJournal(): RetryJournal { return { version: 1, targets: [] }; }
+
+function loadRetryJournal(file: string): RetryJournal {
+  let value: unknown;
+  try {
+    assertSafeExistingFile(file, "inbox audit retry journal");
+    const stat = fs.statSync(file);
+    if (stat.size > MAX_INBOX_AUDIT_REGISTRY_BYTES) throw new Error("inbox audit retry journal exceeds the bounded byte limit");
+    value = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyRetryJournal();
+    throw error;
+  }
+  const raw = value as { version?: unknown; targets?: unknown };
+  if (raw.version !== 1 || !Array.isArray(raw.targets) || raw.targets.length > MAX_INBOX_AUDIT_REGISTRY_ROWS) return emptyRetryJournal();
+  return { version: 1, targets: raw.targets.flatMap((candidate): RetryTarget[] => {
+    if (!candidate || typeof candidate !== "object") return [];
+    const row = candidate as Partial<RetryTarget>;
+    const parsed = parseTarget({ chat_id: row.chat_id, thread_id: row.thread_id, message_id: row.anchor });
+    if (typeof row.agent_id !== "string" || !row.agent_id || typeof row.target !== "string" || !parsed || parsed.target !== row.target
+      || typeof row.chat_id !== "string" || (row.thread_id !== null && typeof row.thread_id !== "string")
+      || typeof row.queued_at !== "string" || !Number.isFinite(Date.parse(row.queued_at))) return [];
+    return [{ agent_id: row.agent_id, target: row.target, anchor: parsed.anchor, chat_id: row.chat_id, thread_id: row.thread_id ?? null, queued_at: row.queued_at }];
+  }) };
+}
+
+function saveRetryJournal(file: string, journal: RetryJournal): void {
+  if (journal.targets.length > MAX_INBOX_AUDIT_REGISTRY_ROWS) throw new Error("inbox audit retry journal exceeds the bounded row limit");
+  const serialized = `${JSON.stringify(journal)}\n`;
+  if (Buffer.byteLength(serialized) > MAX_INBOX_AUDIT_REGISTRY_BYTES) throw new Error("inbox audit retry journal exceeds the bounded byte limit");
+  prepareRegistryDirectory(file);
+  assertSafeExistingFile(file, "inbox audit retry journal");
+  const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${crypto.randomUUID()}.tmp`);
+  const fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0), 0o600);
+  try { fs.writeFileSync(fd, serialized); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  try { fs.renameSync(temporary, file); fs.chmodSync(file, 0o600); }
+  catch (error) { try { fs.unlinkSync(temporary); } catch { /* best effort */ } throw error; }
+}
+
 function sleep(ms: number): void { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
 
 /** Serialize Host observers and CLI completion without replacing a newer registry snapshot. */
-function mutate<T>(file: string, operation: (registry: AuditRegistry) => T): T {
+function withAuditLock<T>(file: string, operation: () => T): T {
   const deadline = Date.now() + LOCK_WAIT_MS;
   const lockFile = `${file}.mutation-lock`;
   prepareRegistryDirectory(file);
@@ -132,16 +174,31 @@ function mutate<T>(file: string, operation: (registry: AuditRegistry) => T): T {
     try {
       assertSafeExistingFile(lockFile, "inbox audit mutation lock");
       lock = acquireProcessLock(lockFile, path.basename(process.execPath), { malformedGraceMs: 1_000 });
-      const registry = load(file);
-      const result = operation(registry);
-      save(file, registry);
-      return result;
+      return operation();
     } catch (error) {
       if (lock || !/lock 已被|无法取得 lock|正在创建|暂不能接管|并发重试耗尽/.test(error instanceof Error ? error.message : String(error))) throw error;
       sleep(LOCK_RETRY_MS);
     } finally { lock?.release(); }
   }
   throw new Error("inbox audit registry busy: bounded lock contention");
+}
+
+function mutate<T>(file: string, operation: (registry: AuditRegistry) => T): T {
+  return withAuditLock(file, () => {
+    const registry = load(file);
+    const result = operation(registry);
+    save(file, registry);
+    return result;
+  });
+}
+
+function mutateRetryJournal<T>(file: string, operation: (journal: RetryJournal) => T): T {
+  return withAuditLock(file, () => {
+    const journal = loadRetryJournal(file);
+    const result = operation(journal);
+    saveRetryJournal(file, journal);
+    return result;
+  });
 }
 
 function revision(row: Pick<StoredTarget, "agent_id" | "target" | "anchor" | "generation" | "status">): string {
@@ -180,6 +237,42 @@ export function observeInboxAuditTarget(file: string, agentId: string, event: {
     registry.targets = registry.targets.slice(0, MAX_STORED_TARGETS);
     return true;
   });
+}
+
+/** Durable recovery intent, recorded only after the same original wake gate. */
+export function enqueueInboxAuditTargetRetry(file: string, agentId: string, event: {
+  chat_id?: string; chat_type?: string; thread_id?: string | null; message_id?: string; wake?: boolean; _sender_is_bot?: boolean; _scan_authority?: boolean;
+}, now = new Date()): boolean {
+  if (event.wake !== true || event._scan_authority !== true || event._sender_is_bot !== false || event.chat_type !== "group") return false;
+  const parsed = parseTarget(event);
+  if (!parsed) return false;
+  return mutateRetryJournal(file, (journal) => {
+    journal.targets = journal.targets.filter((row) => row.agent_id !== agentId || row.target !== parsed.target);
+    journal.targets.unshift({ agent_id: agentId, ...parsed, chat_id: String(event.chat_id), thread_id: event.thread_id ? String(event.thread_id) : null, queued_at: now.toISOString() });
+    journal.targets = journal.targets.slice(0, MAX_STORED_TARGETS);
+    return true;
+  });
+}
+
+/** Remove only the exact recovered/newer target so a late retry cannot erase a new anchor. */
+export function discardInboxAuditTargetRetry(file: string, agentId: string, event: { chat_id?: string; thread_id?: string | null; message_id?: string }): void {
+  const parsed = parseTarget(event);
+  if (!parsed) return;
+  mutateRetryJournal(file, (journal) => { journal.targets = journal.targets.filter((row) => row.agent_id !== agentId || row.target !== parsed.target || row.anchor !== parsed.anchor); });
+}
+
+/** Replay persisted, already-authorized observer intents. Failures remain durable for a later bounded retry/startup. */
+export function reconcileInboxAuditTargetRetries(registryFile: string, retryFile: string, agentId?: string): { recovered: number; remaining: number } {
+  const rows = loadRetryJournal(retryFile).targets.filter((row) => !agentId || row.agent_id === agentId);
+  let recovered = 0;
+  for (const row of rows) {
+    try {
+      observeInboxAuditTarget(registryFile, row.agent_id, { chat_id: row.chat_id, chat_type: "group", thread_id: row.thread_id, message_id: row.anchor, wake: true, _sender_is_bot: false, _scan_authority: true });
+      discardInboxAuditTargetRetry(retryFile, row.agent_id, { chat_id: row.chat_id, thread_id: row.thread_id, message_id: row.anchor });
+      recovered += 1;
+    } catch { break; }
+  }
+  return { recovered, remaining: loadRetryJournal(retryFile).targets.filter((row) => !agentId || row.agent_id === agentId).length };
 }
 
 function instruction(target: InboxAuditTarget, receiptValue: string): string {

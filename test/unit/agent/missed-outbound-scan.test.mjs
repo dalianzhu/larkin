@@ -10,8 +10,11 @@ const {
   completeInboxAuditTarget,
   hasPendingInboxAuditTargets,
   inboxAuditRegistryFile,
+  inboxAuditRetryFile,
   MAX_INBOX_AUDIT_TARGETS,
   observeInboxAuditTarget,
+  enqueueInboxAuditTargetRetry,
+  reconcileInboxAuditTargetRetries,
   readInboxAuditTargets,
 } = await import(pathToFileURL(path.join(import.meta.dirname, "../../../dist/agent/missed-outbound-scan.mjs")).href);
 import { InboxAuditHeartbeat, INBOX_AUDIT_CADENCE_MS } from "../../../src/agent/inbox-audit-heartbeat.ts";
@@ -161,6 +164,17 @@ test("registry refuses a symlink instead of following it during observer mutatio
     fs.symlinkSync(victim, file);
     assert.throws(() => observeInboxAuditTarget(file, "cli_audit", { ...WAKE, message_id: "om_symlink" }), /regular file/);
     assert.equal(fs.readFileSync(victim, "utf8"), "preserve");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("durable retry intent rebuilds an eligible registry target without a new inbound event", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-inbox-audit-retry-"));
+  try {
+    const registry = inboxAuditRegistryFile(root);
+    const retry = inboxAuditRetryFile(root);
+    assert.equal(enqueueInboxAuditTargetRetry(retry, "cli_audit", { ...WAKE, message_id: "om_retry" }), true);
+    assert.deepEqual(reconcileInboxAuditTargetRetries(registry, retry), { recovered: 1, remaining: 0 });
+    assert.deepEqual(readInboxAuditTargets(registry, "cli_audit").targets.map((row) => row.anchor), ["om_retry"]);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

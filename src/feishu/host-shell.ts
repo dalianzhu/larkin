@@ -20,7 +20,7 @@ import { ProcessingEyeOrchestrator } from "./host-processing-eye.js";
 import { projectInboxEnvelope, targetKeyOfInboxEnvelope } from "../agent/inbox-projection.js";
 import { HostReminderOrchestrator } from "../agent/host-reminder-orchestrator.js";
 import { boundedInboxAuditDiagnostic, InboxAuditHeartbeat, INBOX_AUDIT_CADENCE_MS } from "../agent/inbox-audit-heartbeat.js";
-import { hasPendingInboxAuditTargets, inboxAuditRegistryFile, observeInboxAuditTarget } from "../agent/missed-outbound-scan.js";
+import { discardInboxAuditTargetRetry, enqueueInboxAuditTargetRetry, hasPendingInboxAuditTargets, inboxAuditRegistryFile, inboxAuditRetryFile, observeInboxAuditTarget, reconcileInboxAuditTargetRetries } from "../agent/missed-outbound-scan.js";
 import { HostChannelBusiness } from "./host-channel-business.js";
 import { HostInteractionOrchestrator } from "./interaction-orchestrator.js";
 import { targetFor, type FeishuInboundEvent } from "./message-policy.js";
@@ -517,6 +517,23 @@ export function createHostShell({
   for (const agent of agents) prepareAgentState(agent);
   const reminder = new HostReminderOrchestrator({ agents, stateStore, envelopeProjector, deliveryTarget: runtimeHost, log });
   const auditRegistry = inboxAuditRegistryFile(larkinHome);
+  const auditRetryJournal = inboxAuditRetryFile(larkinHome);
+  let auditRetryTimer: NodeJS.Timeout | null = null;
+  let auditRetryAttempt = 0;
+  const reconcileAuditRetries = (): number => {
+    try { return reconcileInboxAuditTargetRetries(auditRegistry, auditRetryJournal).remaining; }
+    catch (error) { log(`inbox audit retry 读取失败: ${boundedInboxAuditDiagnostic(error)}`); return 1; }
+  };
+  const scheduleAuditRetry = (): void => {
+    if (auditRetryTimer || auditRetryAttempt >= 5) return;
+    const delay = [100, 250, 1_000, 3_000, 10_000][auditRetryAttempt++]!;
+    auditRetryTimer = setTimeout(() => {
+      auditRetryTimer = null;
+      if (reconcileAuditRetries() > 0) scheduleAuditRetry();
+      else auditRetryAttempt = 0;
+    }, delay);
+    auditRetryTimer.unref?.();
+  };
   const inboxAudit = new InboxAuditHeartbeat({
     agents,
     stateStore,
@@ -574,8 +591,13 @@ export function createHostShell({
         if (event.event_id) seenEventIds.add(eventKey);
         try {
           observeInboxAuditTarget(auditRegistry, agent.agentId, { ...event, wake });
+          discardInboxAuditTargetRetry(auditRetryJournal, agent.agentId, event);
         } catch (error) {
-          log(`inbox audit target 未持久化: ${boundedInboxAuditDiagnostic(error)}`);
+          try {
+            enqueueInboxAuditTargetRetry(auditRetryJournal, agent.agentId, { ...event, wake });
+            scheduleAuditRetry();
+            log(`inbox audit target 延后重试: ${boundedInboxAuditDiagnostic(error)}`);
+          } catch (retryError) { log(`inbox audit target 未持久化: ${boundedInboxAuditDiagnostic(retryError)}`); }
         }
         if (append.status === "duplicate_consumed") return null;
         const inboxEnvelope = append.envelope;
@@ -1455,6 +1477,8 @@ export function createHostShell({
       eventSourceStartTimer = null;
       await Promise.resolve(eventSourceStop());
       reminder.stopSync();
+      if (auditRetryTimer) clearTimeout(auditRetryTimer);
+      auditRetryTimer = null;
       inboxAudit.stop();
       interaction.stopSync();
       await runtimeHost.shutdown(reason);
@@ -1662,6 +1686,7 @@ export function createHostShell({
           previousSession: agentStates.get(agent.agentId)?.state.previousSessions?.[agent.runtime] ?? null,
         })));
         reminder.startSync();
+        if (reconcileAuditRetries() > 0) scheduleAuditRetry();
         inboxAudit.start();
         interaction.startSync();
         eventSourceStartTimer = setTimeout(() => { eventSourceStartTimer = null; startEventSource(); }, eventSourceStartDelayMs);
