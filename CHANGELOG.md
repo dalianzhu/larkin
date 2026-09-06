@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.4
+
+Inbox Audit is now optional and off by default. The Dashboard and CLI support global and per-Agent switches and inspection gaps. Saving a gap updates scheduling without replacing Runtime sessions; editing a gap alone does not enable auditing. Only originally wake-eligible human group/topic work is audited.
+
+Audit reads no longer mark work complete. Agents explicitly confirm a receipt after checking; receipts are scoped to an observation generation, and durable canonical sequence ordering protects newer work from stale completion or deferred registration. Contended registrations are retried durably. Unproven legacy audit-index rows are ignored while ordinary Inbox and conversation history remain intact.
+
 ## 0.5.3
 
 External Pi initialization now runs with bounded concurrency and recovers from isolated startup-probe timeouts through the existing retry policy. Shutdown waits for pending initialization and closes late sessions. Generic Runtime and delivery failures show unavailable instead of incompatible, while explicit prerequisite failures and useful provider diagnostics are preserved. Recovery workflow tests wait for delivery consumption and Inbox watermarks to converge and isolate temporary state.
