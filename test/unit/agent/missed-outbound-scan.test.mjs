@@ -23,7 +23,7 @@ const configApi = createRequire(import.meta.url)("../../../dist/platform/config.
 
 const CHAT = "oc_7961b9d7be893b46520a926b90cf46eb";
 const ROUTING_SINK = path.resolve(import.meta.dirname, "../../support/inbox-audit-routing-sink.mjs");
-const WAKE = { chat_id: CHAT, chat_type: "group", wake: true, _scan_authority: true, _sender_is_bot: false };
+const WAKE = { chat_id: CHAT, chat_type: "group", source_seq: 1, wake: true, _scan_authority: true, _sender_is_bot: false };
 
 function reportFindingToControlledSink(audit, finding, traceFile) {
   const source = finding && audit.targets.find((row) => row.target === finding.target && row.anchor === finding.anchor);
@@ -42,7 +42,7 @@ test("audit registry retains only originally wake=true human group/topic targets
   try {
     const file = inboxAuditRegistryFile(root);
     assert.equal(observeInboxAuditTarget(file, "cli_audit", { ...WAKE, message_id: "om_chat" }), true);
-    assert.equal(observeInboxAuditTarget(file, "cli_audit", { ...WAKE, thread_id: "omt_topic", message_id: "om_topic" }), true);
+    assert.equal(observeInboxAuditTarget(file, "cli_audit", { ...WAKE, source_seq: 2, thread_id: "omt_topic", message_id: "om_topic" }), true);
     assert.equal(observeInboxAuditTarget(file, "cli_audit", { ...WAKE, chat_type: "p2p", message_id: "om_dm" }), false);
     assert.equal(observeInboxAuditTarget(file, "cli_audit", { ...WAKE, _sender_is_bot: true, message_id: "om_bot" }), false);
     assert.equal(observeInboxAuditTarget(file, "cli_audit", { ...WAKE, wake: false, message_id: "om_unmentioned" }), false, "require unmentioned traffic must not enter audit");
@@ -116,10 +116,10 @@ test("read is completion-free; scoped completion rejects stale receipts and lega
     assert.equal(hasPendingInboxAuditTargets(file, "cli_audit"), false);
     assert.deepEqual(completeInboxAuditTarget(file, "cli_audit", firstRead.targets[0].receipt, "no-finding"), { completed: false, reason: "already_completed" });
     assert.equal(observeInboxAuditTarget(file, "cli_audit", { ...WAKE, message_id: "om_pending" }), false, "same completed anchor must not reopen");
-    assert.equal(observeInboxAuditTarget(file, "cli_audit", { ...WAKE, message_id: "om_new" }), true, "a new originally-wake=true anchor may reopen the target");
+    assert.equal(observeInboxAuditTarget(file, "cli_audit", { ...WAKE, source_seq: 2, message_id: "om_new" }), true, "a new originally-wake=true anchor may reopen the target");
     assert.equal(readInboxAuditTargets(file, "cli_audit").targets[0].anchor, "om_new");
     assert.deepEqual(completeInboxAuditTarget(file, "cli_audit", firstRead.targets[0].receipt, "handled"), { completed: false, reason: "stale" }, "an ABA-style old receipt cannot retire new evidence");
-    assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).version, 3);
+    assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).version, 4);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -130,8 +130,8 @@ test("same-timestamp A to B to A creates a new generation and rejects the first 
     const file = inboxAuditRegistryFile(root);
     observeInboxAuditTarget(file, "cli_audit", { ...WAKE, message_id: "om_aba_a" }, now);
     const first = readInboxAuditTargets(file, "cli_audit").targets[0];
-    observeInboxAuditTarget(file, "cli_audit", { ...WAKE, message_id: "om_aba_b" }, now);
-    observeInboxAuditTarget(file, "cli_audit", { ...WAKE, message_id: "om_aba_a" }, now);
+    observeInboxAuditTarget(file, "cli_audit", { ...WAKE, source_seq: 2, message_id: "om_aba_b" }, now);
+    observeInboxAuditTarget(file, "cli_audit", { ...WAKE, source_seq: 3, message_id: "om_aba_a" }, now);
     const current = readInboxAuditTargets(file, "cli_audit").targets[0];
     assert.notEqual(current.revision, first.revision, "new observation identity cannot depend on wall-clock precision");
     assert.deepEqual(completeInboxAuditTarget(file, "cli_audit", first.receipt, "no-finding"), { completed: false, reason: "stale" });
@@ -148,7 +148,7 @@ test("completion for one Agent preserves another Agent and a concurrent newer an
     const a = readInboxAuditTargets(file, "cli_auditA").targets[0];
     // This is the observer/completer interleaving: completion must reload under
     // the lock and cannot overwrite B or a later pending target.
-    assert.equal(observeInboxAuditTarget(file, "cli_auditA", { ...WAKE, message_id: "om_a_new" }), true);
+    assert.equal(observeInboxAuditTarget(file, "cli_auditA", { ...WAKE, source_seq: 2, message_id: "om_a_new" }), true);
     assert.deepEqual(completeInboxAuditTarget(file, "cli_auditA", a.receipt, "handled"), { completed: false, reason: "stale" });
     assert.deepEqual(readInboxAuditTargets(file, "cli_auditA").targets.map((row) => row.anchor), ["om_a_new"]);
     assert.deepEqual(readInboxAuditTargets(file, "cli_auditB").targets.map((row) => row.anchor), ["om_b"]);
@@ -175,6 +175,27 @@ test("durable retry intent rebuilds an eligible registry target without a new in
     assert.equal(enqueueInboxAuditTargetRetry(retry, "cli_audit", { ...WAKE, message_id: "om_retry" }), true);
     assert.deepEqual(reconcileInboxAuditTargetRetries(registry, retry), { recovered: 1, remaining: 0 });
     assert.deepEqual(readInboxAuditTargets(registry, "cli_audit").targets.map((row) => row.anchor), ["om_retry"]);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("canonical target sequence prevents old retries from overwriting newer pending or completed work", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-inbox-audit-retry-order-"));
+  const now = new Date("2026-07-21T00:00:00.000Z");
+  try {
+    const registry = inboxAuditRegistryFile(root);
+    const retry = inboxAuditRetryFile(root);
+    enqueueInboxAuditTargetRetry(retry, "cli_audit", { ...WAKE, source_seq: 1, message_id: "om_old" }, now);
+    observeInboxAuditTarget(registry, "cli_audit", { ...WAKE, source_seq: 2, message_id: "om_new" }, now);
+    reconcileInboxAuditTargetRetries(registry, retry);
+    assert.deepEqual(readInboxAuditTargets(registry, "cli_audit").targets.map((row) => row.anchor), ["om_new"]);
+    const current = readInboxAuditTargets(registry, "cli_audit").targets[0];
+    completeInboxAuditTarget(registry, "cli_audit", current.receipt, "no-finding", now);
+    enqueueInboxAuditTargetRetry(retry, "cli_audit", { ...WAKE, source_seq: 1, message_id: "om_old" }, now);
+    reconcileInboxAuditTargetRetries(registry, retry);
+    assert.equal(readInboxAuditTargets(registry, "cli_audit").targets.length, 0, "old retry cannot reopen a newer completed anchor");
+    enqueueInboxAuditTargetRetry(retry, "cli_audit", { ...WAKE, source_seq: 3, message_id: "om_newer" }, now);
+    assert.deepEqual(reconcileInboxAuditTargetRetries(registry, retry), { recovered: 1, remaining: 0 });
+    assert.deepEqual(readInboxAuditTargets(registry, "cli_audit").targets.map((row) => row.anchor), ["om_newer"]);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

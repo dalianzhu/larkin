@@ -589,12 +589,13 @@ export function createHostShell({
         // An event becomes permanently transport-seen only after the canonical
         // append/dedupe decision is durable. Agent model-seen state is untouched.
         if (event.event_id) seenEventIds.add(eventKey);
+        const auditSourceSeq = Number((append.envelope as { seq?: unknown }).seq);
         try {
-          observeInboxAuditTarget(auditRegistry, agent.agentId, { ...event, wake });
-          discardInboxAuditTargetRetry(auditRetryJournal, agent.agentId, event);
+          observeInboxAuditTarget(auditRegistry, agent.agentId, { ...event, wake, source_seq: auditSourceSeq });
+          discardInboxAuditTargetRetry(auditRetryJournal, agent.agentId, { ...event, source_seq: auditSourceSeq });
         } catch (error) {
           try {
-            enqueueInboxAuditTargetRetry(auditRetryJournal, agent.agentId, { ...event, wake });
+            enqueueInboxAuditTargetRetry(auditRetryJournal, agent.agentId, { ...event, wake, source_seq: auditSourceSeq });
             scheduleAuditRetry();
             log(`inbox audit target 延后重试: ${boundedInboxAuditDiagnostic(error)}`);
           } catch (retryError) { log(`inbox audit target 未持久化: ${boundedInboxAuditDiagnostic(retryError)}`); }

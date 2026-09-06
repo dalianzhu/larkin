@@ -57,10 +57,11 @@ test("Host ingest records only originally wake=true group traffic into the audit
   try {
     await host.ingest(agentId, event, { wake: false });
     assert.equal(readInboxAuditTargets(inboxAuditRegistryFile(root), agentId).targets.length, 0);
-    await host.ingest(agentId, { ...event, message_id: "om_mentioned", event_id: "ev_mentioned" }, { wake: true });
+    await host.ingest(agentId, { ...event, source_seq: 999, message_id: "om_mentioned", event_id: "ev_mentioned" }, { wake: true });
     const audit = readInboxAuditTargets(inboxAuditRegistryFile(root), agentId);
     assert.deepEqual(audit.targets.map((row) => row.anchor), ["om_mentioned"]);
     assert.equal(audit.targets[0].target, `chat:${CHAT}`);
+    assert.equal(JSON.parse(fs.readFileSync(inboxAuditRegistryFile(root), "utf8")).targets[0].source_seq, 2, "Host uses canonical append sequence, never an external event field");
   } finally {
     await host.shutdown("cleanup");
     fs.rmSync(root, { recursive: true, force: true });

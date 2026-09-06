@@ -17,7 +17,7 @@ const ANCHOR = /^om_[A-Za-z0-9_-]+$/;
 const GENERATION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const OUTCOMES = new Set(["no-finding", "handled"]);
 
-export interface InboxAuditTarget { target: string; anchor: string; observed_at: string }
+export interface InboxAuditTarget { target: string; anchor: string; observed_at: string; source_seq: number }
 export type InboxAuditOutcome = "no-finding" | "handled";
 type AuditStatus = "pending" | "completed";
 interface StoredTarget extends InboxAuditTarget {
@@ -28,10 +28,10 @@ interface StoredTarget extends InboxAuditTarget {
   completed_anchor?: string;
   completed_outcome?: InboxAuditOutcome;
 }
-interface AuditRegistry { version: 3; targets: StoredTarget[] }
+interface AuditRegistry { version: 4; targets: StoredTarget[] }
 interface ReceiptPayload { v: 1; agent_id: string; target: string; anchor: string; revision: string }
-interface RetryTarget { agent_id: string; target: string; anchor: string; chat_id: string; thread_id: string | null; queued_at: string }
-interface RetryJournal { version: 1; targets: RetryTarget[] }
+interface RetryTarget { agent_id: string; target: string; anchor: string; chat_id: string; thread_id: string | null; source_seq: number; queued_at: string }
+interface RetryJournal { version: 2; targets: RetryTarget[] }
 
 export function inboxAuditRegistryFile(larkinHome: string): string { return path.join(larkinHome, "inbox-audit.json"); }
 export function inboxAuditRetryFile(larkinHome: string): string { return path.join(larkinHome, "inbox-audit-retry.json"); }
@@ -44,7 +44,7 @@ function parseTarget(event: { chat_id?: string; thread_id?: string | null; messa
   return { target: threadId ? `thread:${chatId}:${threadId}` : `chat:${chatId}`, anchor };
 }
 
-function emptyRegistry(): AuditRegistry { return { version: 3, targets: [] }; }
+function emptyRegistry(): AuditRegistry { return { version: 4, targets: [] }; }
 
 function assertSafeExistingFile(file: string, label: string): void {
   try {
@@ -86,9 +86,9 @@ function load(file: string): AuditRegistry {
   const value = JSON.parse(bytes.toString("utf8")) as { version?: unknown; targets?: unknown };
   // v1 had no wake provenance; v2 had no durable observation generation.
   // Neither can safely issue a completion receipt after this lifecycle upgrade.
-  if (value?.version !== 3 || !Array.isArray(value.targets)) return emptyRegistry();
+  if (value?.version !== 4 || !Array.isArray(value.targets)) return emptyRegistry();
   if (value.targets.length > MAX_INBOX_AUDIT_REGISTRY_ROWS) throw new Error("inbox audit registry exceeds the bounded row limit");
-  return { version: 3, targets: value.targets.flatMap((row): StoredTarget[] => {
+  return { version: 4, targets: value.targets.flatMap((row): StoredTarget[] => {
     if (!row || typeof row !== "object") return [];
     const candidate = row as Partial<StoredTarget>;
     if (typeof candidate.target !== "string" || typeof candidate.anchor !== "string") return [];
@@ -100,11 +100,12 @@ function load(file: string): AuditRegistry {
     });
     const status = candidate.status === "completed" ? "completed" : candidate.status === "pending" ? "pending" : null;
     if (!status || typeof candidate.agent_id !== "string" || !candidate.agent_id || typeof candidate.generation !== "string" || !GENERATION.test(candidate.generation) || !parsed || candidate.target !== parsed.target
+      || !Number.isSafeInteger(candidate.source_seq) || Number(candidate.source_seq) < 1
       || typeof candidate.observed_at !== "string" || !Number.isFinite(Date.parse(candidate.observed_at))) return [];
     const completed_at = typeof candidate.completed_at === "string" && Number.isFinite(Date.parse(candidate.completed_at)) ? candidate.completed_at : undefined;
     const completed_anchor = typeof candidate.completed_anchor === "string" && ANCHOR.test(candidate.completed_anchor) ? candidate.completed_anchor : undefined;
     const completed_outcome = OUTCOMES.has(String(candidate.completed_outcome)) ? candidate.completed_outcome as InboxAuditOutcome : undefined;
-    return [{ agent_id: candidate.agent_id, generation: candidate.generation, ...parsed, observed_at: candidate.observed_at, status,
+    return [{ agent_id: candidate.agent_id, generation: candidate.generation, ...parsed, source_seq: Number(candidate.source_seq), observed_at: candidate.observed_at, status,
       ...(completed_at ? { completed_at } : {}), ...(completed_anchor ? { completed_anchor } : {}),
       ...(completed_outcome ? { completed_outcome } : {}) }];
   }) };
@@ -123,7 +124,7 @@ function save(file: string, registry: AuditRegistry): void {
   catch (error) { try { fs.unlinkSync(temporary); } catch { /* best effort */ } throw error; }
 }
 
-function emptyRetryJournal(): RetryJournal { return { version: 1, targets: [] }; }
+function emptyRetryJournal(): RetryJournal { return { version: 2, targets: [] }; }
 
 function loadRetryJournal(file: string): RetryJournal {
   let value: unknown;
@@ -137,15 +138,16 @@ function loadRetryJournal(file: string): RetryJournal {
     throw error;
   }
   const raw = value as { version?: unknown; targets?: unknown };
-  if (raw.version !== 1 || !Array.isArray(raw.targets) || raw.targets.length > MAX_INBOX_AUDIT_REGISTRY_ROWS) return emptyRetryJournal();
-  return { version: 1, targets: raw.targets.flatMap((candidate): RetryTarget[] => {
+  if (raw.version !== 2 || !Array.isArray(raw.targets) || raw.targets.length > MAX_INBOX_AUDIT_REGISTRY_ROWS) return emptyRetryJournal();
+  return { version: 2, targets: raw.targets.flatMap((candidate): RetryTarget[] => {
     if (!candidate || typeof candidate !== "object") return [];
     const row = candidate as Partial<RetryTarget>;
     const parsed = parseTarget({ chat_id: row.chat_id, thread_id: row.thread_id, message_id: row.anchor });
     if (typeof row.agent_id !== "string" || !row.agent_id || typeof row.target !== "string" || !parsed || parsed.target !== row.target
       || typeof row.chat_id !== "string" || (row.thread_id !== null && typeof row.thread_id !== "string")
+      || !Number.isSafeInteger(row.source_seq) || Number(row.source_seq) < 1
       || typeof row.queued_at !== "string" || !Number.isFinite(Date.parse(row.queued_at))) return [];
-    return [{ agent_id: row.agent_id, target: row.target, anchor: parsed.anchor, chat_id: row.chat_id, thread_id: row.thread_id ?? null, queued_at: row.queued_at }];
+    return [{ agent_id: row.agent_id, target: row.target, anchor: parsed.anchor, chat_id: row.chat_id, thread_id: row.thread_id ?? null, source_seq: Number(row.source_seq), queued_at: row.queued_at }];
   }) };
 }
 
@@ -224,18 +226,17 @@ function parseReceipt(value: string): ReceiptPayload | null {
 }
 
 export function observeInboxAuditTarget(file: string, agentId: string, event: {
-  chat_id?: string; chat_type?: string; thread_id?: string | null; message_id?: string; wake?: boolean; _sender_is_bot?: boolean; _scan_authority?: boolean;
+  chat_id?: string; chat_type?: string; thread_id?: string | null; message_id?: string; source_seq?: number; wake?: boolean; _sender_is_bot?: boolean; _scan_authority?: boolean;
 }, now = new Date()): boolean {
   if (event.wake !== true || event._scan_authority !== true || event._sender_is_bot !== false || event.chat_type !== "group") return false;
   const parsed = parseTarget(event);
-  if (!parsed) return false;
+  const sourceSeq = typeof event.source_seq === "number" ? event.source_seq : Number.NaN;
+  if (!parsed || !Number.isSafeInteger(sourceSeq) || sourceSeq < 1) return false;
   return mutate(file, (registry) => {
     const existing = registry.targets.find((row) => row.agent_id === agentId && row.target === parsed.target);
-    // Redelivery of the same original source is not new evidence and must not
-    // rotate a receipt generation. A different anchor deliberately reopens it.
-    if (existing?.anchor === parsed.anchor) return false;
+    if (existing && sourceSeq <= existing.source_seq) return false;
     registry.targets = registry.targets.filter((row) => row.agent_id !== agentId || row.target !== parsed.target);
-    registry.targets.unshift({ agent_id: agentId, generation: crypto.randomUUID(), ...parsed, observed_at: now.toISOString(), status: "pending" });
+    registry.targets.unshift({ agent_id: agentId, generation: crypto.randomUUID(), ...parsed, source_seq: sourceSeq, observed_at: now.toISOString(), status: "pending" });
     registry.targets = registry.targets.slice(0, MAX_STORED_TARGETS);
     return true;
   });
@@ -243,24 +244,27 @@ export function observeInboxAuditTarget(file: string, agentId: string, event: {
 
 /** Durable recovery intent, recorded only after the same original wake gate. */
 export function enqueueInboxAuditTargetRetry(file: string, agentId: string, event: {
-  chat_id?: string; chat_type?: string; thread_id?: string | null; message_id?: string; wake?: boolean; _sender_is_bot?: boolean; _scan_authority?: boolean;
+  chat_id?: string; chat_type?: string; thread_id?: string | null; message_id?: string; source_seq?: number; wake?: boolean; _sender_is_bot?: boolean; _scan_authority?: boolean;
 }, now = new Date()): boolean {
   if (event.wake !== true || event._scan_authority !== true || event._sender_is_bot !== false || event.chat_type !== "group") return false;
   const parsed = parseTarget(event);
-  if (!parsed) return false;
+  const sourceSeq = typeof event.source_seq === "number" ? event.source_seq : Number.NaN;
+  if (!parsed || !Number.isSafeInteger(sourceSeq) || sourceSeq < 1) return false;
   return mutateRetryJournal(file, (journal) => {
+    const existing = journal.targets.find((row) => row.agent_id === agentId && row.target === parsed.target);
+    if (existing && sourceSeq <= existing.source_seq) return false;
     journal.targets = journal.targets.filter((row) => row.agent_id !== agentId || row.target !== parsed.target);
-    journal.targets.unshift({ agent_id: agentId, ...parsed, chat_id: String(event.chat_id), thread_id: event.thread_id ? String(event.thread_id) : null, queued_at: now.toISOString() });
+    journal.targets.unshift({ agent_id: agentId, ...parsed, source_seq: sourceSeq, chat_id: String(event.chat_id), thread_id: event.thread_id ? String(event.thread_id) : null, queued_at: now.toISOString() });
     journal.targets = journal.targets.slice(0, MAX_STORED_TARGETS);
     return true;
   });
 }
 
 /** Remove only the exact recovered/newer target so a late retry cannot erase a new anchor. */
-export function discardInboxAuditTargetRetry(file: string, agentId: string, event: { chat_id?: string; thread_id?: string | null; message_id?: string }): void {
+export function discardInboxAuditTargetRetry(file: string, agentId: string, event: { chat_id?: string; thread_id?: string | null; message_id?: string; source_seq?: number }): void {
   const parsed = parseTarget(event);
   if (!parsed) return;
-  mutateRetryJournal(file, (journal) => { journal.targets = journal.targets.filter((row) => row.agent_id !== agentId || row.target !== parsed.target || row.anchor !== parsed.anchor); });
+  mutateRetryJournal(file, (journal) => { journal.targets = journal.targets.filter((row) => row.agent_id !== agentId || row.target !== parsed.target || row.source_seq > Number(event.source_seq ?? 0)); });
 }
 
 /** Replay persisted, already-authorized observer intents. Failures remain durable for a later bounded retry/startup. */
@@ -269,8 +273,8 @@ export function reconcileInboxAuditTargetRetries(registryFile: string, retryFile
   let recovered = 0;
   for (const row of rows) {
     try {
-      observeInboxAuditTarget(registryFile, row.agent_id, { chat_id: row.chat_id, chat_type: "group", thread_id: row.thread_id, message_id: row.anchor, wake: true, _sender_is_bot: false, _scan_authority: true });
-      discardInboxAuditTargetRetry(retryFile, row.agent_id, { chat_id: row.chat_id, thread_id: row.thread_id, message_id: row.anchor });
+      observeInboxAuditTarget(registryFile, row.agent_id, { chat_id: row.chat_id, chat_type: "group", thread_id: row.thread_id, message_id: row.anchor, source_seq: row.source_seq, wake: true, _sender_is_bot: false, _scan_authority: true });
+      discardInboxAuditTargetRetry(retryFile, row.agent_id, { chat_id: row.chat_id, thread_id: row.thread_id, message_id: row.anchor, source_seq: row.source_seq });
       recovered += 1;
     } catch { break; }
   }
@@ -290,11 +294,11 @@ export function hasPendingInboxAuditTargets(file: string, agentId: string): bool
 
 /** Public read is intentionally completion-free: a caller crash leaves the target pending. */
 export function readInboxAuditTargets(file: string, agentId: string): {
-  version: 3; targets: Array<InboxAuditTarget & { revision: string; receipt: string; instruction: string }>; has_more: boolean; no_finding: "stay_silent";
+  version: 4; targets: Array<InboxAuditTarget & { revision: string; receipt: string; instruction: string }>; has_more: boolean; no_finding: "stay_silent";
 } {
   const rows = pendingRows(file, agentId);
-  return { version: 3, targets: rows.slice(0, MAX_INBOX_AUDIT_TARGETS).map((row) => {
-    const target = { target: row.target, anchor: row.anchor, observed_at: row.observed_at };
+  return { version: 4, targets: rows.slice(0, MAX_INBOX_AUDIT_TARGETS).map((row) => {
+    const target = { target: row.target, anchor: row.anchor, observed_at: row.observed_at, source_seq: row.source_seq };
     const receiptValue = receipt(row);
     return { ...target, revision: revision(row), receipt: receiptValue, instruction: instruction(target, receiptValue) };
   }), has_more: rows.length > MAX_INBOX_AUDIT_TARGETS, no_finding: "stay_silent" };
