@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { acquireProcessLock } from "../platform/process-state.js";
 
 /** Historical reminder loops are deliberately unrelated to this bounded audit registry. */
 export const INBOX_AUDIT_LEGACY_MIGRATION_NON_GOAL = "New versions no longer create missed-outbound loops; existing indistinguishable historical loops are not migrated or deleted automatically.";
@@ -8,11 +9,12 @@ export const MAX_INBOX_AUDIT_TARGETS = 96;
 const MAX_STORED_TARGETS = MAX_INBOX_AUDIT_TARGETS;
 export const MAX_INBOX_AUDIT_REGISTRY_BYTES = 64 * 1024;
 export const MAX_INBOX_AUDIT_REGISTRY_ROWS = MAX_INBOX_AUDIT_TARGETS;
-const LOCK_WAIT_MS = 1_000;
-const LOCK_RETRY_MS = 20;
+const LOCK_WAIT_MS = 5_000;
+const LOCK_RETRY_MS = 25;
 const CHAT = /^oc_[A-Za-z0-9]+$/;
 const THREAD = /^omt_[A-Za-z0-9]+$/;
 const ANCHOR = /^om_[A-Za-z0-9_-]+$/;
+const GENERATION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const OUTCOMES = new Set(["no-finding", "handled"]);
 
 export interface InboxAuditTarget { target: string; anchor: string; observed_at: string }
@@ -20,12 +22,13 @@ export type InboxAuditOutcome = "no-finding" | "handled";
 type AuditStatus = "pending" | "completed";
 interface StoredTarget extends InboxAuditTarget {
   agent_id: string;
+  generation: string;
   status: AuditStatus;
   completed_at?: string;
   completed_anchor?: string;
   completed_outcome?: InboxAuditOutcome;
 }
-interface AuditRegistry { version: 2; targets: StoredTarget[] }
+interface AuditRegistry { version: 3; targets: StoredTarget[] }
 interface ReceiptPayload { v: 1; agent_id: string; target: string; anchor: string; revision: string }
 
 export function inboxAuditRegistryFile(larkinHome: string): string { return path.join(larkinHome, "inbox-audit.json"); }
@@ -38,12 +41,29 @@ function parseTarget(event: { chat_id?: string; thread_id?: string | null; messa
   return { target: threadId ? `thread:${chatId}:${threadId}` : `chat:${chatId}`, anchor };
 }
 
-function emptyRegistry(): AuditRegistry { return { version: 2, targets: [] }; }
+function emptyRegistry(): AuditRegistry { return { version: 3, targets: [] }; }
+
+function assertSafeExistingFile(file: string, label: string): void {
+  try {
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`${label} is not a regular file`);
+    if (typeof process.getuid === "function" && stat.uid !== process.getuid()) throw new Error(`${label} is not owned by the current user`);
+  } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+}
+
+function prepareRegistryDirectory(file: string): void {
+  const directory = path.dirname(file);
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const stat = fs.lstatSync(directory);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("inbox audit registry directory is unsafe");
+  if (typeof process.getuid === "function" && stat.uid !== process.getuid()) throw new Error("inbox audit registry directory is not owned by the current user");
+}
 
 function load(file: string): AuditRegistry {
   let fd: number | undefined;
   let bytes: Buffer;
   try {
+    assertSafeExistingFile(file, "inbox audit registry");
     fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
     const stat = fs.fstatSync(fd);
     if (!stat.isFile()) throw new Error("inbox audit registry is not a regular file");
@@ -61,10 +81,11 @@ function load(file: string): AuditRegistry {
     throw error;
   } finally { if (fd !== undefined) fs.closeSync(fd); }
   const value = JSON.parse(bytes.toString("utf8")) as { version?: unknown; targets?: unknown };
-  // v1 never proved original wake eligibility. It is intentionally not upgraded.
-  if (value?.version === 1 || value?.version !== 2 || !Array.isArray(value.targets)) return emptyRegistry();
+  // v1 had no wake provenance; v2 had no durable observation generation.
+  // Neither can safely issue a completion receipt after this lifecycle upgrade.
+  if (value?.version !== 3 || !Array.isArray(value.targets)) return emptyRegistry();
   if (value.targets.length > MAX_INBOX_AUDIT_REGISTRY_ROWS) throw new Error("inbox audit registry exceeds the bounded row limit");
-  return { version: 2, targets: value.targets.flatMap((row): StoredTarget[] => {
+  return { version: 3, targets: value.targets.flatMap((row): StoredTarget[] => {
     if (!row || typeof row !== "object") return [];
     const candidate = row as Partial<StoredTarget>;
     if (typeof candidate.target !== "string" || typeof candidate.anchor !== "string") return [];
@@ -75,12 +96,12 @@ function load(file: string): AuditRegistry {
       message_id: candidate.anchor,
     });
     const status = candidate.status === "completed" ? "completed" : candidate.status === "pending" ? "pending" : null;
-    if (!status || typeof candidate.agent_id !== "string" || !candidate.agent_id || !parsed || candidate.target !== parsed.target
+    if (!status || typeof candidate.agent_id !== "string" || !candidate.agent_id || typeof candidate.generation !== "string" || !GENERATION.test(candidate.generation) || !parsed || candidate.target !== parsed.target
       || typeof candidate.observed_at !== "string" || !Number.isFinite(Date.parse(candidate.observed_at))) return [];
     const completed_at = typeof candidate.completed_at === "string" && Number.isFinite(Date.parse(candidate.completed_at)) ? candidate.completed_at : undefined;
     const completed_anchor = typeof candidate.completed_anchor === "string" && ANCHOR.test(candidate.completed_anchor) ? candidate.completed_anchor : undefined;
     const completed_outcome = OUTCOMES.has(String(candidate.completed_outcome)) ? candidate.completed_outcome as InboxAuditOutcome : undefined;
-    return [{ agent_id: candidate.agent_id, ...parsed, observed_at: candidate.observed_at, status,
+    return [{ agent_id: candidate.agent_id, generation: candidate.generation, ...parsed, observed_at: candidate.observed_at, status,
       ...(completed_at ? { completed_at } : {}), ...(completed_anchor ? { completed_anchor } : {}),
       ...(completed_outcome ? { completed_outcome } : {}) }];
   }) };
@@ -90,9 +111,11 @@ function save(file: string, registry: AuditRegistry): void {
   if (registry.targets.length > MAX_INBOX_AUDIT_REGISTRY_ROWS) throw new Error("inbox audit registry exceeds the bounded row limit");
   const serialized = `${JSON.stringify(registry)}\n`;
   if (Buffer.byteLength(serialized) > MAX_INBOX_AUDIT_REGISTRY_BYTES) throw new Error("inbox audit registry exceeds the bounded byte limit");
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  prepareRegistryDirectory(file);
+  assertSafeExistingFile(file, "inbox audit registry");
   const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${crypto.randomUUID()}.tmp`);
-  fs.writeFileSync(temporary, serialized, { mode: 0o600 });
+  const fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0), 0o600);
+  try { fs.writeFileSync(fd, serialized); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   try { fs.renameSync(temporary, file); fs.chmodSync(file, 0o600); }
   catch (error) { try { fs.unlinkSync(temporary); } catch { /* best effort */ } throw error; }
 }
@@ -103,42 +126,27 @@ function sleep(ms: number): void { Atomics.wait(new Int32Array(new SharedArrayBu
 function mutate<T>(file: string, operation: (registry: AuditRegistry) => T): T {
   const deadline = Date.now() + LOCK_WAIT_MS;
   const lockFile = `${file}.mutation-lock`;
-  const nonce = crypto.randomUUID();
+  prepareRegistryDirectory(file);
   while (Date.now() <= deadline) {
+    let lock: ReturnType<typeof acquireProcessLock> | undefined;
     try {
-      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-      const fd = fs.openSync(lockFile, "wx", 0o600);
-      try { fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, nonce })); fs.fsyncSync(fd); }
-      finally { fs.closeSync(fd); }
+      assertSafeExistingFile(lockFile, "inbox audit mutation lock");
+      lock = acquireProcessLock(lockFile, path.basename(process.execPath), { malformedGraceMs: 1_000 });
       const registry = load(file);
       const result = operation(registry);
       save(file, registry);
       return result;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      // A dead owner cannot preserve a mutation; reclaim only after checking pid
-      // liveness, while live contention remains bounded and retries its full read.
-      try {
-        const owner = JSON.parse(fs.readFileSync(lockFile, "utf8")) as { pid?: unknown };
-        if (Number.isInteger(owner.pid) && Number(owner.pid) > 0) {
-          try { process.kill(Number(owner.pid), 0); }
-          catch (ownerError) { if ((ownerError as NodeJS.ErrnoException).code === "ESRCH") fs.unlinkSync(lockFile); }
-        }
-      } catch (lockError) { if ((lockError as NodeJS.ErrnoException).code === "ENOENT") continue; }
+      if (lock || !/lock 已被|无法取得 lock|正在创建|暂不能接管|并发重试耗尽/.test(error instanceof Error ? error.message : String(error))) throw error;
       sleep(LOCK_RETRY_MS);
-    } finally {
-      try {
-        const owner = JSON.parse(fs.readFileSync(lockFile, "utf8")) as { pid?: unknown; nonce?: unknown };
-        if (owner.pid === process.pid && owner.nonce === nonce) fs.unlinkSync(lockFile);
-      } catch { /* another process owns or removed the lock */ }
-    }
+    } finally { lock?.release(); }
   }
   throw new Error("inbox audit registry busy: bounded lock contention");
 }
 
-function revision(row: Pick<StoredTarget, "agent_id" | "target" | "anchor" | "observed_at" | "status">): string {
+function revision(row: Pick<StoredTarget, "agent_id" | "target" | "anchor" | "generation" | "status">): string {
   return `sha256:${crypto.createHash("sha256").update(JSON.stringify({
-    v: 1, agent_id: row.agent_id, target: row.target, anchor: row.anchor, observed_at: row.observed_at, status: row.status,
+    v: 2, agent_id: row.agent_id, target: row.target, anchor: row.anchor, generation: row.generation, status: row.status,
   })).digest("hex")}`;
 }
 
@@ -168,7 +176,7 @@ export function observeInboxAuditTarget(file: string, agentId: string, event: {
     const existing = registry.targets.find((row) => row.agent_id === agentId && row.target === parsed.target);
     if (existing?.status === "completed" && existing.anchor === parsed.anchor) return false;
     registry.targets = registry.targets.filter((row) => row.agent_id !== agentId || row.target !== parsed.target);
-    registry.targets.unshift({ agent_id: agentId, ...parsed, observed_at: now.toISOString(), status: "pending" });
+    registry.targets.unshift({ agent_id: agentId, generation: crypto.randomUUID(), ...parsed, observed_at: now.toISOString(), status: "pending" });
     registry.targets = registry.targets.slice(0, MAX_STORED_TARGETS);
     return true;
   });
@@ -187,10 +195,10 @@ export function hasPendingInboxAuditTargets(file: string, agentId: string): bool
 
 /** Public read is intentionally completion-free: a caller crash leaves the target pending. */
 export function readInboxAuditTargets(file: string, agentId: string): {
-  version: 2; targets: Array<InboxAuditTarget & { revision: string; receipt: string; instruction: string }>; has_more: boolean; no_finding: "stay_silent";
+  version: 3; targets: Array<InboxAuditTarget & { revision: string; receipt: string; instruction: string }>; has_more: boolean; no_finding: "stay_silent";
 } {
   const rows = pendingRows(file, agentId);
-  return { version: 2, targets: rows.slice(0, MAX_INBOX_AUDIT_TARGETS).map((row) => {
+  return { version: 3, targets: rows.slice(0, MAX_INBOX_AUDIT_TARGETS).map((row) => {
     const target = { target: row.target, anchor: row.anchor, observed_at: row.observed_at };
     const receiptValue = receipt(row);
     return { ...target, revision: revision(row), receipt: receiptValue, instruction: instruction(target, receiptValue) };

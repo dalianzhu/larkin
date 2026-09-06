@@ -338,8 +338,8 @@ process.exit(1);
 test("inbox audit read is public and completion requires its current receipt", () => {
   const f = fixture();
   try {
-    fs.writeFileSync(path.join(f.root, "inbox-audit.json"), JSON.stringify({ version: 2, targets: [{
-      agent_id: f.agentId, target: "thread:oc_audit:omt_audit", anchor: "om_audit", observed_at: "2026-07-20T00:00:00.000Z", status: "pending",
+    fs.writeFileSync(path.join(f.root, "inbox-audit.json"), JSON.stringify({ version: 3, targets: [{
+      agent_id: f.agentId, generation: "00000000-0000-4000-8000-000000000001", target: "thread:oc_audit:omt_audit", anchor: "om_audit", observed_at: "2026-07-20T00:00:00.000Z", status: "pending",
     }] }), { mode: 0o600 });
     const result = f.run(["inbox", "audit", "--json"]);
     assert.equal(result.code, 0, result.stderr);
@@ -361,8 +361,8 @@ test("inbox audit read is public and completion requires its current receipt", (
     assert.equal(repeat.code, 0, repeat.stderr);
     assert.deepEqual(JSON.parse(repeat.stdout), { completed: false, reason: "already_completed" });
 
-    fs.writeFileSync(path.join(f.root, "inbox-audit.json"), JSON.stringify({ version: 2, targets: [{
-      agent_id: f.agentId, target: "chat:oc_audit", anchor: "om_audit_process", observed_at: "2026-07-21T00:00:00.000Z", status: "pending",
+    fs.writeFileSync(path.join(f.root, "inbox-audit.json"), JSON.stringify({ version: 3, targets: [{
+      agent_id: f.agentId, generation: "00000000-0000-4000-8000-000000000002", target: "chat:oc_audit", anchor: "om_audit_process", observed_at: "2026-07-21T00:00:00.000Z", status: "pending",
     }] }), { mode: 0o600 });
     const entry = path.join(ROOT, "dist", "app", "agent-cli.mjs");
     const processRead = spawnSync(process.execPath, [entry, "inbox", "audit", "--json"], { encoding: "utf8", env: { ...process.env, ...f.env } });
@@ -371,6 +371,20 @@ test("inbox audit read is public and completion requires its current receipt", (
     const processComplete = spawnSync(process.execPath, [entry, "inbox", "audit", "complete", "--receipt", processBody.targets[0].receipt, "--outcome", "handled", "--json"], { encoding: "utf8", env: { ...process.env, ...f.env } });
     assert.equal(processComplete.status, 0, processComplete.stderr);
     assert.deepEqual(JSON.parse(processComplete.stdout), { completed: true, reason: "completed" }, "compiled public CLI completes only the exact read receipt");
+
+    const sameTime = "2026-07-22T00:00:00.000Z";
+    const writeTarget = (anchor, generation) => fs.writeFileSync(path.join(f.root, "inbox-audit.json"), JSON.stringify({ version: 3, targets: [{
+      agent_id: f.agentId, generation, target: "chat:oc_audit", anchor, observed_at: sameTime, status: "pending",
+    }] }), { mode: 0o600 });
+    writeTarget("om_aba_a", "00000000-0000-4000-8000-000000000003");
+    const abaRead = spawnSync(process.execPath, [entry, "inbox", "audit", "--json"], { encoding: "utf8", env: { ...process.env, ...f.env } });
+    assert.equal(abaRead.status, 0, abaRead.stderr);
+    const staleReceipt = JSON.parse(abaRead.stdout).targets[0].receipt;
+    writeTarget("om_aba_b", "00000000-0000-4000-8000-000000000004");
+    writeTarget("om_aba_a", "00000000-0000-4000-8000-000000000005");
+    const staleAck = spawnSync(process.execPath, [entry, "inbox", "audit", "complete", "--receipt", staleReceipt, "--outcome", "no-finding", "--json"], { encoding: "utf8", env: { ...process.env, ...f.env } });
+    assert.equal(staleAck.status, 0, staleAck.stderr);
+    assert.deepEqual(JSON.parse(staleAck.stdout), { completed: false, reason: "stale" }, "compiled CLI rejects an ABA receipt with an equal timestamp");
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 

@@ -4,15 +4,16 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import { test } from "bun:test";
-import {
+const {
   completeInboxAuditTarget,
   hasPendingInboxAuditTargets,
   inboxAuditRegistryFile,
   MAX_INBOX_AUDIT_TARGETS,
   observeInboxAuditTarget,
   readInboxAuditTargets,
-} from "../../../src/agent/missed-outbound-scan.ts";
+} = await import(pathToFileURL(path.join(import.meta.dirname, "../../../dist/agent/missed-outbound-scan.mjs")).href);
 import { InboxAuditHeartbeat, INBOX_AUDIT_CADENCE_MS } from "../../../src/agent/inbox-audit-heartbeat.ts";
 
 const configApi = createRequire(import.meta.url)("../../../dist/platform/config.cjs");
@@ -91,7 +92,7 @@ test("controlled audit sink routes only a concrete thread finding to its om_ anc
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test("read is completion-free; scoped completion rejects stale receipts and v1 stays ignored", () => {
+test("read is completion-free; scoped completion rejects stale receipts and legacy rows stay ignored", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-inbox-audit-complete-"));
   try {
     const file = inboxAuditRegistryFile(root);
@@ -100,6 +101,8 @@ test("read is completion-free; scoped completion rejects stale receipts and v1 s
       targets: [{ agent_id: "cli_audit", target: `chat:${CHAT}`, anchor: "om_legacy", observed_at: "2026-07-20T00:00:00.000Z" }],
     })}\n`, { mode: 0o600 });
     assert.equal(readInboxAuditTargets(file, "cli_audit").targets.length, 0, "v1 rows cannot prove originally-wake=true and must be discarded");
+    fs.writeFileSync(file, `${JSON.stringify({ version: 2, targets: [{ agent_id: "cli_audit", target: `chat:${CHAT}`, anchor: "om_legacy_v2", observed_at: "2026-07-20T00:00:00.000Z", status: "pending" }] })}\n`, { mode: 0o600 });
+    assert.equal(readInboxAuditTargets(file, "cli_audit").targets.length, 0, "v2 rows lack a durable generation and cannot fabricate one");
     assert.equal(observeInboxAuditTarget(file, "cli_audit", { ...WAKE, message_id: "om_pending" }), true);
     assert.equal(hasPendingInboxAuditTargets(file, "cli_audit"), true);
     const firstRead = readInboxAuditTargets(file, "cli_audit");
@@ -113,7 +116,23 @@ test("read is completion-free; scoped completion rejects stale receipts and v1 s
     assert.equal(observeInboxAuditTarget(file, "cli_audit", { ...WAKE, message_id: "om_new" }), true, "a new originally-wake=true anchor may reopen the target");
     assert.equal(readInboxAuditTargets(file, "cli_audit").targets[0].anchor, "om_new");
     assert.deepEqual(completeInboxAuditTarget(file, "cli_audit", firstRead.targets[0].receipt, "handled"), { completed: false, reason: "stale" }, "an ABA-style old receipt cannot retire new evidence");
-    assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).version, 2);
+    assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).version, 3);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("same-timestamp A to B to A creates a new generation and rejects the first receipt", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-inbox-audit-aba-generation-"));
+  const now = new Date("2026-07-21T00:00:00.000Z");
+  try {
+    const file = inboxAuditRegistryFile(root);
+    observeInboxAuditTarget(file, "cli_audit", { ...WAKE, message_id: "om_aba_a" }, now);
+    const first = readInboxAuditTargets(file, "cli_audit").targets[0];
+    observeInboxAuditTarget(file, "cli_audit", { ...WAKE, message_id: "om_aba_b" }, now);
+    observeInboxAuditTarget(file, "cli_audit", { ...WAKE, message_id: "om_aba_a" }, now);
+    const current = readInboxAuditTargets(file, "cli_audit").targets[0];
+    assert.notEqual(current.revision, first.revision, "new observation identity cannot depend on wall-clock precision");
+    assert.deepEqual(completeInboxAuditTarget(file, "cli_audit", first.receipt, "no-finding"), { completed: false, reason: "stale" });
+    assert.equal(readInboxAuditTargets(file, "cli_audit").targets[0].anchor, "om_aba_a");
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -130,6 +149,18 @@ test("completion for one Agent preserves another Agent and a concurrent newer an
     assert.deepEqual(completeInboxAuditTarget(file, "cli_auditA", a.receipt, "handled"), { completed: false, reason: "stale" });
     assert.deepEqual(readInboxAuditTargets(file, "cli_auditA").targets.map((row) => row.anchor), ["om_a_new"]);
     assert.deepEqual(readInboxAuditTargets(file, "cli_auditB").targets.map((row) => row.anchor), ["om_b"]);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("registry refuses a symlink instead of following it during observer mutation", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-inbox-audit-symlink-"));
+  try {
+    const file = inboxAuditRegistryFile(root);
+    const victim = path.join(root, "victim.json");
+    fs.writeFileSync(victim, "preserve", { mode: 0o600 });
+    fs.symlinkSync(victim, file);
+    assert.throws(() => observeInboxAuditTarget(file, "cli_audit", { ...WAKE, message_id: "om_symlink" }), /regular file/);
+    assert.equal(fs.readFileSync(victim, "utf8"), "preserve");
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
