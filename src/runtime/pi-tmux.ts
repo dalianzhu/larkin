@@ -211,12 +211,15 @@ function terminateOwnedPane(session: string, env: NodeJS.ProcessEnv): void {
 }
 
 function snapshotFromDir(dir: string, taskId: string, env: NodeJS.ProcessEnv, session: string): TmuxTaskSnapshot {
+  // 先探活再读终态：exit_code 在 shell 退出前落盘。先读再 has-session 会把探测窗口里写完的快命令判成 failed+null。
+  const live = tmuxHasSession(session, env);
+  const readExit = (): number | null => parseExitCode(readText(path.join(dir, "exit_code")));
   const cancelled = readText(path.join(dir, "cancelled")) !== null;
-  const exitCode = parseExitCode(readText(path.join(dir, "exit_code")));
+  let exitCode = readExit();
+  if (!live && exitCode === null) exitCode = readExit();
   const startedAt = readText(path.join(dir, "started_at"))?.trim() || null;
   const endedAt = readText(path.join(dir, "ended_at"))?.trim() || null;
   const output = tailBytes(path.join(dir, "output"), OUTPUT_TAIL_BYTES);
-  const live = tmuxHasSession(session, env);
   let status: TmuxTaskStatus;
   if (exitCode === null) {
     if (live) status = cancelled ? "cancelled" : "running";
