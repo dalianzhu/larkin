@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 export const FIXTURE_AGENT_ID = "cli_inboxAuditEvalA1";
 export const FIXTURE_TIME = "2026-09-06T00:00:00.000Z";
@@ -14,7 +15,22 @@ export function appendTrace(root, event) {
   fs.appendFileSync(path.join(root, "trace.ndjson"), `${JSON.stringify(event)}\n`, { mode: 0o600 });
 }
 
-export function createInboxAuditFixture({ root, scenario }) {
+function eventForTarget(target, anchor) {
+  if (target.startsWith("chat:")) return { chat_id: target.slice("chat:".length), thread_id: null, message_id: anchor };
+  const parts = target.split(":");
+  return { chat_id: parts[1], thread_id: parts[2], message_id: anchor };
+}
+
+async function observeFixtureTarget(sourceRoot, registryFile, agentId, target, anchor, now) {
+  if (!sourceRoot) throw new Error("fixture setup requires --source-root");
+  const module = await import(pathToFileURL(path.join(sourceRoot, "dist", "agent", "missed-outbound-scan.mjs")).href);
+  const event = eventForTarget(target, anchor);
+  return module.observeInboxAuditTarget(registryFile, agentId, {
+    ...event, chat_type: "group", wake: true, _sender_is_bot: false, _scan_authority: true,
+  }, now);
+}
+
+export async function createInboxAuditFixture({ root, scenario, sourceRoot }) {
   const fixtureRoot = root || fs.mkdtempSync(path.join(os.tmpdir(), "larkin-inbox-audit-eval-"));
   fs.mkdirSync(fixtureRoot, { recursive: true, mode: 0o700 });
   const agentId = scenario.fixture.agent_id || FIXTURE_AGENT_ID;
@@ -24,16 +40,8 @@ export function createInboxAuditFixture({ root, scenario }) {
     activeAgent: agentId,
     agents: { [agentId]: { runtime: "codex", model: "gpt-5.6-sol" } },
   });
-  writePrivate(path.join(fixtureRoot, "inbox-audit.json"), {
-    version: 2,
-    targets: [{
-      agent_id: agentId,
-      target: scenario.fixture.target,
-      anchor: scenario.fixture.anchor,
-      observed_at: FIXTURE_TIME,
-      status: "pending",
-    }],
-  });
+  await observeFixtureTarget(sourceRoot, path.join(fixtureRoot, "inbox-audit.json"), agentId,
+    scenario.fixture.target, scenario.fixture.anchor, new Date(FIXTURE_TIME));
   fs.writeFileSync(path.join(fixtureRoot, "trace.ndjson"), "", { mode: 0o600 });
   writePrivate(path.join(fixtureRoot, "history.json"), {
     target: scenario.fixture.target,
@@ -43,18 +51,11 @@ export function createInboxAuditFixture({ root, scenario }) {
   return { root: fixtureRoot, agentId, traceFile: path.join(fixtureRoot, "trace.ndjson") };
 }
 
-export function advanceFixtureAnchor(root, scenario, agentId = FIXTURE_AGENT_ID) {
+export async function advanceFixtureAnchor(root, scenario, sourceRoot, agentId = FIXTURE_AGENT_ID) {
   const file = path.join(root, "inbox-audit.json");
-  const registry = JSON.parse(fs.readFileSync(file, "utf8"));
-  const row = registry.targets.find((candidate) => candidate.agent_id === agentId && candidate.target === scenario.fixture.target);
-  if (!row) throw new Error("fixture target is missing before anchor advance");
-  row.anchor = scenario.fixture.new_anchor;
-  row.observed_at = "2026-09-06T00:01:00.000Z";
-  row.status = "pending";
-  delete row.completed_at;
-  delete row.completed_anchor;
-  delete row.completed_outcome;
-  writePrivate(file, registry);
+  const observed = await observeFixtureTarget(sourceRoot, file, agentId, scenario.fixture.target,
+    scenario.fixture.new_anchor, new Date("2026-09-06T00:01:00.000Z"));
+  if (observed !== true) throw new Error("fixture anchor advance did not create new evidence");
   writePrivate(path.join(root, "history.json"), {
     target: scenario.fixture.target,
     anchor: scenario.fixture.new_anchor,

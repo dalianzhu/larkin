@@ -32,12 +32,14 @@ function runGateway(action, root, sourceRoot, extra = []) {
 const command = process.argv[2] || "";
 if (command === "--setup") {
   const item = scenario();
-  const fixture = createInboxAuditFixture({ root: flag("--root") || undefined, scenario: item });
+  const sourceRoot = flag("--source-root");
+  if (!sourceRoot) throw new Error("--setup requires --source-root");
+  const fixture = await createInboxAuditFixture({ root: flag("--root") || undefined, scenario: item, sourceRoot });
   const callerInstruction = item.task
     .replaceAll("{gateway}", GATEWAY)
     .replaceAll("{agent_id}", fixture.agentId)
     .replaceAll("{root}", fixture.root)
-    .replaceAll("{source_root}", flag("--source-root") || "<source-root>");
+    .replaceAll("{source_root}", sourceRoot);
   process.stdout.write(`${JSON.stringify({
     dataset: DATASET.dataset, version: DATASET.version, scenario: item.id,
     root: fixture.root, agent_id: fixture.agentId, gateway: GATEWAY,
@@ -45,7 +47,7 @@ if (command === "--setup") {
     advance_command: item.fixture.new_anchor
       ? `bun ${path.join(ROOT, "test/support/inbox-audit-flow-driver.mjs")} --advance-anchor --scenario ${item.id} --root ${fixture.root} --agent-id ${fixture.agentId}`
       : null,
-    verify_command: `bun ${path.join(ROOT, "test/support/inbox-audit-flow-driver.mjs")} --verify --scenario ${item.id} --root ${fixture.root} --source-root ${flag("--source-root") || "<source-root>"}`,
+    verify_command: `bun ${path.join(ROOT, "test/support/inbox-audit-flow-driver.mjs")} --verify --scenario ${item.id} --root ${fixture.root} --source-root ${sourceRoot}`,
     trace: path.join(fixture.root, "trace.ndjson"),
     grade_command: `bun ${path.join(ROOT, "test/support/inbox-audit-flow-grader.mjs")} --scenario ${item.id} --trace ${path.join(fixture.root, "trace.ndjson")}`,
   }, null, 2)}\n`);
@@ -53,7 +55,9 @@ if (command === "--setup") {
 }
 if (command === "--advance-anchor") {
   const item = scenario();
-  advanceFixtureAnchor(flag("--root"), item, flag("--agent-id") || undefined);
+  const sourceRoot = flag("--source-root");
+  if (!sourceRoot) throw new Error("--advance-anchor requires --source-root");
+  await advanceFixtureAnchor(flag("--root"), item, sourceRoot, flag("--agent-id") || undefined);
   process.stdout.write(JSON.stringify({ ok: true, action: "fixture_advance_anchor", anchor: item.fixture.new_anchor }) + "\n");
   process.exit(0);
 }
