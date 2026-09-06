@@ -22,8 +22,9 @@ test("optional install fixture records published 0.0.12 without redistributing t
   assert.equal(fixture.redistributed, false);
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
   assert.match(readme, /Pi loads it itself/);
-  assert.match(readme, /does not run `git init`/);
-  assert.match(readme, /ordinary Larkin directories stay on native bash/);
+  assert.match(readme, /registers bash and then fails outside a git working tree/);
+  assert.match(readme, /does not fall back to native bash/);
+  assert.doesNotMatch(readme, /stay on native bash|remain on native bash/);
 });
 
 test("package.json wires the opt-in tmux-bash eval and drops the retired scripts", () => {
