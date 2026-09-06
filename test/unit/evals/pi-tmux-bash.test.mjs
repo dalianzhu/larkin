@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,9 +10,10 @@ import {
   PI_TMUX_BASH_GUIDANCE,
 } from "../../../dist/agent/context-prompt.mjs";
 import {
+  commandMatchesTaskBash,
   extractTimedOutBackground,
   extractTmuxBashCompletion,
-  findUnpromptedCompletionTurn,
+  findAutonomousCompletionTurn,
   gradePiTmuxBashTrace,
   loadPiTmuxBashEval,
   summarizePiTmuxBashEval,
@@ -32,17 +34,20 @@ import {
   createIsolatedTmuxWorkspace,
   descendantProcesses,
   killIsolatedTmuxSession,
+  listIsolatedTmuxWindows,
   packageHasResolvableDependencies,
   parseCommandRuntime,
   parsePsAxRows,
   prepareIsolatedTmuxBashPackage,
   readPinnedPluginManifest,
   requireExplicitEvalModel,
+  requireTmuxBashPackagePath,
   resolveTmuxBashLoadMode,
   resolveTmuxBashPackagePath,
   resolveUserInstalledTmuxBashPackage,
   snapshotUserPiSettings,
-  windowIdFromResultOrTmux,
+  windowIdFromBashResult,
+  windowsOwnedBy,
 } from "../../support/pi-tmux-bash-live-harness.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "../../..");
@@ -71,6 +76,8 @@ test("pi-tmux-bash dataset pins version, threshold, external plugin 0.0.12, and 
   assert.equal(DATASET.workspace.production_claim, "not-assumed");
   assert.match(DATASET.workspace.upstream_limitation, /not in a git repository/);
   assert.match(DATASET.workspace.larkin_note, /usually not git/);
+  assert.match(DATASET.workspace.larkin_note, /does not fall back to native bash/);
+  assert.equal(DATASET.grader.synthetic_fixtures, "unit-only");
   assert.equal(DATASET.harness.headless, true);
   assert.equal(DATASET.harness.tui_independent, true);
   assert.equal(DATASET.harness.intended_script, INTENDED_EVAL_SCRIPT);
@@ -136,7 +143,7 @@ test("standing prompt v30 replaces forced subagent rules with conditional tmux-b
   assert.doesNotMatch(other.content, /tmux-backed bash/);
 });
 
-test("golden traces reach the registered threshold and reject forced subagent routing", () => {
+test("synthetic grader fixtures are unit checks, not model-eval evidence", () => {
   const traces = {
     "long-command-backgrounds-without-subagent": [
       { type: "tool_execution_start", toolName: "bash", args: { command: "sleep 8 && echo larkin-tmux-eval-long", timeout: 5, timeoutAction: "background" } },
@@ -166,9 +173,11 @@ test("golden traces reach the registered threshold and reject forced subagent ro
       { type: "tool_execution_start", toolName: "bash", args: { command: "sleep 6 && echo larkin-tmux-eval-done" } },
       { type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "Still running after 5s in background tmux @12" }] } },
       { type: "agent_end" },
-      completionEvent("larkin-tmux-eval-done"),
+      { type: "turn_start" },
+      { customType: "tmux-bash-completion", content: "Command finished\nlarkin-tmux-eval-done" },
       { type: "message_update", assistantMessageEvent: { type: "text", content: "larkin-tmux-eval-done finished here" } },
       { type: "agent_end" },
+      { type: "agent_settled" },
     ],
     "no-forced-subagent-for-known-long": [
       { type: "tool_execution_start", toolName: "bash", args: { command: "sleep 8 && echo larkin-tmux-eval-deploy", background: true } },
@@ -189,8 +198,8 @@ test("golden traces reach the registered threshold and reject forced subagent ro
     assert.equal(result.passed, true, `${result.id}: ${JSON.stringify(result.results)}`);
   }
   const summary = summarizePiTmuxBashEval(graded);
-  assert.equal(summary.rate, DATASET.core_acceptance_rate);
   assert.equal(summary.passed, DATASET.scenarios.length);
+  assert.equal(DATASET.grader.synthetic_fixtures, "unit-only");
 });
 
 test("grader rejects Agent/subagent delegation and missing inspect/stop IDs", () => {
@@ -210,6 +219,41 @@ test("grader rejects Agent/subagent delegation and missing inspect/stop IDs", ()
   ]);
   assert.equal(noPeek.passed, false);
   assert.equal(noPeek.results.inspects_by_returned_id, false);
+
+  const wrongCommand = gradePiTmuxBashTrace(long, [
+    { type: "tool_execution_start", toolName: "bash", args: { command: "echo not-the-task" } },
+    { type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "Still running @99" }] } },
+    { type: "agent_end" },
+  ]);
+  assert.equal(wrongCommand.results.uses_bash, false);
+  assert.equal(wrongCommand.results.returned_id, false);
+
+  const peekInvented = gradePiTmuxBashTrace(inspect, [
+    { type: "tool_execution_start", toolName: "bash", args: { command: inspect.task_bash } },
+    { type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "Started in background tmux window @77" }] } },
+    { type: "tool_execution_start", toolName: "tmux", args: { action: "peek", window: "@99" } },
+    { type: "tool_execution_end", toolName: "tmux", result: { content: [{ type: "text", text: "peek @99" }] } },
+    { type: "agent_end" },
+  ]);
+  assert.equal(peekInvented.results.inspects_by_returned_id, false);
+
+  const listIsNotInspect = gradePiTmuxBashTrace(inspect, [
+    { type: "tool_execution_start", toolName: "bash", args: { command: inspect.task_bash } },
+    { type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "Started in background tmux window @77" }] } },
+    { type: "tool_execution_start", toolName: "tmux", args: { action: "list" } },
+    { type: "agent_end" },
+  ]);
+  assert.equal(listIsNotInspect.results.inspects_by_returned_id, false);
+
+  const completion = DATASET.scenarios.find((scenario) => scenario.id === "completion-stays-in-originating-target");
+  const receiptOnly = gradePiTmuxBashTrace(completion, [
+    { type: "tool_execution_start", toolName: "bash", args: { command: completion.task_bash } },
+    { type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "Still running @12" }] } },
+    { type: "agent_end" },
+    completionEvent("larkin-tmux-eval-done"),
+  ]);
+  assert.equal(receiptOnly.results.completion_followup, false);
+  assert.equal(receiptOnly.results.final_summary, false);
 });
 
 test("completion extractor only accepts tmux-bash-completion followUp", () => {
@@ -234,11 +278,17 @@ test("headless RPC fixture args and unprompted completion turn are independent o
   assert.equal(extractTimedOutBackground(timeoutEnd)?.outcome, "timed-out-background");
   const firstEnd = { type: "agent_end" };
   const secondStart = { type: "turn_start" };
-  const secondEnd = completionEvent("larkin-tmux-eval-done");
-  const found = findUnpromptedCompletionTurn([timeoutEnd, firstEnd, secondStart, secondEnd], firstEnd);
+  const completion = { customType: "tmux-bash-completion", content: "Command finished\nlarkin-tmux-eval-done" };
+  const assistant = { type: "message_update", assistantMessageEvent: { type: "text", content: "larkin-tmux-eval-done finished here" } };
+  const settled = { type: "agent_settled" };
+  const found = findAutonomousCompletionTurn([timeoutEnd, firstEnd, secondStart, completion, assistant, settled], firstEnd);
   assert.equal(found?.completion?.customType, "tmux-bash-completion");
   assert.equal(found.turnStart, secondStart);
-  assert.equal(findUnpromptedCompletionTurn([timeoutEnd, firstEnd], firstEnd), null);
+  assert.match(found.assistantText, /larkin-tmux-eval-done/);
+  assert.equal(found.settled, settled);
+  assert.equal(findAutonomousCompletionTurn([timeoutEnd, firstEnd, completion], firstEnd), null);
+  assert.equal(commandMatchesTaskBash("sleep 8 && echo larkin-tmux-eval-long", "sleep 8 && echo larkin-tmux-eval-long"), true);
+  assert.equal(commandMatchesTaskBash("echo other", "sleep 8 && echo larkin-tmux-eval-long"), false);
 });
 
 function writePinnedManifest(dir, extra = {}) {
@@ -338,6 +388,9 @@ test("prompt-eval files do not commit machine-specific package paths or a missin
     assert.doesNotMatch(text, /expected to have no license field/);
     assert.doesNotMatch(text, /discoverIsolatedTmuxWindows/);
   }
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+  assert.match(readme, /does not fall back to native bash/);
+  assert.doesNotMatch(readme, /those sessions stay on Pi's native bash/);
 });
 
 test("real Pi runs require an explicit local model and refuse silent fallback", () => {
@@ -363,6 +416,11 @@ test("real Pi runs require an explicit local model and refuse silent fallback", 
     () => assertRequestedModelUsed("openai-codex/gpt-5.6-luna", "openai-codex/gpt-5.6-sol"),
     /recorded actual=openai-codex\/gpt-5\.6-sol/,
   );
+  assert.throws(() => requireTmuxBashPackagePath({
+    LARKIN_PI_TMUX_BASH_PACKAGE: "",
+    PI_CODING_AGENT_DIR: path.join(os.tmpdir(), "larkin-missing-pi-agent"),
+    HOME: path.join(os.tmpdir(), "larkin-missing-home"),
+  }), /refusing silent discovery fallback/);
 });
 
 test("command runtime is taken from in-command timestamps, not leftover tmux windows or .out names", () => {
@@ -390,7 +448,8 @@ test("command runtime is taken from in-command timestamps, not leftover tmux win
   assert.doesNotMatch(harness, /\.out\b/);
   assert.doesNotMatch(harness, /command:\s*"output-dir"/);
   assert.match(harness, /list-windows/);
-  assert.equal(windowIdFromResultOrTmux("Still running in background tmux window @42", "missing-session"), "@42");
+  assert.equal(windowIdFromBashResult("Still running in background tmux window @42"), "@42");
+  assert.equal(windowIdFromBashResult("no identifier"), null);
 
   const live = fs.readFileSync(path.join(ROOT, "test/live/pi-tmux-bash-live.test.mjs"), "utf8");
   assert.match(live, /test\.skipIf\(!evalEnabled\)/);
@@ -398,4 +457,23 @@ test("command runtime is taken from in-command timestamps, not leftover tmux win
   assert.doesNotMatch(live, /if\s*\(!evalEnabled\)\s*return/);
   assert.doesNotMatch(live, /if\s*\(!liveEnabled\)\s*return/);
   assert.doesNotMatch(live, /discoverIsolatedTmuxWindows/);
+});
+
+test("shared tmux session lists windows by recorded piSessionId owner", () => {
+  const workspace = createIsolatedTmuxWorkspace({ prefix: "larkin-tmux-owners-" });
+  try {
+    const created = spawnSync("tmux", ["new-session", "-d", "-s", workspace.sessionName, "-n", "owner-a"], { encoding: "utf8" });
+    assert.equal(created.status, 0, created.stderr || created.stdout);
+    spawnSync("tmux", ["set-option", "-w", "-t", `${workspace.sessionName}:owner-a`, "@pi-tmux-bash-pi-session-id", "owner-a"], { encoding: "utf8" });
+    spawnSync("tmux", ["new-window", "-t", workspace.sessionName, "-n", "owner-b"], { encoding: "utf8" });
+    spawnSync("tmux", ["set-option", "-w", "-t", `${workspace.sessionName}:owner-b`, "@pi-tmux-bash-pi-session-id", "owner-b"], { encoding: "utf8" });
+    const windows = listIsolatedTmuxWindows(workspace.sessionName);
+    assert.ok(windows.length >= 2, `expected two windows, got ${JSON.stringify(windows)}`);
+    assert.equal(windowsOwnedBy(windows, "owner-a").length, 1);
+    assert.equal(windowsOwnedBy(windows, "owner-b").length, 1);
+    assert.equal(windowsOwnedBy(windows, "owner-a")[0].id === windowsOwnedBy(windows, "owner-b")[0].id, false);
+  } finally {
+    killIsolatedTmuxSession(workspace.sessionName);
+    fs.rmSync(workspace.root, { recursive: true, force: true });
+  }
 });

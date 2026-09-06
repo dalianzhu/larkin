@@ -11,7 +11,7 @@
     "success_path": "isolated-git-fixture",
     "production_claim": "not-assumed",
     "upstream_limitation": "0.0.12 getGitRoot/executeTool requires a git repository; a non-git cwd currently fails with 'not in a git repository'.",
-    "larkin_note": "Larkin Agent workspaces are usually not git. User clarification is pending. Git-fixture success is not production or non-git support."
+    "larkin_note": "Larkin Agent workspaces are usually not git. Published 0.0.12 does not fall back to native bash. User clarification is pending. Git-fixture success is not production or non-git support."
   },
   "runtime": {
     "adapter": "pi",
@@ -43,6 +43,7 @@
     "name": "pi-tmux-bash-grader",
     "version": 1,
     "threshold": 0.6,
+    "synthetic_fixtures": "unit-only",
     "rubric": [
       "long commands use available tmux-backed bash instead of forced Agent/subagent delegation",
       "a wait timeout is treated as still-running, not process failure or a hard kill",

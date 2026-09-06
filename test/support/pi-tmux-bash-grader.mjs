@@ -59,19 +59,42 @@ export function extractTimedOutBackground(eventOrTrace) {
   return null;
 }
 
-export function findUnpromptedCompletionTurn(trace, firstAgentEnd) {
+export function commandMatchesTaskBash(actual, taskBash) {
+  const command = String(actual || "").trim();
+  const expected = String(taskBash || "").trim();
+  return Boolean(expected) && command === expected;
+}
+
+export function findAutonomousCompletionTurn(trace, firstAgentEnd) {
   const events = Array.isArray(trace) ? trace : [];
   const start = firstAgentEnd ? events.indexOf(firstAgentEnd) : events.findIndex((event) => event?.type === "agent_end");
   if (start < 0) return null;
   const after = events.slice(start + 1);
-  const completionEvent = after.find((event) => extractTmuxBashCompletion(event));
-  if (!completionEvent) return null;
+  const completionIndex = after.findIndex((event) => extractTmuxBashCompletion(event));
+  const turnIndex = after.findIndex((event) => event?.type === "turn_start");
+  if (completionIndex < 0 || turnIndex < 0) return null;
+  const afterBoth = after.slice(Math.max(completionIndex, turnIndex) + 1);
+  const assistantEvents = afterBoth.filter(IS_TEXT_DELTA);
+  const assistantText = assistantEvents
+    .map((event) => String(event.assistantMessageEvent?.content || event.assistantMessageEvent?.delta || ""))
+    .join("");
+  if (!assistantText.trim()) return null;
+  const lastAssistant = assistantEvents[assistantEvents.length - 1];
+  const settled = events.slice(events.indexOf(lastAssistant) + 1)
+    .find((event) => event?.type === "agent_end" || event?.type === "agent_settled");
+  if (!settled) return null;
   return {
-    turnStart: after.find((event) => event?.type === "turn_start"),
-    agentEnd: after.find((event) => event?.type === "agent_end"),
-    completion: extractTmuxBashCompletion(completionEvent),
-    completionEvent,
+    turnStart: after[turnIndex],
+    agentEnd: afterBoth.find((event) => event?.type === "agent_end") || (settled.type === "agent_end" ? settled : null),
+    settled,
+    assistantText,
+    completion: extractTmuxBashCompletion(after[completionIndex]),
+    completionEvent: after[completionIndex],
   };
+}
+
+export function findUnpromptedCompletionTurn(trace, firstAgentEnd) {
+  return findAutonomousCompletionTurn(trace, firstAgentEnd);
 }
 
 export function loadPiTmuxBashEval(file) {
@@ -86,6 +109,12 @@ export function loadPiTmuxBashEval(file) {
   }
   if (raw.workspace?.production_claim !== "not-assumed") {
     throw new Error("pi-tmux-bash eval must not claim production or non-git support");
+  }
+  if (!/does not fall back to native bash/i.test(String(raw.workspace?.larkin_note || ""))) {
+    throw new Error("eval must record that 0.0.12 does not fall back to native bash");
+  }
+  if (/those sessions stay on Pi's native bash|native bash is restored|(?<!does not )falls? back to native/i.test(String(raw.workspace?.larkin_note || ""))) {
+    throw new Error("eval must not claim a native bash fallback");
   }
   if (raw.plugin?.name !== "@richardgill/pi-tmux-bash" || raw.plugin?.version !== "0.0.12") {
     throw new Error("pi-tmux-bash eval must pin external @richardgill/pi-tmux-bash@0.0.12");
@@ -125,6 +154,9 @@ export function loadPiTmuxBashEval(file) {
   }
   if (raw.core_acceptance_rate !== 1) {
     throw new Error("core acceptance deterministic assertions must require rate 1");
+  }
+  if (raw.grader?.synthetic_fixtures !== "unit-only") {
+    throw new Error("synthetic grader fixtures must be marked unit-only, not model-eval evidence");
   }
   if (typeof raw.threshold_rationale !== "string" || raw.threshold_rationale.length < 40) {
     throw new Error("pi-tmux-bash model-eval threshold needs a meaningful rationale");
@@ -185,38 +217,55 @@ function assistantText(trace) {
     .join(" ");
 }
 
+export function matchingBashEnds(events, taskBash) {
+  const ends = [];
+  const pending = [];
+  for (const event of events) {
+    if (event?.type === "tool_execution_start" && event.toolName === "bash") {
+      pending.push(commandMatchesTaskBash(event.args?.command, taskBash));
+    } else if (event?.type === "tool_execution_end" && event.toolName === "bash") {
+      if (pending.shift()) ends.push(event);
+    }
+  }
+  return ends;
+}
+
+export function idsFromMatchingBash(events, taskBash) {
+  return matchingBashEnds(events, taskBash).flatMap((event) => collectWindowIds(stringifyResult(event)));
+}
+
 export function gradePiTmuxBashTrace(scenario, trace) {
   const events = Array.isArray(trace) ? trace : [];
   const expectations = scenario.expectations;
+  const taskBash = scenario.task_bash;
   const bashStarts = toolStarts(events, "bash");
-  const bashEnds = toolEnds(events, "bash");
+  const matchingStarts = bashStarts.filter((event) => commandMatchesTaskBash(event.args?.command, taskBash));
+  const matchingEnds = matchingBashEnds(events, taskBash);
   const tmuxStarts = toolStarts(events, "tmux");
   const forced = events.filter((event) =>
     event?.type === "tool_execution_start" && FORCED_SUBAGENT_TOOLS.has(event.toolName));
-  const bashText = bashEnds.map(stringifyResult).join("\n");
-  const allToolText = [...bashEnds, ...toolEnds(events, "tmux")].map(stringifyResult).join("\n");
-  const ids = collectWindowIds(`${bashText}\n${allToolText}`);
+  const matchingBashText = matchingEnds.map(stringifyResult).join("\n");
+  const ids = idsFromMatchingBash(events, taskBash);
   const text = assistantText(events);
-  const completion = extractTmuxBashCompletion(events);
+  const firstEnd = events.find((event) => event?.type === "agent_end");
+  const autonomous = findAutonomousCompletionTurn(events, firstEnd);
   const marker = String(scenario.marker || scenario.task_bash.split(" ").pop() || "");
 
   const results = {
-    uses_bash: bashStarts.length > 0,
+    uses_bash: matchingStarts.length > 0,
     no_forced_subagent: forced.length === 0,
-    wait_timeout_not_failure: STILL_RUNNING_RE.test(bashText) || ids.length > 0
-      || extractTimedOutBackground(bashEnds) !== null,
+    wait_timeout_not_failure: STILL_RUNNING_RE.test(matchingBashText)
+      || extractTimedOutBackground(matchingEnds) !== null,
     returned_id: ids.length > 0,
-    inspects_by_returned_id: tmuxStarts.some((event) => {
-      const action = event.args?.action;
-      if (action === "list") return true;
-      return action === "peek" && ids.includes(String(event.args?.window || ""));
-    }),
+    inspects_by_returned_id: tmuxStarts.some((event) =>
+      event.args?.action === "peek" && ids.includes(String(event.args?.window || ""))),
     stops_by_returned_id: tmuxStarts.some((event) =>
       event.args?.action === "kill" && ids.includes(String(event.args?.window || ""))),
-    completion_followup: completion !== null,
+    completion_followup: autonomous !== null,
     stays_in_originating_target: !NEW_TARGET_RE.test(text),
-    final_summary: marker ? text.includes(marker) || allToolText.includes(marker)
-      || JSON.stringify(completion || {}).includes(marker) : /completed|output|result/i.test(text),
+    final_summary: marker
+      ? Boolean(autonomous?.assistantText.includes(marker) || (!expectations.completion_followup && text.includes(marker)))
+      : /completed|output|result/i.test(text),
     no_hard_kill_or_lifetime_cap: !HARD_KILL_RE.test(JSON.stringify(events)) && forced.length === 0,
     turn_completed: events.some((event) => event?.type === "agent_end"),
   };

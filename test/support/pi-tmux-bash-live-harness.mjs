@@ -96,6 +96,14 @@ export function resolveTmuxBashLoadMode(env = process.env) {
   return resolveTmuxBashPackagePath(env) ? "extension" : "discovery";
 }
 
+export function requireTmuxBashPackagePath(env = process.env) {
+  const resolved = resolveTmuxBashPackagePath(env);
+  if (!resolved) {
+    throw new Error("real Pi runs require LARKIN_PI_TMUX_BASH_PACKAGE or a user-installed @richardgill/pi-tmux-bash@0.0.12; refusing silent discovery fallback");
+  }
+  return resolved;
+}
+
 export function readPinnedPluginManifest(packageDir) {
   const manifest = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8"));
   if (manifest.name !== PINNED_PLUGIN.name || manifest.version !== PINNED_PLUGIN.version) {
@@ -186,7 +194,8 @@ export function createIsolatedTmuxWorkspace(prefixOrOptions = "larkin-tmux-eval-
     const init = spawnSync("git", ["init"], { cwd: workDir, encoding: "utf8" });
     if (init.status !== 0) throw new Error(`git init failed: ${init.stderr || init.stdout}`);
   }
-  const sessionName = `larkin-tmux-${path.basename(root).replace(/[^a-zA-Z0-9-]/g, "").slice(-16)}`;
+  const sessionName = options.sessionName
+    || `larkin-tmux-${path.basename(root).replace(/[^a-zA-Z0-9-]/g, "").slice(-16)}`;
   const config = {
     tmuxSessionScope: "global",
     globalTmuxSessionName: sessionName,
@@ -290,20 +299,27 @@ export function descendantProcesses(rows, rootPid) {
 
 export function listIsolatedTmuxWindows(sessionName) {
   const listed = spawnSync("tmux", [
-    "list-windows", "-t", sessionName, "-F", "#{window_id}\t#{window_name}\t#{pane_pid}\t#{pane_current_command}",
+    "list-windows", "-t", sessionName, "-F",
+    "#{window_id}\t#{window_name}\t#{pane_pid}\t#{pane_current_command}\t#{@pi-tmux-bash-pi-session-id}",
   ], { encoding: "utf8" });
   if (listed.status !== 0) return [];
   return listed.stdout.split("\n").filter(Boolean).map((line) => {
-    const [id, name, panePid, command] = line.split("\t");
-    return { id, name, panePid, command };
+    const [id, name, panePid, command, piSessionId] = line.split("\t");
+    return { id, name, panePid, command, piSessionId: piSessionId || "" };
   });
 }
 
-export function windowIdFromResultOrTmux(resultText, sessionName) {
-  const fromResult = String(resultText || "").match(/@\d+/);
-  if (fromResult) return fromResult[0];
-  const windows = listIsolatedTmuxWindows(sessionName);
-  return windows.length === 1 ? windows[0].id : null;
+export function windowsOwnedBy(windows, piSessionId) {
+  return (windows || []).filter((window) => window.piSessionId && window.piSessionId === piSessionId);
+}
+
+export function windowIdFromBashResult(resultText) {
+  const match = String(resultText || "").match(/@\d+/);
+  return match ? match[0] : null;
+}
+
+export function piSessionIdFromState(state) {
+  return String(state?.sessionId || state?.session?.id || state?.id || "");
 }
 
 export function inspectRunningTmuxChild(sessionName, windowId) {
