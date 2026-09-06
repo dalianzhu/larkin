@@ -20,7 +20,7 @@ import {
   buildCanonicalPiSubagentAssistantMessage,
   buildCanonicalPiSubagentNotificationContent,
 } from "../../../dist/runtime/pi-subagents-notification.mjs";
-import { buildTmuxBashFollowUpMessage } from "../../../dist/runtime/pi-tmux-bash-followup.mjs";
+import { buildAutonomousFollowUpMessage, buildTmuxBashFollowUpMessage } from "../../../dist/runtime/pi-autonomous-followup.mjs";
 import { classifyStrictProviderError } from "../../../dist/runtime/provider-error-classifier.mjs";
 import { RuntimePrerequisiteError } from "../../../dist/runtime/runtime-readiness.mjs";
 
@@ -741,6 +741,57 @@ test("Pi repeated canonical late completion notifications only bridge once", asy
   const observations = events.filter((event) => event.type === "runtime-observation");
   assert.deepEqual(observations.map((event) => event.phase), ["completed"]);
   assert.equal(observations[0].completionKey, "task-bridge-repeat");
+});
+
+test("Pi unowned turn_start occupies an autonomous turn without a host-wake key", async () => {
+  let listener;
+  const sdk = {
+    sessionId: "pi-native-followup", prompt() {}, steer() {}, abort() {},
+    subscribe(next) { listener = next; return () => {}; },
+  };
+  const session = await createNativeRuntimeAdapter("pi", {
+    createPiSession: async () => sdk,
+    env: { LARKIN_PI_DISTRIBUTION: "builtin" },
+  }).createSession(create());
+  const events = [];
+  session.subscribe((event) => events.push(event));
+  listener({ type: "turn_start", turnIndex: 3 });
+  listener({ type: "agent_end", willRetry: false, messages: [] });
+  listener({ type: "agent_settled" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events.filter((event) => event.type === "turn-start" || event.type === "turn-end").map((event) => event.type),
+    ["turn-start", "turn-end"]);
+  assert.deepEqual(events.filter((event) => event.type === "runtime-observation" && event.completionKey), []);
+});
+
+test("Pi generic custom followUp without turn_start still accounts busy then settles once", async () => {
+  let listener;
+  const sdk = {
+    sessionId: "pi-generic-followup", prompt() {}, steer() {}, abort() {},
+    subscribe(next) { listener = next; return () => {}; },
+  };
+  const session = await createNativeRuntimeAdapter("pi", {
+    createPiSession: async () => sdk,
+    env: { LARKIN_PI_DISTRIBUTION: "builtin" },
+  }).createSession(create());
+  const events = [];
+  session.subscribe((event) => events.push(event));
+  listener({
+    type: "agent_end",
+    willRetry: false,
+    messages: [buildAutonomousFollowUpMessage("extension-followup", "Command finished (exit 0)")],
+  });
+  listener({ type: "agent_settled" });
+  listener({
+    type: "agent_end",
+    willRetry: false,
+    messages: [buildAutonomousFollowUpMessage("extension-followup", "Command finished (exit 0)")],
+  });
+  listener({ type: "agent_settled" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events.filter((event) => event.type === "turn-start" || event.type === "turn-end").map((event) => event.type),
+    ["turn-start", "turn-end"]);
+  assert.deepEqual(events.filter((event) => event.type === "runtime-observation" && event.completionKey), []);
 });
 
 test("Pi tmux-bash-completion followUp occupies an autonomous turn and does not emit a host-wake key", async () => {

@@ -2966,8 +2966,8 @@ test("RuntimeHost acknowledges an in-turn completion and does not wake again aft
   }
 });
 
-test("RuntimeHost treats a Pi tmux followUp turn as busy and does not schedule a second prompt", async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-host-tmux-followup-"));
+test("RuntimeHost treats an unowned Pi turn as busy and does not schedule a second prompt", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-host-native-followup-"));
   const session = new FakeSession();
   const adapter = { id: "pi", capabilities: {}, async createSession() { return session; } };
   const host = createRuntimeHost({
@@ -2976,18 +2976,18 @@ test("RuntimeHost treats a Pi tmux followUp turn as busy and does not schedule a
     subagentReconcileIntervalMs: 0,
   });
   try {
-    await host.start([{ agentId: "cli_piTmuxFollowA1", name: "tmux-follow", runtime: "pi", model: "model", workspaceDir: "/tmp", stateDir: root }]);
-    await host.deliver("cli_piTmuxFollowA1", { message_id: "om_pi_tmux_follow", chat_id: "oc_pi_tmux_follow", content: "start" });
+    await host.start([{ agentId: "cli_piNativeFollowA1", name: "native-follow", runtime: "pi", model: "model", workspaceDir: "/tmp", stateDir: root }]);
+    await host.deliver("cli_piNativeFollowA1", { message_id: "om_pi_native_follow", chat_id: "oc_pi_native_follow", content: "start" });
     session.emit({ type: "turn-start" });
     session.emit({ type: "turn-end" });
     assert.equal(session.prompts.length, 1);
     session.emit({ type: "turn-start", turnId: "pi-followup" });
-    assert.equal(host.isBusy("cli_piTmuxFollowA1"), true);
-    assert.equal(session.prompts.length, 1, "followUp turn must not cause a second host prompt");
+    assert.equal(host.isBusy("cli_piNativeFollowA1"), true);
+    assert.equal(session.prompts.length, 1, "unowned Pi turn must not cause a second host prompt");
     session.emit({ type: "turn-end" });
     for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(session.prompts.length, 1, "settling the followUp turn must not re-prompt");
-    assert.equal(host.isBusy("cli_piTmuxFollowA1"), false);
+    assert.equal(session.prompts.length, 1, "settling the unowned Pi turn must not re-prompt");
+    assert.equal(host.isBusy("cli_piNativeFollowA1"), false);
   } finally {
     await host.shutdown("done");
     fs.rmSync(root, { recursive: true, force: true });

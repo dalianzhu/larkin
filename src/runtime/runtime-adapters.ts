@@ -23,7 +23,7 @@ import {
   ledgerStatusFromPiNotificationStatus,
 } from "./pi-subagents-notification.js";
 import { effectivePiStateDir, extractBackgroundPiSubagentDispatch } from "./pi-subagent-ledger.js";
-import { extractTmuxBashFollowUp } from "./pi-tmux-bash-followup.js";
+import { extractAutonomousPiFollowUp } from "./pi-autonomous-followup.js";
 import {
   classifyPiMissingCredentialRejection,
   classifyRuntimePrerequisite,
@@ -559,7 +559,7 @@ class PiSession extends EventSession {
   private readonly observedBackgroundCompletionKeys = new Set<string>();
   private readonly pendingUnownedCompletionKeys = new Set<string>();
   private readonly pendingUnownedCompletionStatuses = new Map<string, Record<string, "completed" | "failed" | "cancelled" | "timed_out">>();
-  private readonly observedTmuxFollowUpKeys = new Set<string>();
+  private readonly observedAutonomousFollowUpKeys = new Set<string>();
   private readonly observedAgentEndEpochs = new Set<number>();
   private firstOutputObserved = false;
   private toolCallOpen = false;
@@ -669,7 +669,7 @@ class PiSession extends EventSession {
       this.observedBackgroundCompletionKeys.clear();
       this.pendingUnownedCompletionKeys.clear();
       this.pendingUnownedCompletionStatuses.clear();
-      this.observedTmuxFollowUpKeys.clear();
+      this.observedAutonomousFollowUpKeys.clear();
       this.observedAgentEndEpochs.clear();
       this.activeEpoch = null;
       this.settleArmedEpoch = null;
@@ -696,7 +696,7 @@ class PiSession extends EventSession {
         this.emit({ type: "turn-start", ...(Number.isInteger(event.turnIndex) ? { turnId: `pi-${event.turnIndex}` } : {}) });
         return;
       }
-      // Extension followUp / triggerTurn starts a Pi-owned turn with no host prompt.
+      // Native Pi triggerTurn starts a Pi-owned turn with no host prompt.
       this.beginAutonomousFollowUpTurn(Number.isInteger(event.turnIndex) ? `pi-${event.turnIndex}` : undefined);
     }
     else if (event?.type === "agent_end") {
@@ -719,9 +719,9 @@ class PiSession extends EventSession {
         this.observedCompletedEpochs.add(this.activeEpoch);
         this.emitObservation("completed");
       }
-      const tmuxFollowUp = extractTmuxBashFollowUp(event.messages);
-      if (tmuxFollowUp && !this.observedTmuxFollowUpKeys.has(tmuxFollowUp.key)) {
-        this.observedTmuxFollowUpKeys.add(tmuxFollowUp.key);
+      const autonomousFollowUp = extractAutonomousPiFollowUp(event.messages);
+      if (autonomousFollowUp && !this.observedAutonomousFollowUpKeys.has(autonomousFollowUp.key)) {
+        this.observedAutonomousFollowUpKeys.add(autonomousFollowUp.key);
         // Pi already triggerTurn'd this followUp. Account for the notification
         // turn, but never emit a host-wake completionKey.
         if (this.activeEpoch === null) this.beginAutonomousFollowUpTurn();
