@@ -678,8 +678,9 @@ test("inherited PI_PACKAGE_DIR does not drop production extension version probes
     for (let index = 0; index < sessionLaunch.args.length; index += 1) {
       if (sessionLaunch.args[index] === "-e") extensionPaths.push(sessionLaunch.args[index + 1]);
     }
-    assert.equal(extensionPaths.length, 1, JSON.stringify(sessionLaunch.args));
-    assert.match(extensionPaths[0], /pi-tmux\.bundle\.js$/);
+    const supported = tmuxAvailable({ ...process.env, ...input.env }, process.platform);
+    assert.equal(extensionPaths.length, supported ? 1 : 0, JSON.stringify(sessionLaunch.args));
+    if (supported) assert.match(extensionPaths[0], /pi-tmux\.bundle\.js$/);
     assert.equal(session.effectiveModel, "test-provider/test-model");
   } finally {
     await session?.close("inherited extension probe test complete").catch(() => {});
