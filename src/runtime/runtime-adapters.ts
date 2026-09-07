@@ -937,7 +937,12 @@ async function discoverEffectivePiContextWindow(input: RuntimeSessionCreate, com
   commandPrefix: readonly string[], requestedModel: string | undefined,
   env: NodeJS.ProcessEnv, spawn: (command: string, args: readonly string[], options: Record<string, unknown>) => ProcessLike,
   rpcOptions?: PiRpcClientOptions): Promise<PiProbeResult> {
-  const probeArgs = [...commandPrefix, "--mode", "rpc", "--no-session", "--no-extensions",
+  // The isolated context-window probe must load the same extensions as the real
+  // session handshake: provider-registered models (e.g. Pi packages that add a
+  // model provider such as `kiro/*`) do not exist under `--no-extensions`, so a
+  // `--model <extension-provided>` probe would fail with a spurious "model not
+  // found" that then misclassifies the runtime as not installed.
+  const probeArgs = [...commandPrefix, "--mode", "rpc", "--no-session",
     ...(requestedModel ? ["--model", requestedModel] : [])];
   const probe = spawn(command, probeArgs, {
     cwd: input.workspaceDir,

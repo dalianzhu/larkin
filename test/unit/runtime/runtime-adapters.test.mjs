@@ -105,7 +105,7 @@ process.stdin.on("data", (chunk) => {
     const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
     const request = JSON.parse(line); record({ kind: "request", probe, type: request.type });
     if (request.type === "get_state") {
-      if (!(${JSON.stringify(mode)} === "probe-timeout" && args.includes("--no-extensions"))) respond(request, state());
+      if (!(${JSON.stringify(mode)} === "probe-timeout" && args.includes("--no-session") && args.includes("--model"))) respond(request, state());
     } else if (request.type === "get_available_models") respond(request, {
       models: process.env.PI_CODING_AGENT_DIR ? [] : [{ provider: "test-provider", id: "test-model" }],
     });
@@ -897,7 +897,12 @@ test("production Pi probe uses isolated get_state only and preserves the verifie
     const runtimeArgs = rows.find((row) => row.kind === "argv" && !row.probe && !row.args.includes("--version"));
     assert.ok(probeArgs);
     assert.ok(probeArgs.args.includes("--no-session"), JSON.stringify(probeArgs));
-    assert.ok(probeArgs.args.includes("--no-extensions"), JSON.stringify(rows));
+    // Regression: the isolated context-window probe must NOT pass --no-extensions.
+    // Provider-registered models (e.g. Pi packages that add a `kiro/*` provider)
+    // only exist when extensions load; probing with --no-extensions made a
+    // `--model kiro/auto` probe fail with a spurious "model not found" that was
+    // then misclassified as "pi is not installed".
+    assert.equal(probeArgs.args.includes("--no-extensions"), false, JSON.stringify(rows));
     assert.equal(probeArgs.args.includes("-e"), false);
     assert.deepEqual(probeRequests, ["get_state"]);
     assert.ok(runtimeArgs.args.includes("-e"));
