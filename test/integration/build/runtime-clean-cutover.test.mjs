@@ -45,10 +45,10 @@ test("production build, start, and Agent CLI graph contain only current entries"
   assert.equal(packageJson.larkinPackageRole, "development-source-checkout");
   assert.deepEqual(packageJson.files, [
     "dist/",
-    "patches/",
     "assets/",
     "scripts/npm/",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "SECURITY.md",
     "CONTRIBUTING.md",

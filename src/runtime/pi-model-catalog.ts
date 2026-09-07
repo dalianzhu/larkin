@@ -1,6 +1,4 @@
 import { spawn as nodeSpawn } from "node:child_process";
-import * as path from "node:path";
-import { applyPiPackageDirForChild, catalogPiChildDistribution } from "./builtin-pi-assets.js";
 import { PiRpcClient, type PiRpcProcess } from "./pi-rpc-client.js";
 import { classifyRuntimePrerequisite, RuntimePrerequisiteError } from "./runtime-readiness.js";
 
@@ -35,7 +33,6 @@ export interface PiModelCatalog {
 
 export interface DiscoverPiCatalogOptions {
   cwd: string;
-  agentDir?: string;
   command?: string;
   commandArgs?: readonly string[];
   env?: NodeJS.ProcessEnv;
@@ -75,23 +72,21 @@ const discoveryCache = new Map<string, Promise<PiModelCatalog>>();
 
 /** Discover only through Pi's structured RPC protocol; no table parsing or static fallback. */
 function piCatalogChildEnv(options: DiscoverPiCatalogOptions): NodeJS.ProcessEnv {
-  const mergedEnv = {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     ...options.env,
-    ...(options.agentDir ? { PI_CODING_AGENT_DIR: path.resolve(options.agentDir) } : {}),
     NO_COLOR: "1",
   };
-  return applyPiPackageDirForChild(mergedEnv, {
-    distribution: catalogPiChildDistribution(options.commandArgs),
-    explicitPackageDir: options.packageDir,
-  });
+  // External pi 必须看见用户自己的 home；Larkin 从不注入或转发 PI_CODING_AGENT_DIR。
+  delete env.PI_CODING_AGENT_DIR;
+  return env;
 }
 
 export async function discoverPiModelCatalog(options: DiscoverPiCatalogOptions): Promise<PiModelCatalog> {
   if (!options.spawn) {
     const command = options.command ?? options.env?.LARKIN_PI_COMMAND ?? process.env.LARKIN_PI_COMMAND ?? "pi";
     const childEnv = piCatalogChildEnv(options);
-    const key = `${command}|${(options.commandArgs ?? []).join("\0")}|${childEnv.PI_CODING_AGENT_DIR ?? ""}|${options.agentDir ?? ""}|${childEnv.PI_PACKAGE_DIR ?? ""}|${options.packageDir ?? ""}`;
+    const key = `${command}|${(options.commandArgs ?? []).join("\0")}|${childEnv.PI_PACKAGE_DIR ?? ""}|${options.packageDir ?? ""}`;
     const cached = discoveryCache.get(key);
     if (cached) return cached;
     const pending = discoverPiModelCatalogUncached(options);
@@ -119,7 +114,7 @@ async function discoverPiModelCatalogUncached(options: DiscoverPiCatalogOptions)
       client.request<{ model?: PiModelLike | null; thinkingLevel?: string }>("get_state"),
     ]);
     const available = [...(availableResponse?.models ?? [])].sort((left, right) => piModelId(left).localeCompare(piModelId(right)));
-    if (!available.length) throw new Error("Pi has no authenticated available models. Run the official `pi` login flow or configure provider credentials; Larkin will not create a fallback session.");
+    if (!available.length) throw new Error("Pi has no authenticated available models. Run the official `pi` login flow; Larkin will not create a fallback session.");
     const effectiveModel = state.model ? piModelId(state.model) : null;
     if (!effectiveModel || !available.some((model) => piModelId(model) === effectiveModel)) {
       throw new Error(`Pi official default resolution returned an unavailable model (${effectiveModel || "none"}); refusing implicit fallback`);

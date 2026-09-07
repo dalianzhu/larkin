@@ -20,16 +20,24 @@ import {
 import { ProcessingEyeOrchestrator } from "./host-processing-eye.js";
 import { RUNTIME_EXTERNAL_TARGET, projectInboxEnvelope, targetKeyOfInboxEnvelope } from "../agent/inbox-projection.js";
 import { HostReminderOrchestrator } from "../agent/host-reminder-orchestrator.js";
-import { InboxAuditHeartbeat } from "../agent/inbox-audit-heartbeat.js";
-import { inboxAuditRegistryFile, observeInboxAuditTarget } from "../agent/missed-outbound-scan.js";
+import { boundedInboxAuditDiagnostic, InboxAuditHeartbeat, INBOX_AUDIT_CADENCE_MS } from "../agent/inbox-audit-heartbeat.js";
+import { discardInboxAuditTargetRetry, enqueueInboxAuditTargetRetry, hasPendingInboxAuditTargets, inboxAuditRegistryFile, inboxAuditRetryFile, observeInboxAuditTarget, reconcileInboxAuditTargetRetries } from "../agent/missed-outbound-scan.js";
 import { HostChannelBusiness } from "./host-channel-business.js";
 import { HostInteractionOrchestrator } from "./interaction-orchestrator.js";
 import { slug10, targetFor, type FeishuInboundEvent } from "./message-policy.js";
 import type { PreviousSessionRef } from "../agent/context-prompt.js";
 import type { RuntimeHost, RuntimeHostEvent, RuntimeSessionRecoveryResult } from "../runtime/runtime-host.js";
-import { providerAuthenticationFailureReadiness, RuntimePrerequisiteError } from "../runtime/runtime-readiness.js";
+import {
+  authFailureAppliesTo,
+  parsePersistedAuthFailure,
+  providerAuthenticationFailureReadiness,
+  readinessForPersistedAuthFailure,
+  RuntimePrerequisiteError,
+  type PersistedAuthFailure,
+} from "../runtime/runtime-readiness.js";
+import { safeProviderDiagnostic } from "../runtime/provider-error-classifier.js";
 import { readDocumentCommentSubscription, verifyCallbackProbe, type EffectiveDocumentCommentSubscription } from "../platform/callback-capability.js";
-import { loadConfig, resolveMentionPolicy } from "../platform/config.js";
+import { loadConfig, resolveInboxAuditSchedule, resolveMentionPolicy } from "../platform/config.js";
 import { processCommandToken } from "../app/internal-command.js";
 import { managedOfficialLarkCli } from "../app/agent-lark-cli-workspace.js";
 import { isChannelReconnecting, isRuntimeReadinessCurrent } from "../app/agent-readiness.js";
@@ -48,7 +56,6 @@ interface ConfiguredAgent {
   name: string;
   runtime: string;
   model: string;
-  piDistribution?: "external" | "builtin";
   effort?: string | null;
   displayName?: string | null;
   description?: string | null;
@@ -68,6 +75,8 @@ interface AgentState {
   agentId?: string;
   sessions: Record<string, string>;
   previousSessions?: Record<string, PreviousSessionRef>;
+  authFailureProvider?: string;
+  authFailure?: PersistedAuthFailure;
 }
 interface PendingDocumentComment {
   messageId: string;
@@ -196,9 +205,12 @@ export function memberNamesFromPayloads(payloads: readonly unknown[]): Record<st
 }
 
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+function safeRuntimeStatusDiagnostic(error: unknown): string {
+  return safeProviderDiagnostic(error, "Runtime entered an error state", 500);
+}
 function agentConfigSignature(agent: ConfiguredAgent): string {
   return JSON.stringify({
-    agentId: agent.agentId, runtime: agent.runtime, model: agent.model, piDistribution: agent.piDistribution ?? null, effort: agent.effort ?? null,
+    agentId: agent.agentId, runtime: agent.runtime, model: agent.model, effort: agent.effort ?? null,
     feishuAppId: agent.feishuAppId, feishuProfile: agent.feishuProfile,
     larkConfigDir: agent.larkConfigDir, feishuDomain: agent.feishuDomain,
     feishuAppSecret: agent.feishuAppSecret, workspaceDir: agent.workspaceDir, stateDir: agent.stateDir,
@@ -306,6 +318,61 @@ export function createHostShell({
       runtimeReadiness: { runtime: agent.runtime, state: "unavailable", reason, nextAction: "Wait for the current daemon epoch to publish Runtime readiness.", observedAt: new Date().toISOString() },
     });
   };
+  const unresolvedCurrentAuth = (agent: ConfiguredAgent): PersistedAuthFailure | null => {
+    try {
+      const persisted = parsePersistedAuthFailure(stateStore(agent).readJson<Partial<AgentState>>("agentState", {}));
+      if (!persisted) return null;
+      // 只使用当前 agentState 作用域标记，不扫描历史 delivery 的 authProvider。
+      return authFailureAppliesTo({
+        runtime: agent.runtime,
+        model: agent.model,
+      }, persisted) ? persisted : null;
+    } catch {
+      return null;
+    }
+  };
+  const projectReadyUnlessUnresolvedAuth = (agent: ConfiguredAgent, observedAt: string): void => {
+    const failure = unresolvedCurrentAuth(agent);
+    if (failure) {
+      hostState.updateStatus(agent, {
+        runtimeReadiness: { ...readinessForPersistedAuthFailure(failure), observedAt },
+      });
+      return;
+    }
+    hostState.updateStatus(agent, { runtimeReadiness: { runtime: agent.runtime, state: "ready", observedAt } });
+  };
+  const projectFallbackRuntimeReadiness = (
+    agent: ConfiguredAgent,
+    observedAt: string,
+    fallback: { state: "missing" | "unavailable"; reason: string; nextAction?: string },
+    preserveCurrentUnavailableDiagnostic = false,
+  ): void => {
+    const failure = unresolvedCurrentAuth(agent);
+    if (failure) {
+      hostState.updateStatus(agent, {
+        runtimeReadiness: { ...readinessForPersistedAuthFailure(failure), observedAt },
+      });
+      return;
+    }
+    const currentReadiness = hostState.readStatus(agent).runtimeReadiness as {
+      runtime?: string; state?: string; observedAt?: string; reason?: unknown; nextAction?: unknown;
+    } | undefined;
+    const observedMs = Date.parse(String(currentReadiness?.observedAt || ""));
+    const daemonStartedMs = Date.parse(daemonStartedAt);
+    const currentEpoch = currentReadiness?.runtime === agent.runtime
+      && Number.isFinite(observedMs) && Number.isFinite(daemonStartedMs) && observedMs >= daemonStartedMs;
+    if (currentEpoch && (currentReadiness?.state === "missing" || currentReadiness?.state === "unauthenticated" || currentReadiness?.state === "incompatible")) return;
+    if (currentEpoch && preserveCurrentUnavailableDiagnostic && currentReadiness?.state === "unavailable"
+      && typeof currentReadiness.reason === "string" && currentReadiness.reason.trim()) {
+      hostState.updateStatus(agent, {
+        runtimeReadiness: { ...currentReadiness, runtime: agent.runtime, state: "unavailable", observedAt },
+      });
+      return;
+    }
+    hostState.updateStatus(agent, {
+      runtimeReadiness: { runtime: agent.runtime, ...fallback, observedAt },
+    });
+  };
   const recordInboundDeliveryFailure = (
     agent: ConfiguredAgent,
     code: "non_retryable_receipt" | "runtime_delivery_exception" | "runtime_delivery_event",
@@ -315,20 +382,35 @@ export function createHostShell({
     const nextAction = "Inspect the delivery/status error, correct the Runtime or canonical Inbox state, then restart to replay safely.";
     hostState.updateStatus(agent, {
       inboundDeliveryHealth: { state: "error", code, at, reason, nextAction },
-      runtimeReadiness: { runtime: agent.runtime, state: "incompatible", reason, nextAction },
     });
+    projectFallbackRuntimeReadiness(agent, at, { state: "unavailable", reason, nextAction }, true);
     hostState.recordStatusError(agent, `${reason} ${nextAction} code=${code}`);
   };
   const agentStates = new Map<string, AgentStateRecord>();
+  const mergePersistedAgentState = (record: AgentStateRecord): void => {
+    const latest = record.store.readJson<Partial<AgentState>>("agentState", {});
+    if (isRecord(latest.previousSessions)) {
+      record.state.previousSessions = {
+        ...latest.previousSessions,
+        ...(record.state.previousSessions ?? {}),
+      };
+    }
+    const persisted = parsePersistedAuthFailure(latest);
+    if (persisted) {
+      record.state.authFailure = persisted;
+      if (persisted.kind === "missing-provider" && persisted.provider) {
+        record.state.authFailureProvider = persisted.provider;
+      } else {
+        delete record.state.authFailureProvider;
+      }
+    } else {
+      delete record.state.authFailure;
+      delete record.state.authFailureProvider;
+    }
+  };
   const saveAgentState = (record: AgentStateRecord): void => {
     try {
-      const latest = record.store.readJson<Partial<AgentState>>("agentState", {});
-      if (isRecord(latest.previousSessions)) {
-        record.state.previousSessions = {
-          ...latest.previousSessions,
-          ...(record.state.previousSessions ?? {}),
-        };
-      }
+      mergePersistedAgentState(record);
       record.store.writeJson("agentState", record.state);
     }
     catch (error) { log(`agent-state 写失败: ${errorMessage(error)}`); }
@@ -441,13 +523,45 @@ export function createHostShell({
   };
   for (const agent of agents) prepareAgentState(agent);
   const reminder = new HostReminderOrchestrator({ agents, stateStore, envelopeProjector, deliveryTarget: runtimeHost, log });
+  const auditRegistry = inboxAuditRegistryFile(larkinHome);
+  const auditRetryJournal = inboxAuditRetryFile(larkinHome);
+  let auditRetryTimer: NodeJS.Timeout | null = null;
+  let auditRetryAttempt = 0;
+  const reconcileAuditRetries = (): number => {
+    try { return reconcileInboxAuditTargetRetries(auditRegistry, auditRetryJournal).remaining; }
+    catch (error) { log(`inbox audit retry 读取失败: ${boundedInboxAuditDiagnostic(error)}`); return 1; }
+  };
+  const scheduleAuditRetry = (): void => {
+    if (auditRetryTimer || auditRetryAttempt >= 5) return;
+    const delay = [100, 250, 1_000, 3_000, 10_000][auditRetryAttempt++]!;
+    auditRetryTimer = setTimeout(() => {
+      auditRetryTimer = null;
+      if (reconcileAuditRetries() > 0) scheduleAuditRetry();
+      else auditRetryAttempt = 0;
+    }, delay);
+    auditRetryTimer.unref?.();
+  };
   const inboxAudit = new InboxAuditHeartbeat({
     agents,
     stateStore,
     runtimeHost,
     log,
+    configFile: path.join(larkinHome, "config.json"),
+    schedule(agent) {
+      try { return resolveInboxAuditSchedule(loadConfig(env).config, agent.agentId); }
+      catch (error) {
+        log(`inbox audit schedule 读取失败 agent=${agent.agentId}: ${errorMessage(error)}`);
+        return { enabled: false, intervalMs: INBOX_AUDIT_CADENCE_MS };
+      }
+    },
+    shouldDispatch(agent) {
+      try { return hasPendingInboxAuditTargets(auditRegistry, agent.agentId); }
+      catch (error) {
+        log(`inbox audit pending 读取失败 agent=${agent.agentId}: ${errorMessage(error)}`);
+        return false;
+      }
+    },
   });
-  const auditRegistry = inboxAuditRegistryFile(larkinHome);
   const seenEventIds = new Set<string>();
   const inFlightEventIds = new Set<string>();
   const onFeishuMessage = async (agent: ConfiguredAgent, event: FeishuInboundEvent, options?: { wake?: boolean }): Promise<void> => {
@@ -482,12 +596,18 @@ export function createHostShell({
         // An event becomes permanently transport-seen only after the canonical
         // append/dedupe decision is durable. Agent model-seen state is untouched.
         if (event.event_id) seenEventIds.add(eventKey);
-        try {
-          observeInboxAuditTarget(auditRegistry, agent.agentId, event);
-        } catch (error) {
-          log(`inbox audit target 未持久化: ${(error as Error).message}`);
-        }
         if (append.status === "duplicate_consumed") return null;
+        const auditSourceSeq = Number((append.envelope as { target_seq?: unknown }).target_seq);
+        try {
+          observeInboxAuditTarget(auditRegistry, agent.agentId, { ...event, wake, source_seq: auditSourceSeq });
+          discardInboxAuditTargetRetry(auditRetryJournal, agent.agentId, { ...event, source_seq: auditSourceSeq });
+        } catch (error) {
+          try {
+            enqueueInboxAuditTargetRetry(auditRetryJournal, agent.agentId, { ...event, wake, source_seq: auditSourceSeq });
+            scheduleAuditRetry();
+            log(`inbox audit target 延后重试: ${boundedInboxAuditDiagnostic(error)}`);
+          } catch (retryError) { log(`inbox audit target 未持久化: ${boundedInboxAuditDiagnostic(retryError)}`); }
+        }
         const inboxEnvelope = append.envelope;
         if (append.status === "appended") hostState.appendConversation(agent, {
           direction: "in", from: inboxEnvelope.sender_name, senderType: inboxEnvelope.sender_type,
@@ -1263,25 +1383,35 @@ export function createHostShell({
     if (message.type === "agent-status") {
       log("agent:status", message.agentId, message.status);
       const observedAt = new Date().toISOString();
-      if (message.status === "error" || message.status === "inactive") hostState.updateStatus(agent, {
-        runtimeReadiness: message.readiness?.state && message.readiness.state !== "ready" ? { ...message.readiness, observedAt } : {
-          runtime: agent.runtime,
-          state: message.status === "error" ? "incompatible" : "missing",
-          reason: message.status === "error" ? message.error || "Runtime entered an error state" : "Runtime is inactive",
-          observedAt,
-        },
-      });
-      else if (message.readiness) hostState.updateStatus(agent, { runtimeReadiness: { ...message.readiness, observedAt } });
-      else if (message.status === "active") hostState.updateStatus(agent, { runtimeReadiness: {
-        runtime: agent.runtime, state: "ready", observedAt,
-      } });
+      if (message.status === "error" || message.status === "inactive") {
+        if (message.readiness?.state && message.readiness.state !== "ready") {
+          hostState.updateStatus(agent, { runtimeReadiness: { ...message.readiness, observedAt } });
+        } else {
+          projectFallbackRuntimeReadiness(agent, observedAt, message.status === "error" ? {
+            state: "unavailable",
+            reason: safeRuntimeStatusDiagnostic(message.error),
+            nextAction: "Inspect the Runtime status error, correct the Runtime availability issue, then retry.",
+          } : {
+            state: "missing",
+            reason: "Runtime is inactive",
+          });
+        }
+      }
+      else if (message.readiness) {
+        if (message.readiness.state === "ready" && unresolvedCurrentAuth(agent)) {
+          projectReadyUnlessUnresolvedAuth(agent, observedAt);
+        } else {
+          hostState.updateStatus(agent, { runtimeReadiness: { ...message.readiness, observedAt } });
+        }
+      }
+      else if (message.status === "active") projectReadyUnlessUnresolvedAuth(agent, observedAt);
       if (message.status === "active") {
         const redeliveryTimer = setTimeout(() => {
           void reminder.redeliverUnread(agent).catch((error) => log("启动补投失败", errorMessage(error)));
         }, 5_000);
         redeliveryTimer.unref?.();
       }
-      if (message.status === "error" && message.error) hostState.recordStatusError(agent, message.error);
+      if (message.status === "error" && message.error) hostState.recordStatusError(agent, safeRuntimeStatusDiagnostic(message.error));
       if (message.status === "error" || message.status === "inactive") {
         processingEyes.clear(agent, `agent-status:${message.status}`);
       }
@@ -1355,6 +1485,8 @@ export function createHostShell({
       eventSourceStartTimer = null;
       await Promise.resolve(eventSourceStop());
       reminder.stopSync();
+      if (auditRetryTimer) clearTimeout(auditRetryTimer);
+      auditRetryTimer = null;
       inboxAudit.stop();
       interaction.stopSync();
       await runtimeHost.shutdown(reason);
@@ -1494,6 +1626,7 @@ export function createHostShell({
         if (record) {
           if (reset.sessionId) record.state.sessions[agent.runtime] = reset.sessionId;
           else delete record.state.sessions[agent.runtime];
+          mergePersistedAgentState(record);
           record.store.writeJson("agentState", record.state);
         }
         if (!reset.sessionId) {
@@ -1501,10 +1634,10 @@ export function createHostShell({
           hostState.updateStatus(agent, {
             session: { runtime: agent.runtime, id: null, launchId: null, startedAt: observedAt,
               lastSeenAt: null, lastTurnAt: null, turns: 0 },
-            runtimeReadiness: { runtime: agent.runtime, state: "ready", observedAt },
           });
+          projectReadyUnlessUnresolvedAuth(agent, observedAt);
         } else if (reset.runtimeReady) {
-          hostState.updateStatus(agent, { runtimeReadiness: { runtime: agent.runtime, state: "ready", observedAt: new Date().toISOString() } });
+          projectReadyUnlessUnresolvedAuth(agent, new Date().toISOString());
         }
       } catch (error) {
         const projection = readinessProjection();
@@ -1572,13 +1705,14 @@ export function createHostShell({
         throw Object.assign(error instanceof Error ? error : new Error(String(error)), readinessProjection());
       }
       if (recovery.runtimeReady) {
-        hostState.updateStatus(agent, { runtimeReadiness: { runtime: agent.runtime, state: "ready", observedAt: new Date().toISOString() } });
+        projectReadyUnlessUnresolvedAuth(agent, new Date().toISOString());
       }
       const record = agentStates.get(agentId);
       try {
         if (record) {
           if (recovery.sessionId) record.state.sessions[agent.runtime] = recovery.sessionId;
           else delete record.state.sessions[agent.runtime];
+          mergePersistedAgentState(record);
           record.store.writeJson("agentState", record.state);
         }
       } catch (error) {
@@ -1622,6 +1756,7 @@ export function createHostShell({
           previousSession: agentStates.get(agent.agentId)?.state.previousSessions?.[agent.runtime] ?? null,
         })));
         reminder.startSync();
+        if (reconcileAuditRetries() > 0) scheduleAuditRetry();
         inboxAudit.start();
         interaction.startSync();
         eventSourceStartTimer = setTimeout(() => { eventSourceStartTimer = null; startEventSource(); }, eventSourceStartDelayMs);

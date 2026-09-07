@@ -173,83 +173,22 @@ let input="";process.stdin.on("data",c=>{input+=c;for(;;){const i=input.indexOf(
   } finally { fs.rmSync(temp, { recursive: true, force: true }); }
 });
 
-test("Pi distribution CLI performs a locked snapshot mutation and rollback", () => {
-  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-pi-distribution-cli-"));
-  const app = "cli_piDistributionA1";
-  const snapshot = path.join(temp, "pi-distribution.snapshot.json");
-  try {
-    fs.writeFileSync(path.join(temp, "config.json"), `${JSON.stringify({
-      version: 4, serverId: "server-pi-distribution", mentionPolicy: "require", activeAgent: app,
-      agents: { [app]: { runtime: "pi", model: "default", piDistribution: "external" } },
-    })}\n`, { mode: 0o600 });
-    const run = (...args) => spawnSync(process.execPath, [ENTRY, ...args], {
-      cwd: ROOT, encoding: "utf8", env: { ...process.env, LARKIN_CONFIG_DIR: temp },
-    });
-    const shown = run("pi-distribution", "show", "--agent", app);
-    assert.equal(shown.status, 0, shown.stderr);
-    assert.equal(JSON.parse(shown.stdout).piDistribution, "external");
-    const providerDir = path.join(temp, "providers", "pi", app);
-    fs.mkdirSync(providerDir, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(path.join(providerDir, "auth.json"), JSON.stringify({ fixture: { type: "api_key", key: "fixture-only" } }), { mode: 0o600 });
-    const changed = run("pi-distribution", "builtin", "--agent", app, "--snapshot", snapshot);
-    assert.equal(changed.status, 0, changed.stderr);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(temp, "config.json"), "utf8")).agents[app].piDistribution, "builtin");
-    const rollback = run("pi-distribution", "rollback", "--snapshot", snapshot);
-    assert.equal(rollback.status, 0, rollback.stderr);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(temp, "config.json"), "utf8")).agents[app].piDistribution, "external");
-  } finally { fs.rmSync(temp, { recursive: true, force: true }); }
-});
-
-test("Pi distribution CLI refuses builtin without provider state before writing config or snapshot", () => {
-  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-pi-distribution-preflight-"));
-  const app = "cli_piDistributionPreflightA1";
-  const snapshot = path.join(temp, "pi-distribution.snapshot.json");
+test("pi-distribution is an unknown agent-config command and does not write config", () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-pi-distribution-removed-"));
+  const app = "cli_piDistributionRemovedA1";
   try {
     const initial = `${JSON.stringify({
-      version: 4, serverId: "server-pi-distribution-preflight", mentionPolicy: "require", activeAgent: app,
-      agents: { [app]: { runtime: "pi", model: "default", piDistribution: "external" } },
+      version: 4, serverId: "server-pi-distribution-removed", mentionPolicy: "require", activeAgent: app,
+      agents: { [app]: { runtime: "pi", model: "default" } },
     })}\n`;
     fs.writeFileSync(path.join(temp, "config.json"), initial, { mode: 0o600 });
-    const result = spawnSync(process.execPath, [ENTRY, "pi-distribution", "builtin", "--agent", app, "--snapshot", snapshot], {
+    const result = spawnSync(process.execPath, [ENTRY, "pi-distribution", "show", "--agent", app], {
       cwd: ROOT, encoding: "utf8", env: { ...process.env, LARKIN_CONFIG_DIR: temp },
     });
-    assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /provider 尚未.*配置/);
-    assert.doesNotMatch(result.stderr, new RegExp(temp.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /用法: larkin agents/);
+    assert.doesNotMatch(result.stderr, /Provider Credentials|pi-auth|import-external-profile/);
     assert.equal(fs.readFileSync(path.join(temp, "config.json"), "utf8"), initial);
-    assert.equal(fs.existsSync(snapshot), false, "failed provider preflight must not create a rollback snapshot");
-  } finally { fs.rmSync(temp, { recursive: true, force: true }); }
-});
-
-test("Pi distribution import is explicit, byte-preserving, and reverse rollback removes only the imported target", () => {
-  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-pi-distribution-import-cli-"));
-  const app = "cli_piDistributionImportA1";
-  const source = path.join(temp, "external");
-  const bin = path.join(temp, "bin");
-  const target = path.join(temp, "providers", "pi", app);
-  const snapshot = path.join(temp, "pi-distribution.snapshot.json");
-  try {
-    fs.mkdirSync(source, { recursive: true, mode: 0o755 }); fs.mkdirSync(bin, { mode: 0o700 });
-    fs.writeFileSync(path.join(bin, "pi"), `#!${process.execPath}\nconsole.log("0.84.2")\n`, { mode: 0o700 });
-    fs.writeFileSync(path.join(source, "auth.json"), JSON.stringify({ fixture: { key: "PRIVATE" } }) + "\n", { mode: 0o600 });
-    fs.writeFileSync(path.join(source, "models.json"), JSON.stringify({ providers: { fixture: {} } }) + "\n", { mode: 0o644 });
-    fs.writeFileSync(path.join(source, "settings.json"), JSON.stringify({ theme: "dark", compaction: { enabled: false } }) + "\n", { mode: 0o644 });
-    const initial = { version: 4, serverId: "server-pi-distribution-import", mentionPolicy: "require", activeAgent: app,
-      agents: { [app]: { runtime: "pi", model: "fixture/model", piDistribution: "external" } } };
-    fs.writeFileSync(path.join(temp, "config.json"), `${JSON.stringify(initial)}\n`, { mode: 0o600 });
-    const run = (...args) => spawnSync(process.execPath, [ENTRY, ...args], { cwd: ROOT, encoding: "utf8",
-      env: { ...process.env, HOME: temp, PATH: `${bin}:/usr/bin:/bin`, LARKIN_CONFIG_DIR: temp, PI_CODING_AGENT_DIR: source } });
-    const imported = run("pi-distribution", "builtin", "--agent", app, "--snapshot", snapshot, "--import-external-profile");
-    assert.equal(imported.status, 0, imported.stderr);
-    assert.deepEqual(fs.readFileSync(path.join(target, "auth.json")), fs.readFileSync(path.join(source, "auth.json")));
-    assert.deepEqual(fs.readFileSync(path.join(target, "models.json")), fs.readFileSync(path.join(source, "models.json")));
-    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(target, "settings.json"))).compaction,
-      { enabled: true, reserveTokens: 40800, keepRecentTokens: 20000 });
-    assert.equal(JSON.parse(fs.readFileSync(snapshot, "utf8")).migration.sourceFiles["auth.json"].sha256.length, 64);
-    const rolled = run("pi-distribution", "rollback", "--snapshot", snapshot);
-    assert.equal(rolled.status, 0, rolled.stderr);
-    assert.equal(fs.existsSync(target), false);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(temp, "config.json"))).agents[app].piDistribution, "external");
   } finally { fs.rmSync(temp, { recursive: true, force: true }); }
 });
 
@@ -300,6 +239,7 @@ test("TypeScript agent-config bridge preserves listing, fail-closed selection, a
           agent_id: first,
           name: first,
           runtime: "codex",
+          runtimeOption: "codex",
           model: "gpt-5.3-codex",
           document_comment: { event: "drive.notice.comment_add_v1", category: "not_requested", reason: "setup_required", requested_at: null,
             reply_scope: "docs:document.comment:create", reply_requested_at: null, event_verified_at: null, accepted_at: null, last_error: null, last_error_at: null,
@@ -317,6 +257,7 @@ test("TypeScript agent-config bridge preserves listing, fail-closed selection, a
           agent_id: second,
           name: second,
           runtime: "claude",
+          runtimeOption: "claude",
           model: "claude-sonnet-4-5",
           document_comment: { event: "drive.notice.comment_add_v1", category: "not_requested", reason: "setup_required", requested_at: null,
             reply_scope: "docs:document.comment:create", reply_requested_at: null, event_verified_at: null, accepted_at: null, last_error: null, last_error_at: null,
@@ -367,7 +308,7 @@ test("TypeScript agent-config bridge preserves listing, fail-closed selection, a
     const beforeInvalid = fs.readFileSync(configFile, "utf8");
     const invalidRuntime = run("runtime", "not-a-runtime", "--agent", first);
     assert.equal(invalidRuntime.status, 1);
-    assert.match(invalidRuntime.stderr, /不是合法 runtime/);
+    assert.match(invalidRuntime.stderr, /未知 runtime/);
     assert.equal(fs.readFileSync(configFile, "utf8"), beforeInvalid, "invalid catalog choice must fail before write");
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
@@ -600,5 +541,102 @@ let input="";process.stdin.on("data",c=>{input+=c;for(;;){const i=input.indexOf(
     assert.match(apply.stderr, /已保存但未应用/);
     const stillPending = JSON.parse(run("config", "show", "--agent", app, "--json").stdout);
     assert.equal(stillPending.agents[0].apply.applyState, "pending");
+  } finally { fs.rmSync(temp, { recursive: true, force: true }); }
+});
+
+function writeFakePiRecorder(bin, logFile) {
+  fs.mkdirSync(bin, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(bin, "pi"), `#!${process.execPath}
+import fs from "node:fs";
+fs.appendFileSync(${JSON.stringify(logFile)}, JSON.stringify({
+  agentDir: process.env.PI_CODING_AGENT_DIR || null,
+  argv: process.argv.slice(2),
+}) + "\\n");
+process.exit(1);
+`, { mode: 0o755 });
+}
+
+test("larkin model discovers Pi catalog from the user install and ignores a host decoy dir", () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-pi-catalog-isolation-cli-"));
+  const first = "cli_piCatalogFirstA1";
+  const second = "cli_piCatalogSecondB2";
+  const decoy = path.join(temp, "decoy-host-pi");
+  const logFile = path.join(temp, "fake-pi.log");
+  const bin = path.join(temp, "bin");
+  try {
+    writeFakePiRecorder(bin, logFile);
+    fs.writeFileSync(logFile, "");
+    fs.mkdirSync(path.join(temp, "agents", first), { recursive: true });
+    fs.mkdirSync(path.join(temp, "agents", second), { recursive: true });
+    fs.writeFileSync(path.join(temp, "config.json"), `${JSON.stringify({
+      version: 4, serverId: "server-pi-catalog-isolation", mentionPolicy: "require", activeAgent: second,
+      agents: {
+        [first]: { runtime: "pi", model: "default" },
+        [second]: { runtime: "pi", model: "default" },
+      },
+    })}\n`, { mode: 0o600 });
+    const env = {
+      ...process.env,
+      HOME: temp,
+      PATH: `${bin}:/usr/bin:/bin`,
+      LARKIN_CONFIG_DIR: temp,
+      PI_CODING_AGENT_DIR: decoy,
+    };
+    const run = (...args) => spawnSync(process.execPath, [ENTRY, ...args], {
+      cwd: ROOT, encoding: "utf8", env, timeout: 30_000,
+    });
+    const decoyPattern = new RegExp(decoy.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+
+    const listed = run("model", "--agent", second);
+    assert.match(listed.stdout, /runtime=pi\b/);
+    assert.doesNotMatch(listed.stdout, /runtime=builtin-pi|发行版|用户安装的 Pi|内置 Pi/);
+    assert.doesNotMatch(`${listed.stdout}\n${listed.stderr}`, decoyPattern);
+    const recorded = fs.readFileSync(logFile, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    assert.ok(recorded.length >= 1, "Pi catalog must spawn host pi");
+    for (const row of recorded) {
+      assert.equal(row.agentDir, null);
+    }
+  } finally { fs.rmSync(temp, { recursive: true, force: true }); }
+});
+
+test("larkin runtime rejects builtin-pi and a missing executable without writing config", () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-runtime-missing-cli-"));
+  const app = "cli_runtimeMissingA1";
+  try {
+    const initial = `${JSON.stringify({
+      version: 4, serverId: "server-runtime-missing", mentionPolicy: "require", activeAgent: app,
+      agents: { [app]: { runtime: "pi", model: "default" } },
+    })}\n`;
+    fs.writeFileSync(path.join(temp, "config.json"), initial, { mode: 0o600 });
+    const emptyBin = path.join(temp, "empty-bin");
+    fs.mkdirSync(emptyBin, { mode: 0o700 });
+    const run = (...args) => spawnSync(process.execPath, [ENTRY, ...args], {
+      cwd: ROOT, encoding: "utf8",
+      env: { ...process.env, PATH: emptyBin, LARKIN_CONFIG_DIR: temp, LARKIN_CLAUDE_COMMAND: "claude-missing-for-runtime" },
+    });
+    const listed = run("runtime", "--agent", app);
+    assert.equal(listed.status, 0, listed.stderr);
+    assert.match(listed.stdout, /runtime=pi\b/);
+    assert.doesNotMatch(listed.stdout, /builtin-pi/);
+
+    const unknown = run("runtime", "builtin-pi", "--agent", app);
+    assert.notEqual(unknown.status, 0);
+    assert.match(`${unknown.stdout}\n${unknown.stderr}`, /未知 runtime：builtin-pi/);
+    assert.doesNotMatch(`${unknown.stdout}\n${unknown.stderr}`, /pi-auth|Provider Credentials|import-external-profile/);
+    assert.equal(fs.readFileSync(path.join(temp, "config.json"), "utf8"), initial);
+
+    const missing = run("runtime", "claude", "--agent", app);
+    assert.notEqual(missing.status, 0);
+    assert.match(`${missing.stdout}\n${missing.stderr}`, /claude is not installed/);
+    assert.match(`${missing.stdout}\n${missing.stderr}`, /LARKIN_CLAUDE_COMMAND|Install Claude Code/);
+    assert.equal(fs.readFileSync(path.join(temp, "config.json"), "utf8"), initial);
+
+    const publicMissing = spawnSync(process.execPath, [PUBLIC_ENTRY, "config", "runtime", "claude", "--agent", app], {
+      cwd: ROOT, encoding: "utf8",
+      env: { ...process.env, PATH: emptyBin, LARKIN_CONFIG_DIR: temp, LARKIN_CLAUDE_COMMAND: "claude-missing-for-runtime" },
+    });
+    assert.notEqual(publicMissing.status, 0);
+    assert.match(`${publicMissing.stdout}\n${publicMissing.stderr}`, /claude is not installed/);
+    assert.equal(fs.readFileSync(path.join(temp, "config.json"), "utf8"), initial);
   } finally { fs.rmSync(temp, { recursive: true, force: true }); }
 });

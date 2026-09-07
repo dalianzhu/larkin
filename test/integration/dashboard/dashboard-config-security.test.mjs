@@ -82,6 +82,23 @@ test("dashboard config API is sanitized, same-origin/CSRF protected, bounded, an
     assert.equal(stored.mentionPolicy, "free");
     assert.deepEqual(stored.agents[APP].chatMentionPolicies, { oc_legacy: "free" });
 
+    const savedGapOnly = await fetch(`${base}/api/config`, {
+      method: "PATCH", headers: { "Content-Type": "application/json", Origin: base, "X-Larkin-CSRF": csrf },
+      body: JSON.stringify({ operation: "set-global-inbox-audit", intervalMs: 90_000 }),
+    });
+    assert.equal(savedGapOnly.status, 200);
+    const savedAgentAudit = await fetch(`${base}/api/config`, {
+      method: "PATCH", headers: { "Content-Type": "application/json", Origin: base, "X-Larkin-CSRF": csrf },
+      body: JSON.stringify({ operation: "set-agent-inbox-audit", agentId: APP, enabled: true, intervalMs: 30 * 60_000 }),
+    });
+    assert.equal(savedAgentAudit.status, 200);
+    const auditView = await fetch(`${base}/api/config`, { headers: privateHeaders }).then((response) => response.json());
+    assert.deepEqual(auditView.inboxAudit, { enabled: false, intervalMs: 90_000 }, "saving only the global gap must not enable audit");
+    assert.deepEqual(auditView.agents[0].inboxAudit, {
+      override: { enabled: "on", intervalMs: 30 * 60_000 }, effective: { enabled: true, intervalMs: 30 * 60_000 },
+      source: { enabled: "agent", intervalMs: "agent" },
+    });
+
     const inherit = await fetch(`${base}/api/config`, { method: "PATCH", headers: { "Content-Type": "application/json", Origin: base, "X-Larkin-CSRF": csrf }, body: JSON.stringify({ operation: "set-chat-mention", agentId: APP, chatId: "oc_legacy", value: "inherit" }) });
     assert.equal(inherit.status, 200);
     const afterInherit = await fetch(`${base}/api/config`, { headers: privateHeaders }).then((response) => response.json());
@@ -93,6 +110,75 @@ test("dashboard config API is sanitized, same-origin/CSRF protected, bounded, an
     assert.deepEqual([applyMissingOrigin.status, applyBadCsrf.status, applyOffline.status], [409, 409, 409]);
     const pendingView = await fetch(`${base}/api/config`, { headers: privateHeaders }).then((response) => response.json());
     assert.equal(pendingView.agents[0].apply.applyState, "pending");
+  } finally {
+    child.kill("SIGINT");
+    await Promise.race([new Promise((resolve) => child.once("exit", resolve)), new Promise((resolve) => setTimeout(resolve, 3_000))]);
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("removed pi-auth routes 404 like unknown routes; remaining config routes keep loopback/CSRF/no-store/16KB checks", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-dashboard-pi-auth-sec-"));
+  const port = await freePort();
+  fs.writeFileSync(path.join(root, "config.json"), `${JSON.stringify({
+    version: 4, serverId: "server-secret-internal", activeAgent: APP, mentionPolicy: "require",
+    agents: { [APP]: { runtime: "pi", model: "default", createdAt: "2026-09-04T00:00:00.000Z" } },
+  })}\n`, { mode: 0o600 });
+  const child = spawn(process.execPath, [path.join(ROOT, "dist/app/dashboard.mjs"), "--port", String(port)], {
+    cwd: ROOT, env: { ...process.env, LARKIN_CONFIG_DIR: root }, stdio: ["ignore", "pipe", "pipe"],
+  });
+  let output = "";
+  child.stdout.on("data", (chunk) => { output += chunk; });
+  child.stderr.on("data", (chunk) => { output += chunk; });
+  try {
+    const deadline = Date.now() + 5_000;
+    while (!output.includes(`http://localhost:${port}`) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.match(output, new RegExp(`http://localhost:${port}`));
+    const base = `http://localhost:${port}`;
+    const page = await fetch(`${base}/`).then((response) => response.text());
+    const csrf = JSON.parse(page.match(/"csrfCapability":("[^"]+")/)?.[1] || "null");
+    const privateHeaders = { "X-Larkin-CSRF": csrf };
+    const unknown = await fetch(`${base}/api/does-not-exist`);
+    assert.equal(unknown.status, 404);
+    for (const pathname of ["/api/pi-auth/providers", `/api/pi-auth/status?agent=${APP}`, "/api/models/builtin-pi"]) {
+      const response = await fetch(`${base}${pathname}`, { headers: privateHeaders });
+      assert.equal(response.status, 404, pathname);
+    }
+    for (const pathname of ["/api/pi-auth/login", "/api/pi-auth/logout"]) {
+      const response = await fetch(`${base}${pathname}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Origin: base, "X-Larkin-CSRF": csrf },
+        body: JSON.stringify({ agentId: APP, provider: "deepseek" }),
+      });
+      assert.equal(response.status, 404, pathname);
+    }
+
+    const config = await fetch(`${base}/api/config`, { headers: privateHeaders });
+    assert.equal(config.status, 200);
+    assert.equal(config.headers.get("cache-control"), "no-store");
+    const view = await config.json();
+    assert.deepEqual(view.runtimeOptions, ["codex", "claude", "pi"]);
+    assert.equal(view.agents[0].runtimeOption, "pi");
+
+    const raw = JSON.stringify({ operation: "set-global-mention", value: "free" });
+    const rejected = [
+      await fetch(`${base}/api/config`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: raw }),
+      await fetch(`${base}/api/config`, { method: "PATCH", headers: { "Content-Type": "application/json", Origin: "https://evil.example", "X-Larkin-CSRF": csrf }, body: raw }),
+      await fetch(`${base}/api/config`, { method: "PATCH", headers: { "Content-Type": "application/json", Origin: base, "X-Larkin-CSRF": "wrong" }, body: raw }),
+      await fetch(`${base}/api/config`, { method: "PATCH", headers: { "Content-Type": "application/json", Origin: base, "X-Larkin-CSRF": csrf }, body: JSON.stringify({ operation: "set-global-mention", value: "free", padding: "x".repeat(17_000) }) }),
+    ];
+    assert.deepEqual(rejected.map((response) => response.status), [400, 400, 400, 400]);
+    for (const response of rejected) {
+      assert.equal(response.headers.get("cache-control"), "no-store");
+    }
+    const accepted = await fetch(`${base}/api/config`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Origin: base, "X-Larkin-CSRF": csrf },
+      body: raw,
+    });
+    assert.equal(accepted.status, 200);
+    assert.equal(accepted.headers.get("cache-control"), "no-store");
   } finally {
     child.kill("SIGINT");
     await Promise.race([new Promise((resolve) => child.once("exit", resolve)), new Promise((resolve) => setTimeout(resolve, 3_000))]);

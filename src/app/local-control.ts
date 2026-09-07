@@ -9,8 +9,13 @@ import { currentProcessMetadata } from "../platform/process-inspect.cjs";
 import { processCommandToken } from "./internal-command.js";
 import { isWindows, notGroupOrWorldAccessible, secureWindowsDirectoryAcl } from "../platform/secure-metadata.js";
 
-export interface AgentUpsertRequest { operationId: string; agentId: string; authorization: string }
-export type AgentUpsertOperation = Pick<AgentUpsertRequest, "operationId" | "agentId">;
+export interface AgentUpsertRequest {
+  operationId: string;
+  agentId: string;
+  authorization: string;
+  expectedSignature?: string;
+}
+export type AgentUpsertOperation = Pick<AgentUpsertRequest, "operationId" | "agentId" | "expectedSignature">;
 export interface AgentUpsertResponse { ok: boolean; operationId: string; agentId: string; code?: string; error?: string; readiness?: RuntimeReadiness }
 export interface DashboardRecoveryResponse { ok: boolean; operationId: string; state?: string; error?: string }
 export interface AgentEnqueueInput {
@@ -75,6 +80,7 @@ const AUTHORIZATION = /^[A-Za-z0-9_-]{43,128}$/;
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
 const MAX_CONTROL_REQUEST_BYTES = 65_536;
 const MAX_EXTERNAL_CONTENT_BYTES = 32_768;
+const CONFIG_SIGNATURE = /^sha256:[a-f0-9]{64}$/;
 const UNIX_SOCKET_PATH_MAX_BYTES = process.platform === "darwin" ? 103 : 107;
 
 function recoveryErrorText(code: string | undefined): string {
@@ -233,8 +239,12 @@ function parseRequest(line: string): AgentControlRequest {
   if (value.waitReadyMs !== undefined) {
     throw new Error("invalid session reset waitReadyMs");
   }
-  if (Object.keys(value).some((key) => !["operationId", "agentId", "authorization"].includes(key))) {
+  if (Object.keys(value).some((key) => !["operationId", "agentId", "authorization", "expectedSignature"].includes(key))) {
     throw new Error("agent control request 包含未知字段");
+  }
+  if (value.expectedSignature !== undefined
+      && (typeof value.expectedSignature !== "string" || !CONFIG_SIGNATURE.test(value.expectedSignature))) {
+    throw new Error("invalid agent upsert expectedSignature");
   }
   return value as unknown as AgentUpsertRequest;
 }
@@ -830,7 +840,11 @@ export function createAgentControlServer({
             }
             const execute = async (): Promise<AgentUpsertResponse> => {
               try {
-                await upsert({ operationId: upsertRequest.operationId, agentId: upsertRequest.agentId });
+                await upsert({
+                  operationId: upsertRequest.operationId,
+                  agentId: upsertRequest.agentId,
+                  ...(upsertRequest.expectedSignature ? { expectedSignature: upsertRequest.expectedSignature } : {}),
+                });
                 return { ok: true, operationId: upsertRequest.operationId, agentId: upsertRequest.agentId };
               } catch (error) {
                 return { ok: false, operationId: upsertRequest.operationId, agentId: upsertRequest.agentId,
@@ -1018,10 +1032,15 @@ export async function requestAgentUpsert(input: {
   larkinHome: string;
   agentId: string;
   operationId?: string;
+  expectedSignature?: string;
   timeoutMs?: number;
 }): Promise<AgentUpsertResponse> {
   return requestAgentControl<AgentUpsertResponse>({ larkinHome: input.larkinHome, timeoutMs: input.timeoutMs,
-    request: { operationId: input.operationId ?? crypto.randomUUID(), agentId: input.agentId } });
+    request: {
+      operationId: input.operationId ?? crypto.randomUUID(),
+      agentId: input.agentId,
+      ...(input.expectedSignature ? { expectedSignature: input.expectedSignature } : {}),
+    } });
 }
 
 export async function requestSessionReset({

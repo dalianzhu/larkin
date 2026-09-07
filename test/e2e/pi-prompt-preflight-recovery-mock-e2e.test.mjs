@@ -14,6 +14,10 @@ import { createNativeRuntimeAdapter } from "../../dist/runtime/runtime-adapters.
 import { PiCompactionBreaker } from "../../dist/runtime/pi-compaction-recovery.mjs";
 import { createRuntimeHost } from "../../dist/runtime/runtime-host.mjs";
 
+function isolatedPiInput(input, root) {
+  return { ...input, env: { ...input.env, LARKIN_CONFIG_DIR: root, LARKIN_HOME: root, HOME: path.join(root, "home") } };
+}
+
 class PreflightPiProcess extends EventEmitter {
   stdout = new PassThrough();
   stderr = new PassThrough();
@@ -63,7 +67,7 @@ test("production-order Pi preflight progress preserves one durable Inbox deliver
     maxFiles: 100, maxAgeMs: 60_000, uploadIntervalMs: 60_000, requestTimeoutMs: 2_000 };
   const telemetry = createTelemetryRuntime(telemetryConfig, { stateDirFor: () => stateDir });
   const native = createNativeRuntimeAdapter("pi", {
-    env: { LARKIN_PI_DISTRIBUTION: "builtin", LARKIN_CONFIG_DIR: path.join(root, "config") },
+    env: { LARKIN_CONFIG_DIR: path.join(root, "config") },
     spawn: () => { spawnCount += 1; return child; },
     piRpcClientOptions: { requestTimeoutMs: 5, inputTimeoutMs: 20, inputProgressTimeoutMs: 40, inputMaxTimeoutMs: 100 },
   });
@@ -76,8 +80,8 @@ test("production-order Pi preflight progress preserves one durable Inbox deliver
   const envelope = { message_id: messageId, target, content: "PRIVATE_PROMPT_BODY", wake: true };
   try {
     fs.mkdirSync(workspaceDir, { recursive: true });
-    await host.start([{ agentId, name: agentId, runtime: "pi", model: "default", piDistribution: "builtin",
-      workspaceDir, stateDir, env: { LARKIN_PI_DISTRIBUTION: "builtin", LARKIN_CONFIG_DIR: path.join(root, "config") } }]);
+    await host.start([{ agentId, name: agentId, runtime: "pi", model: "default",
+      workspaceDir, stateDir, env: { LARKIN_CONFIG_DIR: path.join(root, "config") } }]);
     store.prepareInboxDelivery(envelope); telemetry.beginMessage(agentId, messageId);
     const delivery = telemetry.phase(messageId, "runtime.deliver", SpanKind.PRODUCER, () => host.deliver(agentId, envelope));
     await new Promise((resolve) => setTimeout(resolve, 25));
@@ -138,14 +142,14 @@ test("production-shaped Pi RPC Mock proves native retry lifecycle is correlated 
     } else if (request.type === "compact") compactCount += 1;
     return true;
   }, end() {} };
-  const native = createNativeRuntimeAdapter("pi", { env: { LARKIN_PI_DISTRIBUTION: "builtin" }, spawn: () => child });
-  const adapter = { id: native.id, capabilities: native.capabilities, probe: async () => ({ runtime: "pi", state: "ready" }), createSession: (input) => native.createSession(input) };
+  const native = createNativeRuntimeAdapter("pi", { spawn: () => child });
+  const adapter = { id: native.id, capabilities: native.capabilities, probe: async () => ({ runtime: "pi", state: "ready" }), createSession: (input) => native.createSession(isolatedPiInput(input, root)) };
   const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store,
     assertOfficialCliReady: () => {}, retryPolicy: { baseDelayMs: 2, maxDelayMs: 2, maxAttempts: 1 } });
   const target = "chat:oc_native_retry";
   try {
     fs.mkdirSync(workspaceDir, { recursive: true });
-    await host.start([{ agentId, name: agentId, runtime: "pi", model: "default", piDistribution: "builtin", workspaceDir, stateDir }]);
+    await host.start([{ agentId, name: agentId, runtime: "pi", model: "default", workspaceDir, stateDir }]);
     store.prepareInboxDelivery({ message_id: messageId, target, content: "native retry", wake: true });
     const receipt = await host.deliver(agentId, { message_id: messageId, target, content: "native retry", wake: true });
     assert.equal(receipt.status, "accepted");
@@ -204,11 +208,11 @@ class RecoveryPiProcess extends EventEmitter {
 
 function recoveryHost(root, scenario, sessions, store, target = `chat:oc_${scenario}`) {
   const workspaceDir = path.join(root, "workspace"); fs.mkdirSync(workspaceDir, { recursive: true });
-  const native = createNativeRuntimeAdapter("pi", { env: { LARKIN_PI_DISTRIBUTION: "builtin" }, spawn: () => {
+  const native = createNativeRuntimeAdapter("pi", { spawn: () => {
     const child = new RecoveryPiProcess(sessions.length, scenario, () => store.pollInbox({ target })); sessions.push(child); return child;
   }, piRpcClientOptions: { requestTimeoutMs: 50, inputTimeoutMs: 100, inputProgressTimeoutMs: 100, inputMaxTimeoutMs: 500 } });
   const adapter = { id: native.id, capabilities: native.capabilities, probe: async () => ({ runtime: "pi", state: "ready" }),
-    createSession: (input) => native.createSession(input) };
+    createSession: (input) => native.createSession(isolatedPiInput(input, root)) };
   return createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store,
     assertOfficialCliReady: () => {}, retryPolicy: { baseDelayMs: 2, maxDelayMs: 2, maxAttempts: 1 } });
 }
@@ -227,7 +231,7 @@ async function runRecoveryScenario(scenario, expectedSessions, expectedCompacts,
   const store = createAgentStateStore(root, agentId); const sessions = []; const host = recoveryHost(root, scenario, sessions, store);
   const envelope = { message_id: messageId, target, content: `recovery ${scenario}`, wake: true };
   try {
-    await host.start([{ agentId, name: agentId, runtime: "pi", model: "default", piDistribution: "builtin",
+    await host.start([{ agentId, name: agentId, runtime: "pi", model: "default",
       workspaceDir: path.join(root, "workspace"), stateDir }]);
     store.prepareInboxDelivery(envelope);
     const receipt = await host.deliver(agentId, envelope); assert.equal(receipt.status, "accepted");
@@ -254,7 +258,7 @@ test("production RuntimeHost RPC events manual success plus exact second overflo
   await runRecoveryScenario("manual-second", 2, 1, 3, 3, 3);
 });
 
-test("production RuntimeHost restart table deterministically falls back durable manual/native states without compact", async () => {
+test("production RuntimeHost restart table deterministically falls back durable manual/native states without compact", { timeout: 20_000 }, async () => {
   for (const state of ["manual_sent", "manual_ambiguous", "native_failed"]) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), `larkin-pi-restart-${state}-e2e-`));
     const agentId = `cli_restart${state.replace(/[^A-Za-z0-9]/g, "")}A1`; const messageId = `om_restart_${state}`;
@@ -270,9 +274,9 @@ test("production RuntimeHost restart table deterministically falls back durable 
         input: { inputId, deliveryId, kind: "wake", text: `restart ${state}`, attempt: 1 }, reason: "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again.", updatedAt: new Date().toISOString() }] });
       breaker.save(record);
       const host = recoveryHost(root, "restart", sessions, store, target);
-      await host.start([{ agentId, name: agentId, runtime: "pi", model: "default", piDistribution: "builtin",
+      await host.start([{ agentId, name: agentId, runtime: "pi", model: "default",
         workspaceDir: path.join(root, "workspace"), stateDir }]);
-      await waitUntil(() => sessions.length >= 2 && sessions.at(-1).promptCount > 0, `${state} restart fallback`);
+      await waitUntil(() => sessions.length >= 2 && sessions.at(-1).promptCount > 0, `${state} restart fallback`, 4_000);
       store.pollInbox({ target }); await new Promise((resolve) => setImmediate(resolve));
       assert.equal(sessions.reduce((count, session) => count + session.compactCount, 0), 0);
       assert.equal(store.readJson("runtimeDeliveries", { records: [] }).records[0].status, "consumed");
@@ -297,7 +301,7 @@ test("external Pi production-order preflight timeout stays bounded, pending, obs
     piRpcClientOptions: { requestTimeoutMs: 5, inputTimeoutMs: 15, inputProgressTimeoutMs: 25, inputMaxTimeoutMs: 50 },
   });
   const adapter = { id: native.id, capabilities: native.capabilities,
-    probe: async () => ({ runtime: "pi", state: "ready" }), createSession: (input) => native.createSession(input) };
+    probe: async () => ({ runtime: "pi", state: "ready" }), createSession: (input) => native.createSession(isolatedPiInput(input, root)) };
   const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(),
     stateStoreFor: () => store, telemetry, retryPolicy: { baseDelayMs: 2, maxDelayMs: 2, maxAttempts: 0 },
     assertOfficialCliReady: () => {} });
@@ -305,7 +309,7 @@ test("external Pi production-order preflight timeout stays bounded, pending, obs
   const envelope = { message_id: messageId, target, content: "PRIVATE_TIMEOUT_BODY", wake: true };
   try {
     fs.mkdirSync(workspaceDir, { recursive: true });
-    await host.start([{ agentId, name: agentId, runtime: "pi", model: "default", piDistribution: "external",
+    await host.start([{ agentId, name: agentId, runtime: "pi", model: "default",
       workspaceDir, stateDir }]);
     store.prepareInboxDelivery(envelope); telemetry.beginMessage(agentId, messageId);
     const receipt = await telemetry.phase(messageId, "runtime.deliver", SpanKind.PRODUCER, () => host.deliver(agentId, envelope));
@@ -331,6 +335,80 @@ test("external Pi production-order preflight timeout stays bounded, pending, obs
     }
   } finally {
     await host.shutdown("test cleanup").catch(() => {}); await telemetry.shutdown().catch(() => {});
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("real Pi adapter missing-key RPC rejection terminals the ledger and projects unauthenticated", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-pi-missing-key-e2e-"));
+  const agentId = "cli_piMissingKeyA1";
+  const messageId = "om_missing_key_rpc";
+  const stateDir = path.join(root, "state", "agents", agentId);
+  const workspaceDir = path.join(root, "workspace");
+  const store = createAgentStateStore(root, agentId);
+  const previousConfigDir = process.env.LARKIN_CONFIG_DIR;
+  const previousHome = process.env.HOME;
+  const configDir = path.join(root, "config");
+  let rejectMissing = true;
+  let sdkListener;
+  const sdk = {
+    sessionId: "pi-missing-key-session",
+    prompt() {
+      if (rejectMissing) throw new Error("Pi RPC prompt failed: No API key found for zai-coding-cn");
+    },
+    steer() {},
+    abort() {},
+    subscribe(next) { sdkListener = next; return () => { sdkListener = undefined; }; },
+  };
+  process.env.LARKIN_CONFIG_DIR = configDir;
+  process.env.HOME = path.join(root, "decoy-home");
+  const native = createNativeRuntimeAdapter("pi", {
+    env: { LARKIN_CONFIG_DIR: configDir },
+    createPiSession: async () => sdk,
+  });
+  const adapter = { id: native.id, capabilities: native.capabilities,
+    probe: async () => ({ runtime: "pi", state: "ready" }), createSession: (input) => native.createSession(input) };
+  const events = [];
+  const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(),
+    stateStoreFor: () => store, assertOfficialCliReady: () => {},
+    retryPolicy: { baseDelayMs: 60_000, maxDelayMs: 60_000, maxAttempts: 0 } });
+  host.subscribe((event) => events.push(event));
+  const target = "chat:oc_missing_key_rpc";
+  try {
+    fs.mkdirSync(workspaceDir, { recursive: true });
+    await host.start([{ agentId, name: agentId, runtime: "pi", model: "zai-coding-cn/glm-5.2",
+      workspaceDir, stateDir, env: { LARKIN_CONFIG_DIR: configDir } }]);
+    store.prepareInboxDelivery({ message_id: messageId, target, content: "missing key", wake: true });
+    const receipt = await host.deliver(agentId, { message_id: messageId, target, content: "missing key", wake: true });
+    assert.equal(receipt.status, "error");
+    assert.equal(receipt.retryable, false);
+    assert.match(receipt.reason, /zai-coding-cn/);
+    const record = store.readJson("runtimeDeliveries", { records: [] }).records[0];
+    assert.equal(record.status, "error");
+    assert.equal(record.retryable, false);
+    assert.equal(record.errorCategory, "auth");
+    const status = events.filter((event) => event.type === "agent-status").at(-1);
+    assert.equal(status.readiness.state, "unauthenticated");
+    assert.match(status.readiness.nextAction, /external `pi` CLI/);
+    assert.match(status.readiness.nextAction, /zai-coding-cn/);
+    assert.doesNotMatch(JSON.stringify(events), /pi-auth|Provider Credentials/);
+    assert.equal(events.filter((event) => event.type === "delivery" && event.status === "deferred").length, 0);
+
+    rejectMissing = false;
+    const retry = await host.deliver(agentId, { message_id: messageId, target, content: "missing key", wake: true });
+    assert.equal(retry.status, "accepted");
+    sdkListener({ type: "turn_start", turnIndex: 0 });
+    sdkListener({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "authenticated fixture output" } });
+    sdkListener({ type: "agent_end", willRetry: false, messages: [{ role: "assistant", provider: "zai-coding-cn", stopReason: "stop" }] });
+    sdkListener({ type: "agent_settled" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(events.filter((event) => event.type === "agent-status").at(-1).readiness.state, "ready");
+  } finally {
+    await host.shutdown("missing-key adapter e2e complete").catch(() => {});
+    if (previousConfigDir === undefined) delete process.env.LARKIN_CONFIG_DIR;
+    else process.env.LARKIN_CONFIG_DIR = previousConfigDir;
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

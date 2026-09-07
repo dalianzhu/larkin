@@ -8,7 +8,14 @@ import { createHostShell } from "../../../dist/feishu/host-shell.mjs";
 
 const testManagedCli = () => ({ command: { command: "/test/official-lark-cli", argsPrefix: [], version: "1.0.80" }, env: {} });
 
-for (const mode of ["error-receipt", "throw-after-persist", "async-input-error"]) {
+for (const { mode, explicitReadiness, runtimeError } of [
+  { mode: "error-receipt", explicitReadiness: "missing" },
+  { mode: "throw-after-persist", explicitReadiness: "unauthenticated" },
+  { mode: "async-input-error", explicitReadiness: "incompatible" },
+  { mode: "generic-error", explicitReadiness: null },
+  { mode: "provider-403-delivery", explicitReadiness: null,
+    runtimeError: "provider request failed with HTTP 403 Authorization: Bearer issue124-status-token\nCookie: session=issue124-status-cookie\n/Users/issue124/private/settings.json" },
+]) {
   test(`HostShell ${mode} keeps Inbox durable and degrades visible health without raw Runtime error data`, { timeout: 10_000 }, async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), `larkin-host-delivery-health-${mode}-`));
     const agentId = `cli_issue124Health${mode === "error-receipt" ? "Receipt" : mode === "throw-after-persist" ? "Throw" : "Async"}A1`;
@@ -56,6 +63,13 @@ for (const mode of ["error-receipt", "throw-after-persist", "async-input-error"]
     try {
       await host.start();
       assert.equal(store.readJson("status", {}).runtimeReadiness.state, "ready");
+      if (explicitReadiness) {
+        listener({ type: "agent-status", agentId, status: "error", readiness: {
+          runtime: "codex", state: explicitReadiness,
+          reason: `explicit ${explicitReadiness} prerequisite`, nextAction: `resolve explicit ${explicitReadiness} prerequisite`,
+        } });
+      }
+      if (runtimeError) listener({ type: "agent-status", agentId, status: "error", error: runtimeError, readiness: { runtime: "codex", state: "ready" } });
       await host.ingest(agentId, event);
       assert.equal(deliveries, 1);
       if (mode === "async-input-error") {
@@ -75,16 +89,24 @@ for (const mode of ["error-receipt", "throw-after-persist", "async-input-error"]
       assert.equal(inboxState.targets[rows[0].target].model_seen_seq, 0, "delivery failure must not mark Agent model-seen");
 
       const status = store.readJson("status", {});
-      assert.equal(status.runtimeReadiness.state, "incompatible");
+      assert.equal(status.runtimeReadiness.state, explicitReadiness || "unavailable");
       assert.equal(status.inboundDeliveryHealth.state, "error");
-      const expectedCode = mode === "error-receipt" ? "non_retryable_receipt"
-        : mode === "throw-after-persist" ? "runtime_delivery_exception" : "runtime_delivery_event";
+      const expectedCode = mode === "throw-after-persist" ? "runtime_delivery_exception"
+        : mode === "async-input-error" ? "runtime_delivery_event" : "non_retryable_receipt";
       assert.equal(status.inboundDeliveryHealth.code, expectedCode);
-      assert.match(status.runtimeReadiness.nextAction, /inspect.*restart.*replay/i);
+      if (explicitReadiness) {
+        assert.equal(status.runtimeReadiness.reason, `explicit ${explicitReadiness} prerequisite`);
+        assert.equal(status.runtimeReadiness.nextAction, `resolve explicit ${explicitReadiness} prerequisite`);
+      } else if (runtimeError) {
+        assert.match(status.runtimeReadiness.reason, /HTTP 403/);
+        assert.match(status.runtimeReadiness.nextAction, /inspect.*retry/i);
+      } else {
+        assert.match(status.runtimeReadiness.nextAction, /inspect.*restart.*replay/i);
+      }
       const errorDeliveryLog = (status.deliverLog || []).filter((entry) => entry.status === "error");
       const visible = JSON.stringify({ health: status.inboundDeliveryHealth, readiness: status.runtimeReadiness,
         recentErrors: status.recentErrors, errorDeliveryLog, logs });
-      assert.doesNotMatch(visible, /issue124-super-secret|raw rejected payload|raw asynchronous|unsafe next action|raw inbound body/);
+      assert.doesNotMatch(visible, /issue124-super-secret|issue124-status-token|issue124-status-cookie|Users\/issue124|raw rejected payload|raw asynchronous|unsafe next action|raw inbound body/);
 
       await host.ingest(agentId, event);
       assert.equal(deliveries, 1, "transport duplicate must not create a second delivery attempt");
