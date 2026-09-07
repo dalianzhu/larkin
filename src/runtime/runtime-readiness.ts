@@ -1,9 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { applyPiPackageDirForChild, piChildDistributionFromOverrides } from "./builtin-pi-assets.js";
-import { assertBuiltinPiAgentDirectory, BUNDLED_PI_VERSION, piAgentDirectory } from "./pi-provider-config.js";
-import { traceProcessBoundary } from "../platform/process-boundary-trace.js";
+import { MINIMUM_PI_VERSION, parsePiExecutableVersion } from "./pi-compaction-recovery.js";
 
 export type RuntimeReadinessState = "missing" | "unauthenticated" | "unavailable" | "incompatible" | "ready";
 
@@ -18,9 +16,98 @@ export interface RuntimeReadiness {
   observedAt?: string;
 }
 
-function safeProviderLabel(value: unknown): string | null {
+export function safeProviderId(value: unknown): string | null {
   const provider = typeof value === "string" ? value.trim() : "";
   return /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(provider) ? provider : null;
+}
+
+function safeProviderLabel(value: unknown): string | null {
+  return safeProviderId(value);
+}
+
+export type PersistedAuthFailureKind = "missing-provider" | "generic";
+
+/** Current scoped auth-failure marker. Never stores secrets or ledger history. */
+export interface PersistedAuthFailure {
+  kind: PersistedAuthFailureKind;
+  runtime: RuntimeReadiness["runtime"];
+  provider?: string | null;
+}
+
+export interface AuthFailureScope {
+  runtime: string;
+  model?: string;
+  adapterId?: string;
+}
+
+/** Model ids are `provider/model`; only the provider prefix is used for scope. */
+export function configuredProviderId(model: unknown): string | null {
+  const value = typeof model === "string" ? model.trim() : "";
+  const slash = value.indexOf("/");
+  return slash > 0 ? safeProviderId(value.slice(0, slash)) : null;
+}
+
+function persistedRuntime(value: unknown): RuntimeReadiness["runtime"] | null {
+  return value === "pi" || value === "codex" || value === "claude" ? value : null;
+}
+
+export function parsePersistedAuthFailure(state: unknown): PersistedAuthFailure | null {
+  if (!state || typeof state !== "object" || Array.isArray(state)) return null;
+  const record = state as Record<string, unknown>;
+  if (record.authFailure && typeof record.authFailure === "object" && !Array.isArray(record.authFailure)) {
+    const failure = record.authFailure as Record<string, unknown>;
+    const kind = failure.kind === "missing-provider" || failure.kind === "generic" ? failure.kind : null;
+    const runtime = persistedRuntime(failure.runtime);
+    if (!kind || !runtime) return null;
+    const provider = safeProviderId(failure.provider);
+    if (kind === "missing-provider" && !provider) return null;
+    return { kind, runtime, provider };
+  }
+  const legacy = safeProviderId(record.authFailureProvider);
+  return legacy ? { kind: "missing-provider", runtime: "pi", provider: legacy } : null;
+}
+
+function currentAdapterId(current: AuthFailureScope): string {
+  return current.adapterId ?? current.runtime;
+}
+
+export function authFailureAppliesTo(current: AuthFailureScope, failure: PersistedAuthFailure): boolean {
+  if (failure.runtime !== currentAdapterId(current)) return false;
+  if (!failure.provider) return true;
+  const currentProvider = configuredProviderId(current.model);
+  return currentProvider ? currentProvider === failure.provider : true;
+}
+
+export function readinessForPersistedAuthFailure(failure: PersistedAuthFailure): RuntimeReadiness {
+  if (failure.kind === "missing-provider") {
+    return missingProviderCredentialReadiness(failure.runtime, failure.provider);
+  }
+  return providerAuthenticationFailureReadiness(failure.runtime, failure.provider);
+}
+
+const MISSING_CREDENTIAL_REJECTION =
+  /^(?:Pi RPC (?:prompt|steer) failed: )?(No API key found for|No login found for) ([A-Za-z0-9][A-Za-z0-9._-]{0,79})$/;
+
+/** Narrow match for an explicit Pi absent-key / absent-login diagnostic. */
+export function classifyPiMissingCredentialRejection(message: unknown): { provider: string; diagnostic: string } | null {
+  const text = typeof message === "string"
+    ? message.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim()
+    : "";
+  const match = MISSING_CREDENTIAL_REJECTION.exec(text);
+  const provider = match ? safeProviderLabel(match[2]) : null;
+  return provider && match ? { provider, diagnostic: `${match[1]} ${provider}` } : null;
+}
+
+export function runtimeInstallNextAction(runtime: RuntimeReadiness["runtime"]): string {
+  if (runtime === "pi") return "Install Pi and ensure `pi` is on PATH, or set LARKIN_PI_COMMAND.";
+  if (runtime === "codex") return "Install Codex and ensure `codex` is on PATH, or set LARKIN_CODEX_COMMAND.";
+  return "Install Claude Code and ensure `claude` is on PATH, or set LARKIN_CLAUDE_COMMAND.";
+}
+
+export function runtimeLoginNextAction(runtime: RuntimeReadiness["runtime"]): string {
+  if (runtime === "pi") return "Log in with the external `pi` CLI, then retry.";
+  if (runtime === "codex") return "Run `codex login`, then retry.";
+  return "Run `claude login`, then retry.";
 }
 
 export function providerAuthenticationFailureReadiness(
@@ -34,7 +121,24 @@ export function providerAuthenticationFailureReadiness(
     reason: label
       ? `Provider ${label} API-key authentication failed during a Runtime turn.`
       : "Configured provider API-key authentication failed during a Runtime turn.",
-    nextAction: "Check the provider login or API-key resolver command, then retry the Agent turn.",
+    nextAction: runtimeLoginNextAction(runtime),
+  };
+}
+
+export function missingProviderCredentialReadiness(
+  runtime: RuntimeReadiness["runtime"],
+  provider?: unknown,
+): RuntimeReadiness {
+  const label = safeProviderLabel(provider);
+  return {
+    runtime,
+    state: "unauthenticated",
+    reason: label
+      ? `Provider ${label} is not authenticated for this runtime.`
+      : "The configured provider is not authenticated for this runtime.",
+    nextAction: runtime === "pi" && label
+      ? `Log in with the external \`pi\` CLI for provider ${label}, then retry.`
+      : runtimeLoginNextAction(runtime),
   };
 }
 
@@ -61,21 +165,36 @@ export function classifyRuntimePrerequisite(runtime: RuntimeReadiness["runtime"]
   executable?: string): RuntimeReadiness {
   const reason = (error instanceof Error ? error.message : String(error)).replace(/[\r\n]+/g, " ").slice(0, 500);
   if (/ENOENT|not found|no such file|spawn .* failed/i.test(reason)) return {
-    runtime, state: "missing", ...(executable ? { executable } : {}), reason,
-    nextAction: runtime === "pi" ? "Install Pi and ensure `pi` is on PATH, or set LARKIN_PI_COMMAND." : `Install ${runtime} and ensure it is on PATH.`,
+    runtime, state: "missing", ...(executable ? { executable } : {}),
+    reason: `${runtime} is not installed`,
+    nextAction: runtimeInstallNextAction(runtime),
   };
   if (/no authenticated available models|login|credential|unauthenticated|unauthorized|oauth/i.test(reason)) return {
     runtime, state: "unauthenticated", ...(executable ? { executable } : {}), reason,
-    nextAction: runtime === "pi" ? "Run the official `pi` login flow, then retry." : `Authenticate ${runtime}, then retry.`,
+    nextAction: runtimeLoginNextAction(runtime),
   };
-  if (/protocol (?:version )?(?:mismatch|unsupported|incompatible)|unsupported (?:rpc|protocol|schema)|schema (?:mismatch|incompatible)|requires (?:a )?newer version/i.test(reason)) return {
-    runtime, state: "incompatible", ...(executable ? { executable } : {}), reason,
-    nextAction: runtime === "pi" ? "Upgrade local Pi to a version that supports the documented RPC protocol." : `Upgrade ${runtime}, then retry.`,
-  };
-  if (/timeout|timed out|unexpected EOF|\bEOF\b|TLS|ECONNRESET|socket hang up|network|temporar(?:y|ily)|unavailable/i.test(reason)) return {
-    runtime, state: "unavailable", ...(executable ? { executable } : {}), reason,
-    nextAction: `Retry ${runtime}; Larkin will use its bounded Runtime recreate/backoff policy.`,
-  };
+  if (/older than the minimum|not a supported version(?: line)?|version output must contain exactly one/i.test(reason)) {
+    return {
+      runtime, state: "incompatible", ...(executable ? { executable } : {}), reason,
+      nextAction: runtime === "pi"
+        ? `Upgrade pi to ${MINIMUM_PI_VERSION} or newer`
+        : `Upgrade ${runtime}, then retry.`,
+    };
+  }
+  if (/protocol (?:version )?(?:mismatch|unsupported|incompatible)|unsupported (?:rpc|protocol|schema)|schema (?:mismatch|incompatible)|requires (?:a )?newer version/i.test(reason)) {
+    return {
+      runtime, state: "incompatible", ...(executable ? { executable } : {}), reason,
+      nextAction: runtime === "pi"
+        ? "Upgrade local Pi to a version that supports the documented RPC protocol."
+        : `Upgrade ${runtime}, then retry.`,
+    };
+  }
+  if (/timeout|timed out|unexpected EOF|\bEOF\b|TLS|ECONNRESET|socket hang up|network|temporar(?:y|ily)|unavailable/i.test(reason)) {
+    return {
+      runtime, state: "unavailable", ...(executable ? { executable } : {}), reason,
+      nextAction: `Retry ${runtime}; Larkin will use its bounded Runtime recreate/backoff policy.`,
+    };
+  }
   return {
     runtime, state: "unavailable", ...(executable ? { executable } : {}), reason,
     nextAction: `Retry ${runtime}; the failure is not proven to be a protocol incompatibility.`,
@@ -106,37 +225,39 @@ function executableVersion(executable: string, env: NodeJS.ProcessEnv, commandAr
 
 /** Resolve and handshake through each runtime's structured native control protocol. */
 export async function probeNativeRuntimeReadiness(options: ProbeNativeRuntimeReadinessOptions): Promise<RuntimeReadiness> {
-  let env = { ...process.env, ...options.env };
-  const piDistribution = options.runtime === "pi" ? piChildDistributionFromOverrides(options.env) : "external";
-  if (options.runtime === "pi" && piDistribution !== "builtin") {
-    if (env.LARKIN_PI_DISTRIBUTION === "builtin") delete env.LARKIN_PI_DISTRIBUTION;
-    env = applyPiPackageDirForChild(env, { distribution: "external" });
-  }
-  if (options.runtime === "pi" && piDistribution === "builtin") {
-    try {
-      if (!options.agentId || !env.LARKIN_CONFIG_DIR) throw new Error("内置 Pi readiness 缺少 Agent/config identity");
-      assertBuiltinPiAgentDirectory(piAgentDirectory(env.LARKIN_CONFIG_DIR, options.agentId));
-      return { runtime: "pi", state: "ready", executable: process.execPath, version: `official-pi ${BUNDLED_PI_VERSION} (bundled)` };
-    } catch (error) {
-      traceProcessBoundary(env, "readiness:builtin-pi-failure", { configDir: env.LARKIN_CONFIG_DIR, agentId: options.agentId, targetDir: options.agentId && env.LARKIN_CONFIG_DIR ? piAgentDirectory(env.LARKIN_CONFIG_DIR, options.agentId) : undefined, error });
-      return { runtime: "pi", state: "unauthenticated", reason: error instanceof Error ? error.message : String(error),
-        nextAction: "重新运行 larkin setup，选择内置 Pi 并配置有效 API Key。" };
-    }
-  }
+  const env = { ...process.env, ...options.env };
+  if (options.runtime === "pi") delete env.PI_CODING_AGENT_DIR;
   const command = selectedCommand(options);
   const executable = resolveRuntimeExecutable(command, env);
-  if (!executable) return {
-    runtime: options.runtime, state: "missing",
-    reason: `${command} executable was not found`,
-    nextAction: options.runtime === "pi"
-      ? "Install Pi and ensure `pi` is on PATH, or set LARKIN_PI_COMMAND."
-      : `Install ${options.runtime} and ensure it is on PATH.`,
-  };
-  const version = executableVersion(executable, env, options.commandArgs);
+  if (!executable) {
+    return {
+      runtime: options.runtime,
+      state: "missing",
+      reason: `${options.runtime} is not installed`,
+      nextAction: runtimeInstallNextAction(options.runtime),
+    };
+  }
+  let version = executableVersion(executable, env, options.commandArgs);
+  if (options.runtime === "pi") {
+    try {
+      const probe = spawnSync(executable, [...options.commandArgs ?? [], "--version"], {
+        env, encoding: "utf8", timeout: 5_000, maxBuffer: 64 * 1024,
+      });
+      version = parsePiExecutableVersion(String(probe.stdout || ""));
+    } catch (error) {
+      const classified = classifyRuntimePrerequisite("pi", error, executable);
+      return { ...classified, executable, ...(version ? { version } : {}) };
+    }
+  }
   try {
     if (options.runtime === "pi") {
       const { discoverPiModelCatalog } = await import("./pi-model-catalog.js");
-      await discoverPiModelCatalog({ cwd: options.cwd, command: executable, commandArgs: options.commandArgs, env });
+      await discoverPiModelCatalog({
+        cwd: options.cwd,
+        command: executable,
+        commandArgs: options.commandArgs,
+        env,
+      });
     } else if (options.runtime === "codex") {
       const { discoverCodexModelCatalog } = await import("./codex-model-catalog.js");
       await discoverCodexModelCatalog({ cwd: options.cwd, command: executable, env });

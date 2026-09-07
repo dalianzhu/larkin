@@ -311,7 +311,7 @@ test("Pi model directory reuses discoverPiModelCatalog and caches default plus a
     };
   };
   const resolver = module.createPiModelDirectoryResolver({ discoverPiModelCatalog, now: () => now, ttlMs: 5 * 60_000 });
-  const input = { agentId: APP, cwd: "/tmp/pi-workspace", agentDir: "/tmp/pi-state" };
+  const input = { agentId: APP, cwd: "/tmp/pi-workspace" };
 
   const [first, concurrent] = await Promise.all([resolver.resolve(input), resolver.resolve(input)]);
   assert.deepEqual(first.map(({ id }) => id), ["default", "anthropic/claude-sonnet-4-5"]);
@@ -321,7 +321,7 @@ test("Pi model directory reuses discoverPiModelCatalog and caches default plus a
   assert.equal(Object.hasOwn(first[0], "defaultReasoningEffort"), false);
   assert.deepEqual(concurrent, first);
   assert.equal(calls.length, 1, "concurrent Pi model requests share one official discovery");
-  assert.deepEqual(calls[0], { cwd: input.cwd, agentDir: input.agentDir });
+  assert.deepEqual(calls[0], { cwd: input.cwd });
 
   now += 5 * 60_000 - 1;
   await resolver.resolve(input);
@@ -343,7 +343,7 @@ test("Pi model directory negative-caches discovery failures and retries after th
     now: () => now,
     negativeTtlMs: 30_000,
   });
-  const input = { agentId: APP, cwd: "/tmp/pi-negative", agentDir: "/tmp/pi-state" };
+  const input = { agentId: APP, cwd: "/tmp/pi-negative" };
 
   await assert.rejects(resolver.resolve(input), /fixture auth detail/);
   await assert.rejects(resolver.resolve(input), /Pi model catalog unavailable/);
@@ -372,6 +372,96 @@ test("GET /api/models/pi returns default plus authenticated models through the i
   assert.deepEqual(response.body.models, models);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].agentId, APP);
+  assert.equal(calls[0].agentDir, undefined);
+  assert.equal(calls[0].command, process.env.LARKIN_PI_COMMAND || "pi");
+  assert.deepEqual(calls[0].commandArgs, []);
+  assert.equal(calls[0].commandArgs?.includes("pi-rpc") ?? false, false);
+});
+
+function writePiAgents(root, agents) {
+  fs.writeFileSync(path.join(root, "config.json"), `${JSON.stringify({
+    version: 4,
+    serverId: "server-dashboard-directory",
+    mentionPolicy: "require",
+    activeAgent: Object.keys(agents)[0],
+    agents,
+  })}\n`, { mode: 0o600 });
+}
+
+test("GET /api/config lists three runtimes and /api/models/builtin-pi is unhandled", async () => {
+  const { createDashboardConfigController } = await import(`${CONTROLLER}?pi-owned=${Date.now()}`);
+  const f = fixture();
+  onTestFinished(() => fs.rmSync(f.root, { recursive: true, force: true }));
+  const first = "cli_dashboardPiA1";
+  const second = "cli_dashboardPiB2";
+  writePiAgents(f.root, {
+    [first]: { runtime: "pi", model: "default", createdAt: "2026-07-24T00:00:00.000Z" },
+    [second]: { runtime: "pi", model: "default", createdAt: "2026-07-24T00:00:00.000Z" },
+  });
+  const decoy = path.join(f.root, "decoy-host-pi");
+  const calls = [];
+  const models = [
+    { id: "default", label: "default: owned/model" },
+    { id: "owned/model", label: "Owned", supportedReasoningEfforts: ["off"] },
+  ];
+  const piModelDirectoryResolver = { async resolve(input) { calls.push(input); return models; } };
+
+  for (const decoyDir of [decoy, undefined]) {
+    const env = { ...f.env };
+    if (decoyDir) env.PI_CODING_AGENT_DIR = decoyDir;
+    else delete env.PI_CODING_AGENT_DIR;
+    const controller = createDashboardConfigController({ csrfCapability: "test", env, piModelDirectoryResolver });
+    const projected = await get(controller, `/api/config?agent=${first}`);
+    assert.equal(projected.status, 200);
+    assert.equal(projected.body.agents[0].runtime, "pi");
+    assert.equal(projected.body.agents[0].runtimeOption, "pi");
+    assert.deepEqual(projected.body.runtimeOptions, ["codex", "claude", "pi"]);
+    assert.equal(Object.hasOwn(projected.body.runtimeModels, "builtin-pi"), false);
+    assert.ok(Object.hasOwn(projected.body.runtimeModels, "pi"));
+    calls.length = 0;
+    const listed = await get(controller, `/api/models/pi?agent=${first}`);
+    assert.equal(listed.status, 200, JSON.stringify(listed.body));
+    assert.equal(listed.handled, true);
+    assert.equal(calls[0].agentDir, undefined);
+    assert.notEqual(calls[0].agentDir, decoy);
+    assert.equal(calls[0].commandArgs.includes("pi-rpc"), false, "pi catalog must use the external pi executable");
+
+    calls.length = 0;
+    const removed = await get(controller, `/api/models/builtin-pi?agent=${first}`);
+    assert.equal(removed.handled, false, "builtin-pi model directory must be an unknown route");
+    assert.equal(calls.length, 0);
+
+    calls.length = 0;
+    const saved = await patch(controller, { operation: "set-agent-model", agentId: second, model: "owned/model" });
+    assert.equal(saved.status, 200, JSON.stringify(saved.body));
+    assert.equal(calls[0].agentDir, undefined);
+
+    const rejected = await patch(controller, { operation: "set-agent-model", agentId: second, model: "host-only/decoy" });
+    assert.equal(rejected.status, 400);
+  }
+});
+
+test("Pi model directory cache key isolates distinct catalog command specs", async () => {
+  const module = await import(`${CONTROLLER}?pi-engine-cache=${Date.now()}`);
+  const calls = [];
+  const resolver = module.createPiModelDirectoryResolver({
+    async discoverPiModelCatalog(options) {
+      calls.push(options);
+      return {
+        models: [{ id: "owned/model", label: "Owned", supportedReasoningEfforts: ["off"], verified: "launchable" }],
+        effectiveModel: "owned/model",
+        effectiveThinkingLevel: "off",
+        defaultSource: "settings",
+        diagnostics: [],
+      };
+    },
+  });
+  const shared = { agentId: APP, cwd: "/tmp/pi-workspace" };
+  await resolver.resolve({ ...shared, command: "/bin/bun", commandArgs: ["entry", "__internal", "pi-rpc"] });
+  await resolver.resolve({ ...shared, command: "pi", commandArgs: [] });
+  assert.equal(calls.length, 2, "distinct catalog commands must not share a cache entry");
+  assert.deepEqual(calls[0].commandArgs, ["entry", "__internal", "pi-rpc"]);
+  assert.deepEqual(calls[1].commandArgs, []);
 });
 
 test("Codex model directory reuses app-server model/list with five-minute caching and dedupe", async () => {
@@ -475,6 +565,7 @@ for (const runtimeCase of [
     const options = {
       csrfCapability: "test",
       env: f.env,
+      probeRuntimeReadiness: async ({ runtime }) => ({ runtime, state: "ready" }),
       codexModelDirectoryResolver: { async resolve() { return runtimeCase.runtime === "codex" ? models : []; } },
       claudeModelDirectoryResolver: { async resolve() { return runtimeCase.runtime === "claude" ? models : []; } },
     };
@@ -520,4 +611,35 @@ test("dynamic directory GETs require loopback Host and the dashboard capability 
   assert.equal(missingCapability.handled, true);
   assert.deepEqual([badHost.status, missingCodexCapability.status, missingClaudeCapability.status, missingCapability.status], [403, 403, 403, 403]);
   assert.deepEqual(calls, [], "untrusted dynamic GETs never reach local credential-backed resolvers");
+});
+
+test("PATCH set-agent-runtime rejects a missing executable and does not write config", async () => {
+  const { createDashboardConfigController } = await import(`${CONTROLLER}?missing-runtime=${Date.now()}`);
+  const f = fixture();
+  onTestFinished(() => fs.rmSync(f.root, { recursive: true, force: true }));
+  const before = fs.readFileSync(path.join(f.root, "config.json"), "utf8");
+  const controller = createDashboardConfigController({
+    csrfCapability: "test",
+    env: { ...f.env, LARKIN_CLAUDE_COMMAND: path.join(f.root, "missing-claude") },
+    claudeModelDirectoryResolver: { async resolve() { return [{ id: "default", label: "default" }]; } },
+  });
+  const response = await patch(controller, { operation: "set-agent-runtime", agentId: APP, runtime: "claude", model: "default" });
+  assert.equal(response.handled, true);
+  assert.equal(response.status, 400, JSON.stringify(response.body));
+  assert.match(response.body.error, /claude is not installed/);
+  assert.equal(response.body.readiness.state, "missing");
+  assert.match(response.body.readiness.nextAction, /claude/i);
+  assert.equal(fs.readFileSync(path.join(f.root, "config.json"), "utf8"), before);
+});
+
+test("PATCH set-agent-runtime rejects builtin-pi as an unknown runtime", async () => {
+  const { createDashboardConfigController } = await import(`${CONTROLLER}?unknown-runtime=${Date.now()}`);
+  const f = fixture();
+  onTestFinished(() => fs.rmSync(f.root, { recursive: true, force: true }));
+  const before = fs.readFileSync(path.join(f.root, "config.json"), "utf8");
+  const controller = createDashboardConfigController({ csrfCapability: "test", env: f.env });
+  const response = await patch(controller, { operation: "set-agent-runtime", agentId: APP, runtime: "builtin-pi", model: "default" });
+  assert.equal(response.status, 400);
+  assert.match(response.body.error, /未知 runtime/);
+  assert.equal(fs.readFileSync(path.join(f.root, "config.json"), "utf8"), before);
 });

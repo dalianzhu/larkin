@@ -103,9 +103,15 @@ export interface KnownChat {
 export interface ConfigAgent {
   agentId: string;
   runtime: string;
+  runtimeOption: "codex" | "claude" | "pi";
   model: string;
   effort: string | null;
   mention: { override: "inherit" | "require" | "free"; effective: "require" | "free"; source: "global" | "agent" };
+  inboxAudit: {
+    override: { enabled: "inherit" | "on" | "off"; intervalMs: "inherit" | number };
+    effective: { enabled: boolean; intervalMs: number };
+    source: { enabled: "default" | "global" | "agent"; intervalMs: "default" | "global" | "agent" };
+  };
   knownChats: KnownChat[];
   apply: { applyState?: "unknown" | "pending" | "applied" };
 }
@@ -120,9 +126,11 @@ export interface RuntimeModel {
 export interface ConfigResponse {
   version: 4;
   mentionPolicy: "require" | "free";
+  inboxAudit: { enabled: boolean; intervalMs: number };
   persistedRevision: string;
   agents: ConfigAgent[];
   runtimeModels: Record<string, RuntimeModel[]>;
+  runtimeOptions: Array<"codex" | "claude" | "pi">;
 }
 
 export type WorkspaceProjection = {

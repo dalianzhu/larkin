@@ -8,18 +8,28 @@ import { discoverClaudeModelCatalog, type DiscoverClaudeCatalogOptions } from ".
 import { discoverCodexModelCatalog, type DiscoverCodexCatalogOptions } from "../runtime/codex-model-catalog.js";
 import { discoverPiModelCatalog, type DiscoverPiCatalogOptions } from "../runtime/pi-model-catalog.js";
 import { managedOfficialLarkCli } from "../app/agent-lark-cli-workspace.js";
+import { RUNTIME_OPTIONS, isUserRuntime } from "../runtime/user-runtime.js";
+import { probeNativeRuntimeReadiness, RuntimePrerequisiteError } from "../runtime/runtime-readiness.js";
 
 type Env = Record<string, string | undefined>;
 type LarkJsonCall = { command: string; args: string[]; env: Env; maxBuffer: number; timeout: number };
 type ChatDirectoryInput = { agentId: string; chatIds: string[]; configDir: string; profile: string };
 type ClaudeModelDirectoryInput = { agentId: string; cwd: string; env: Env };
 type CodexModelDirectoryInput = { agentId: string; cwd: string; env: Env };
-type PiModelDirectoryInput = { agentDir?: string; agentId: string; cwd: string };
+type PiModelDirectoryInput = {
+  agentId: string;
+  cwd: string;
+  command?: string;
+  commandArgs?: readonly string[];
+};
 
 export type ChatDirectoryResolver = { resolve(input: ChatDirectoryInput): Promise<Record<string, string>> };
 export type ClaudeModelDirectoryResolver = { resolve(input: ClaudeModelDirectoryInput): Promise<Array<Record<string, unknown> & { id: string; label: string }>> };
 export type CodexModelDirectoryResolver = { resolve(input: CodexModelDirectoryInput): Promise<Array<Record<string, unknown> & { id: string; label: string }>> };
-export type PiModelDirectoryResolver = { resolve(input: PiModelDirectoryInput): Promise<Array<Record<string, unknown> & { id: string; label: string }>> };
+export type PiModelDirectoryResolver = {
+  resolve(input: PiModelDirectoryInput): Promise<Array<Record<string, unknown> & { id: string; label: string }>>;
+  invalidate?(agentId?: string): void;
+};
 
 type KnownChat = { chatId: string; displayName: string | null; kind: "group" | "direct" };
 
@@ -175,9 +185,32 @@ export function createPiModelDirectoryResolver(options: {
   const cache = new Map<string, { expiresAt: number; value: Array<Record<string, unknown> & { id: string; label: string }> }>();
   const failures = new Map<string, { expiresAt: number }>();
   const inFlight = new Map<string, Promise<Array<Record<string, unknown> & { id: string; label: string }>>>();
+  const generations = new Map<string, number>();
+  // 单调序号：targeted 后再 global 时，in-flight 的 started 不能与新 generation 相等。
+  let seq = 0;
+  let baseline = 0;
+  const generationOf = (agentId: string) => Math.max(baseline, generations.get(agentId) ?? 0);
+  const dropPrefixed = <T>(store: Map<string, T>, agentId?: string): void => {
+    if (!agentId) { store.clear(); return; }
+    const prefix = `${agentId}\u0000`;
+    for (const key of store.keys()) if (key.startsWith(prefix)) store.delete(key);
+  };
   return {
+    invalidate(agentId?: string) {
+      dropPrefixed(cache, agentId);
+      dropPrefixed(failures, agentId);
+      dropPrefixed(inFlight, agentId);
+      seq += 1;
+      if (!agentId) {
+        baseline = seq;
+        generations.clear();
+      } else {
+        generations.set(agentId, seq);
+      }
+    },
     async resolve(input) {
-      const key = [input.agentId, input.cwd, input.agentDir ?? ""].join("\u0000");
+      const key = [input.agentId, input.cwd, input.command ?? "", ...(input.commandArgs ?? [])].join("\u0000");
+      const started = generationOf(input.agentId);
       pruneCache(cache, (entry) => now() >= entry.expiresAt, 64);
       pruneCache(failures, (entry) => now() >= entry.expiresAt, 64);
       const cached = cache.get(key);
@@ -187,23 +220,31 @@ export function createPiModelDirectoryResolver(options: {
       if (!pending) {
         pending = (async () => {
           try {
-            const catalog = await discover({ cwd: input.cwd, ...(input.agentDir ? { agentDir: input.agentDir } : {}) });
+            const catalog = await discover({
+              cwd: input.cwd,
+              ...(input.command ? { command: input.command } : {}),
+              ...(input.commandArgs ? { commandArgs: input.commandArgs } : {}),
+            });
             const models = [
               { id: "default", label: `default: ${catalog.effectiveModel}` },
               ...catalog.models.map(({ id, label, contextWindow, supportedReasoningEfforts, defaultReasoningEffort }) => ({
                 id, label, ...(contextWindow ? { contextWindow } : {}), supportedReasoningEfforts, ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
               })),
             ];
-            failures.delete(key);
-            cache.set(key, { expiresAt: now() + ttlMs, value: models });
+            if (generationOf(input.agentId) === started) {
+              failures.delete(key);
+              cache.set(key, { expiresAt: now() + ttlMs, value: models });
+            }
             return models;
           } catch (error) {
-            failures.set(key, { expiresAt: now() + negativeTtlMs });
+            if (generationOf(input.agentId) === started) failures.set(key, { expiresAt: now() + negativeTtlMs });
             throw error;
           }
         })();
         inFlight.set(key, pending);
-        void pending.finally(() => inFlight.delete(key)).catch(() => undefined);
+        void pending.finally(() => {
+          if (inFlight.get(key) === pending) inFlight.delete(key);
+        }).catch(() => undefined);
       }
       return await pending;
     },
@@ -365,10 +406,21 @@ function dashboardMutation(value: Record<string, unknown>): ConfigMutation {
     "set-global-mention": ["operation", "value"], "set-agent-mention": ["operation", "agentId", "value"],
     "set-chat-mention": ["operation", "agentId", "chatId", "value"], "set-agent-runtime": ["operation", "agentId", "runtime", "model"],
     "set-agent-model": ["operation", "agentId", "model"], "set-agent-effort": ["operation", "agentId", "effort"],
+    "set-global-inbox-audit": ["operation", "enabled", "intervalMs"], "set-agent-inbox-audit": ["operation", "agentId", "enabled", "intervalMs"],
   };
   if (!allowed[operation] || Object.keys(value).some((key) => !allowed[operation].includes(key))) throw new Error("unsupported operation");
   if (operation === "set-global-mention") return { kind: operation, value: String(value.value) as "require" | "free" };
+  if (operation === "set-global-inbox-audit") {
+    if (value.enabled !== undefined && typeof value.enabled !== "boolean") throw new Error("invalid inbox-audit enabled");
+    if (value.intervalMs !== undefined && (typeof value.intervalMs !== "number" || !Number.isSafeInteger(value.intervalMs))) throw new Error("invalid inbox-audit interval");
+    return { kind: operation, ...(value.enabled !== undefined ? { enabled: value.enabled } : {}), ...(value.intervalMs !== undefined ? { intervalMs: value.intervalMs } : {}) };
+  }
   const agentId = String(value.agentId || "");
+  if (operation === "set-agent-inbox-audit") {
+    if (value.enabled !== undefined && value.enabled !== "inherit" && typeof value.enabled !== "boolean") throw new Error("invalid inbox-audit enabled");
+    if (value.intervalMs !== undefined && value.intervalMs !== "inherit" && (typeof value.intervalMs !== "number" || !Number.isSafeInteger(value.intervalMs))) throw new Error("invalid inbox-audit interval");
+    return { kind: operation, agentId, ...(value.enabled !== undefined ? { enabled: value.enabled as boolean | "inherit" } : {}), ...(value.intervalMs !== undefined ? { intervalMs: value.intervalMs as number | "inherit" } : {}) };
+  }
   if (operation === "set-agent-mention") return { kind: operation, agentId, value: String(value.value) as "inherit" | "require" | "free" };
   if (operation === "set-chat-mention") return { kind: operation, agentId, chatId: String(value.chatId || ""), value: String(value.value) as "inherit" | "require" | "free" };
   if (operation === "set-agent-runtime") return { kind: operation, agentId, runtime: String(value.runtime || ""), ...(value.model ? { model: String(value.model) } : {}) };
@@ -384,6 +436,7 @@ export function createDashboardConfigController({
   claudeModelDirectoryResolver = createClaudeModelDirectoryResolver(),
   codexModelDirectoryResolver = createCodexModelDirectoryResolver(),
   piModelDirectoryResolver = createPiModelDirectoryResolver(),
+  probeRuntimeReadiness = probeNativeRuntimeReadiness,
 }: {
   csrfCapability: string;
   env?: Env;
@@ -392,19 +445,44 @@ export function createDashboardConfigController({
   claudeModelDirectoryResolver?: ClaudeModelDirectoryResolver;
   codexModelDirectoryResolver?: CodexModelDirectoryResolver;
   piModelDirectoryResolver?: PiModelDirectoryResolver;
+  probeRuntimeReadiness?: typeof probeNativeRuntimeReadiness;
 }) {
+  const resolvePiModelDirectory = async (agentId: string) => {
+    const { config } = loadConfig(env);
+    const agent = config.agents[agentId];
+    if (!agent) throw new Error("unknown agent");
+    // 外部 `pi --mode rpc` 使用用户自己的 Pi home；catalog 探测不改写子进程 agent 目录。
+    return await piModelDirectoryResolver.resolve({
+      agentId,
+      cwd: agent.workspaceDir,
+      command: env.LARKIN_PI_COMMAND || process.env.LARKIN_PI_COMMAND || "pi",
+      commandArgs: [],
+    });
+  };
   const resolveModelDirectory = async (runtime: string, agentId: string) => {
     const { config } = loadConfig(env);
     const agent = config.agents[agentId];
     if (!agent) throw new Error("unknown agent");
-    if (runtime === "pi") return await piModelDirectoryResolver.resolve({
-      agentId, cwd: agent.workspaceDir, ...(env.PI_CODING_AGENT_DIR ? { agentDir: env.PI_CODING_AGENT_DIR } : {}),
-    });
+    if (runtime === "pi") return await resolvePiModelDirectory(agentId);
     if (runtime === "codex") return await codexModelDirectoryResolver.resolve({ agentId, cwd: agent.workspaceDir, env });
     if (runtime === "claude") return await claudeModelDirectoryResolver.resolve({ agentId, cwd: agent.workspaceDir, env });
     const authored = loadRuntimeModels()[runtime];
     if (!authored) throw new Error("unknown runtime");
     return authored;
+  };
+  const assertRuntimeSwitchReady = async (mutation: ConfigMutation): Promise<void> => {
+    if (mutation.kind !== "set-agent-runtime") return;
+    if (!isUserRuntime(mutation.runtime)) throw new Error(`未知 runtime：${mutation.runtime}`);
+    const { config } = loadConfig(env);
+    const agent = config.agents[mutation.agentId];
+    if (!agent) throw new Error("unknown agent");
+    const readiness = await probeRuntimeReadiness({
+      runtime: mutation.runtime,
+      cwd: agent.workspaceDir,
+      env,
+      agentId: mutation.agentId,
+    });
+    if (readiness.state === "missing") throw new RuntimePrerequisiteError(readiness);
   };
   const assertDirectoryMutation = async (mutation: ConfigMutation): Promise<void> => {
     if (mutation.kind !== "set-agent-runtime" && mutation.kind !== "set-agent-model" && mutation.kind !== "set-agent-effort") return;
@@ -428,7 +506,11 @@ export function createDashboardConfigController({
       if (requestUrl.pathname === "/api/config" && req.method === "GET") {
         try {
           assertPrivateReadRequest(req, csrfCapability);
-          json(res, 200, { ...await sanitizedView(env, chatDirectoryResolver, requestUrl.searchParams.get("agent") || undefined, requestUrl.searchParams.get("chat") || undefined), runtimeModels: loadRuntimeModels() });
+          json(res, 200, {
+            ...await sanitizedView(env, chatDirectoryResolver, requestUrl.searchParams.get("agent") || undefined, requestUrl.searchParams.get("chat") || undefined),
+            runtimeModels: loadRuntimeModels(),
+            runtimeOptions: [...RUNTIME_OPTIONS],
+          });
         } catch (error) {
           json(res, error instanceof Error && /host|capability/.test(error.message) ? 403 : 500, { error: "configuration unavailable" });
         }
@@ -438,14 +520,7 @@ export function createDashboardConfigController({
         try {
           assertPrivateReadRequest(req, csrfCapability);
           const agentId = requestUrl.searchParams.get("agent") || "";
-          const { config } = loadConfig(env);
-          const agent = config.agents[agentId];
-          if (!agent) throw new Error("unknown agent");
-          const models = await piModelDirectoryResolver.resolve({
-            agentId,
-            cwd: agent.workspaceDir,
-            ...(env.PI_CODING_AGENT_DIR ? { agentDir: env.PI_CODING_AGENT_DIR } : {}),
-          });
+          const models = await resolvePiModelDirectory(agentId);
           json(res, 200, { models });
         } catch (error) {
           json(res, error instanceof Error && /host|capability/.test(error.message) ? 403 : 500, { error: "Pi model directory unavailable" });
@@ -484,10 +559,19 @@ export function createDashboardConfigController({
         try {
           assertWriteRequest(req, csrfCapability);
           const mutation = dashboardMutation(await boundedJson(req));
+          await assertRuntimeSwitchReady(mutation);
           await assertDirectoryMutation(mutation);
           const result = mutateConfig(env, mutation, { kind: "user" });
           json(res, 200, { ok: true, revision: result.revision, persisted: true, applyState: result.applyState, changedScope: result.changedScope });
-        } catch { json(res, 400, { error: "configuration update rejected" }); }
+        } catch (error) {
+          if (error instanceof RuntimePrerequisiteError) {
+            json(res, 400, { error: error.message, readiness: error.readiness });
+          } else if (error instanceof Error && error.message.startsWith("未知 runtime")) {
+            json(res, 400, { error: error.message });
+          } else {
+            json(res, 400, { error: "configuration update rejected" });
+          }
+        }
         return true;
       }
       if (requestUrl.pathname === "/api/config/apply" && req.method === "POST") {

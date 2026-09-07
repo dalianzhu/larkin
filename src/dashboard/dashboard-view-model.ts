@@ -13,6 +13,7 @@ import { isAllowedDashboardAvatarUrl } from "./dashboard-avatar.js";
 import { collectWorkspaceEntry as collectTypedWorkspaceEntry } from "./dashboard-workspace.js";
 import { buildFingerprint, packageVersion } from "../platform/build-info.js";
 import * as larkinConfig from "../platform/config.js";
+import { toUserRuntime } from "../runtime/user-runtime.js";
 
 export interface JsonRecord {
   [key: string]: unknown;
@@ -483,7 +484,12 @@ export function projectStatusTimeline(status: JsonRecord) {
 }
 
 export type PiStatusModelResolver = {
-  resolve(input: { agentDir?: string; agentId: string; cwd: string }): Promise<PiContextCatalogModel[]>;
+  resolve(input: {
+    agentId: string;
+    cwd: string;
+    command?: string;
+    commandArgs?: readonly string[];
+  }): Promise<PiContextCatalogModel[]>;
 };
 
 async function collectAgentStatus(a: DashboardAgent, configDir: string, daemonStartedAt: unknown, piModelResolver?: PiStatusModelResolver) {
@@ -501,7 +507,8 @@ async function collectAgentStatus(a: DashboardAgent, configDir: string, daemonSt
       piCatalog = await piModelResolver.resolve({
         agentId: a.agentId,
         cwd: a.workspaceDir,
-        ...(process.env.PI_CODING_AGENT_DIR ? { agentDir: process.env.PI_CODING_AGENT_DIR } : {}),
+        command: process.env.LARKIN_PI_COMMAND || "pi",
+        commandArgs: [],
       });
     } catch { /* unknown or unavailable catalog keeps the explicit turns fallback */ }
   }
@@ -553,7 +560,7 @@ async function collectAgentStatus(a: DashboardAgent, configDir: string, daemonSt
     agentId: a.agentId,
     name: a.name,
     displayName: (botIdentity && botIdentity.name) || a.name,
-    runtime: a.runtime,
+    runtime: toUserRuntime(a.runtime),
     model: status.session?.runtime === a.runtime && status.session?.model ? String(status.session.model) : a.model,
     effort: status.session?.runtime === a.runtime && status.session?.reasoningEffort ? String(status.session.reasoningEffort) : a.effort || null,
     runtimeReadiness,
@@ -577,7 +584,7 @@ async function collectAgentStatus(a: DashboardAgent, configDir: string, daemonSt
     sessions: agentState.sessions || {},
     session: sessionId ? {
       id: sessionId,
-      runtime: a.runtime,
+      runtime: toUserRuntime(a.runtime),
       startedAt: usage.startedAt || (status.session?.id === sessionId ? status.session.startedAt : null) || null,
       ageSec: ageSec(usage.startedAt || (status.session?.id === sessionId ? status.session.startedAt : null)),
       lastTurnAt: status.session?.lastTurnAt || null,

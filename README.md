@@ -83,13 +83,13 @@ git push origin main
 - release commit 必须保持工作树干净、已推送，并通过 typecheck、build、测试、license 和 publication checks；安装工件必须显示 `sourceDirty: false`。
 - 发现上下游使用了相同版本号时，不覆盖、不移动已有 tag；下游直接递增到新的未使用版本，并从明确的上游 commit 重新构建。
 
-当前发行关系：下游已同步上游 `eddiearc/larkin@d95cb75`（`0.4.25`），external enqueue 修复版本为 `0.4.26`。后续同步时以实际的 `upstream/main` 和下游最新 release 为准，不把本段中的 commit 当作永久固定基线。
+当前发行关系：下游已同步上游 `eddiearc/larkin@5a78e2d`（`0.5.5`），该版本上游已移除内置（builtin）Pi、全面转向外部安装的 `pi` 运行时；下游在此基础上保留 external enqueue，发行版本为 `0.5.6`。后续同步时以实际的 `upstream/main` 和下游最新 release 为准，不把本段中的 commit 当作永久固定基线。
 
 ## Requirements
 
 - A supported macOS, Linux, or Windows (x64) system
 - Official `@larksuite/cli >= 1.0.80` (`lark-cli`) (Larkin product policy)
-- At least one supported agent runtime and its authentication
+- At least one externally installed agent runtime on `PATH`, already logged in: `pi`, `codex`, or `claude`
 - Bun 1.3.14 when running the npm package or building from source (standalone binaries bundle their own runtime)
 
 ## Quick start
@@ -166,18 +166,35 @@ Feishu clients do not reliably render Markdown links such as `[label](URL)` as c
 
 Feishu (https://open.feishu.cn) and Lark (https://open.larksuite.com) are different platforms; `larkin setup` must be told which brand with `--tenant feishu|lark` or the interactive prompt before the authorization QR, and must never emit a `feishu.cn` host for a Lark tenant.
 
-During setup, a new Agent is offered Pi first, followed by Codex and Claude Code. Provider keys are stored only in the selected Agent's private provider directory, not in the ordinary Agent config. Setup also discovers every API-key and OAuth/subscription login exposed by the pinned official Pi registry and delegates those flows to Pi.
+During setup, choose one of the three externally installed runtimes: Pi (`pi`), Codex (`codex`), or Claude Code (`claude`). Larkin does not ship a runtime and does not store provider credentials. Install the runtime yourself and complete its own login (`pi` login flow, `codex login`, or `claude login`) before setup. Interactive setup lists each runtime as installed or not installed and refuses a missing binary; non-interactive setup requires `--runtime` and exits non-zero with the same missing-install message.
 
-Use `larkin pi-auth status` or `larkin pi-auth logout <provider>` to manage Pi auth. The builtin Pi runtime loads Larkin's two supported extensions inline: background subagents and the 60-second foreground bash timeout guard are enabled without writing extension files or arguments. A compatible external Pi installation keeps the existing explicit `-e` extension path.
+`larkin setup --model <id>` optionally stores a catalog model for that runtime. After setup, use `larkin model` and `larkin runtime` to inspect or switch. For Pi, Larkin talks to your installed `pi --mode rpc` and verifies the RPC handshake and compaction capability contract.
 
-The bundled Pi identity is pinned to `@earendil-works/pi-coding-agent@0.84.2` in both `package.json` and `bun.lock`. Larkin launches it through the official RPC entrypoint and verifies the real RPC state/event handshake, compaction capability contract, and persisted session file before claiming readiness. The integration smoke test completes a provider turn, closes the process, and resumes the same session file; missing resume data fails closed instead of creating a fresh session.
+### Optional Pi tmux-backed bash
 
-For a controlled per-Agent switch, use `larkin pi-distribution show --agent <App ID>`, then provide a private snapshot destination for the atomic mutation: `larkin pi-distribution builtin --agent <App ID> --snapshot <private-file>`. Existing external Pi users can explicitly migrate the pinned 0.84.2 profile with `--import-external-profile`; this imports only `auth.json`, `models.json`, and `settings.json` into a new private per-Agent directory, preserves provider/model/auth bytes, and owns compaction at 40800/20000. Without that flag, builtin selection fails closed unless provider state is already configured. Roll back only when the snapshot CAS still matches with `larkin pi-distribution rollback --snapshot <private-file>`. Import and config changes are journaled together; source/target tampering refuses rollback, and sessions, Inbox data, unrelated provider files, and other Agents remain untouched.
+On macOS and Linux with `tmux` 3.2 or newer installed, Larkin provides a small tmux-backed Bash tool. Commands run in their requested directory, including non-Git directories and paths with spaces. By default the tool waits up to 30 seconds, then returns a `taskId` while the same command continues; `background: true` returns immediately. The `tmux` tool lists, inspects and stops tasks owned by that Pi instance. Completed background commands notify the Agent. There is no Larkin-imposed 60-second kill or ten-minute command limit.
+
+Without a supported tmux version, or on native Windows, Pi keeps native bash. After Pi shuts down, background commands remain in tmux, but automatic completion notifications are not restored; use `tmux list-sessions` to find the session containing the task ID and attach manually. Larkin does not require a third-party tmux plugin.
+
+### Optional Inbox Audit
+
+Inbox Audit is **off by default**. In the Dashboard, use **Global settings → Inbox 巡检** to configure the switch and inspection gap, or the selected Agent's **Configuration → Inbox 巡检** to override either value. The gap defaults to 15 minutes and supports 1 minute to 24 hours. Saving a gap alone keeps auditing disabled; saved settings survive restart and update later scheduling without replacing the Agent Runtime session.
+
+The same settings are available through the CLI:
+
+```bash
+larkin config inbox-audit global on --interval 15m
+larkin config inbox-audit agent off --agent <App-ID>
+larkin config inbox-audit agent inherit --agent <App-ID> --interval inherit
+larkin config inbox-audit global off
+```
+
+When enabled, audit only revisits originally wake-eligible human group/topic work and does not wake a model for an empty work list. Reading an audit list does not complete it: the managed Agent follows the returned inspection instructions and explicitly confirms the receipt after checking. A failed check remains retryable; newer messages cannot be completed by an older receipt. Old audit-index records without proven eligibility or observation identity are ignored; ordinary Inbox messages and conversation history are preserved.
 
 <details>
 <summary>Windows support and optional autostart</summary>
 
-Windows 11 x64 core support covers the standalone CLI, local Runtime Host startup, builtin Pi RPC with the inline extensions above, and the embedded Dashboard. Provider authentication, the official `lark-cli`, and external Codex, Claude Code, or Pi executables remain separately installed dependencies; secret-bearing live channel/provider tests are intentionally outside the hosted Windows CI gate.
+Windows 11 x64 core support covers the standalone CLI, local Runtime Host startup, and the embedded Dashboard. The official `lark-cli` and the chosen external Codex, Claude Code, or Pi executable remain separately installed dependencies; secret-bearing live channel/runtime tests are intentionally outside the hosted Windows CI gate.
 
 An Administrator account can optionally start Larkin at that account's interactive logon with Task Scheduler. From an elevated PowerShell prompt, adjust the executable and working-directory paths first:
 
@@ -212,7 +229,7 @@ larkin start
 
 The default spool is `$LARKIN_HOME/telemetry/spool`. Its directory and files use modes `0700` and `0600`. Defaults are 64 MiB, 10,000 files, and 14 days; override them with `LARKIN_TELEMETRY_MAX_BYTES`, `LARKIN_TELEMETRY_MAX_FILES`, and `LARKIN_TELEMETRY_MAX_AGE_MS`. Network errors and rejected uploads remain queued. A successful HTTP 200 acknowledges the local batch; an OTLP `partialSuccess` with rejected spans is recorded as a safe drop and is not retried.
 
-`larkin telemetry status` reports bounded queue and endpoint metadata without paths, message text, prompts, model output, commands, credentials, real user IDs, raw errors, headers, or complete URLs. Trace attributes use hashes and low-cardinality enums. `inbox.consume` measures the authoritative direct `larkin inbox poll` operation and inherits the active `agent.turn`. Bundled Pi traces add `pi.rpc.submit`, `pi.rpc.lifecycle`, `pi.output.wait`, `pi.generation`, `pi.tool.wait`, and `pi.rpc.settle`, exposing submit-to-accept, observed first-output, tool wait, and settle timing. External Pi is labeled as external and does not claim these bundled-process intervals. Document-comment traces expose receive, safe gate, pending/replay, Inbox, Runtime, and an independent `document.comment.reply` client result without recording comment locators or bodies.
+`larkin telemetry status` reports bounded queue and endpoint metadata without paths, message text, prompts, model output, commands, credentials, real user IDs, raw errors, headers, or complete URLs. Trace attributes use hashes and low-cardinality enums. `inbox.consume` measures the authoritative direct `larkin inbox poll` operation and inherits the active `agent.turn`. Pi traces add `pi.rpc.submit`, `pi.rpc.lifecycle`, `pi.output.wait`, `pi.generation`, `pi.tool.wait`, and `pi.rpc.settle`, exposing submit-to-accept, observed first-output, tool wait, and settle timing. Document-comment traces expose receive, safe gate, pending/replay, Inbox, Runtime, and an independent `document.comment.reply` client result without recording comment locators or bodies.
 
 ### Offline transfer
 

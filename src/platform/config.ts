@@ -5,31 +5,40 @@ import * as path from "node:path";
 import { TargetRootLayout, resolveConfigDir as resolveRootConfigDir } from "./root-layout.js";
 import { exactMode, fsyncDirectoryOf } from "./secure-metadata.js";
 import { CURRENT_RUNTIME_MODELS, type RuntimeModels } from "../runtime/runtime-model-catalog.js";
+import { fromUserRuntime, isAdapterRuntime, isUserRuntime, toUserRuntime } from "../runtime/user-runtime.js";
 import processInspect from "./process-inspect.cjs";
-import {
-  applyPiProfileMigration,
-  assertPiProfileMigrationAfterState,
-  preparePiProfileMigration,
-  releasePiProfileMigrationLock,
-  rollbackPiProfileMigration,
-  validatePiProfileMigrationState,
-  type PiProfileMigrationPlan,
-  type PiProfileMigrationState,
-} from "../runtime/pi-profile-migration.js";
 
 type Env = Record<string, string | undefined>;
 type Obj = Record<string, unknown>;
 export type { RuntimeModels } from "../runtime/runtime-model-catalog.js";
+export {
+  RUNTIME_OPTIONS, fromUserRuntime, isAdapterRuntime, isUserRuntime, runtimeOptionOf, runtimeOptionTarget, toUserRuntime,
+} from "../runtime/user-runtime.js";
 export type MentionPolicy = "require" | "free";
 export type MentionPolicyOverride = MentionPolicy | "inherit";
+export type InboxAuditEnabledOverride = boolean | "inherit";
+export type InboxAuditIntervalOverride = number | "inherit";
+
+export interface InboxAuditSettings {
+  enabled?: boolean;
+  intervalMs?: number;
+}
+export interface InboxAuditResolved {
+  enabled: boolean;
+  intervalMs: number;
+}
+
+export const DEFAULT_INBOX_AUDIT_INTERVAL_MS = 15 * 60_000;
+export const MIN_INBOX_AUDIT_INTERVAL_MS = 60_000;
+export const MAX_INBOX_AUDIT_INTERVAL_MS = 24 * 60 * 60_000;
 
 export interface StoredAgent {
   runtime: string;
   model: string;
-  piDistribution?: "external" | "builtin";
   effort?: string;
   mentionPolicy?: MentionPolicy;
   chatMentionPolicies?: Record<string, MentionPolicy>;
+  inboxAudit?: InboxAuditSettings;
   createdAt?: string;
 }
 
@@ -50,6 +59,7 @@ export interface HydratedConfig {
   version: 4;
   serverId: string | null;
   mentionPolicy: MentionPolicy;
+  inboxAudit?: InboxAuditResolved;
   configDir: string;
   larkinHome: string;
   larkConfigDir: string;
@@ -62,8 +72,9 @@ export type ConfigMutation =
   | { kind: "set-global-mention"; value: MentionPolicy }
   | { kind: "set-agent-mention"; agentId: string; value: MentionPolicyOverride }
   | { kind: "set-chat-mention"; agentId: string; chatId: string; value: MentionPolicyOverride }
+  | { kind: "set-global-inbox-audit"; enabled?: boolean; intervalMs?: number }
+  | { kind: "set-agent-inbox-audit"; agentId: string; enabled?: InboxAuditEnabledOverride; intervalMs?: InboxAuditIntervalOverride }
   | { kind: "set-agent-runtime"; agentId: string; runtime: string; model?: string }
-  | { kind: "set-agent-pi-distribution"; agentId: string; distribution: "builtin" | "external" }
   | { kind: "set-agent-model"; agentId: string; model: string }
   | { kind: "set-agent-effort"; agentId: string; effort: string | null };
 
@@ -83,8 +94,11 @@ interface ConfigApplyFile { version: 1; persistedRevision: string; agents: Recor
 
 const TOP_FIELDS_V3 = new Set(["version", "serverId", "activeAgent", "agents"]);
 const TOP_FIELDS_V4 = new Set(["version", "serverId", "mentionPolicy", "activeAgent", "agents"]);
+const OPTIONAL_TOP_FIELDS_V4 = new Set(["inboxAudit"]);
 const AGENT_FIELDS_V3 = new Set(["runtime", "model", "effort", "noMentionChats", "createdAt"]);
-const AGENT_FIELDS_V4 = new Set(["runtime", "model", "piDistribution", "effort", "mentionPolicy", "chatMentionPolicies", "createdAt"]);
+const AGENT_FIELDS_V4 = new Set(["runtime", "model", "effort", "mentionPolicy", "chatMentionPolicies", "inboxAudit", "createdAt"]);
+const LEGACY_AGENT_FIELDS = new Set(["piDistribution", "runtimeOption"]);
+const INBOX_AUDIT_FIELDS = new Set(["enabled", "intervalMs"]);
 const APP_ID = /^cli_[A-Za-z0-9]+$/;
 const CHAT_ID = /^oc_[A-Za-z0-9_-]+$/;
 const PI_EFFORTS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
@@ -123,7 +137,8 @@ export function loadRuntimeModels(): RuntimeModels {
 }
 
 export function defaultModelFor(runtime: string): string {
-  const models = loadRuntimeModels()[runtime];
+  const adapter = isUserRuntime(runtime) ? fromUserRuntime(runtime).runtime : runtime;
+  const models = loadRuntimeModels()[adapter];
   if (!models) throw new Error(`runtime 模型目录不存在 runtime: ${runtime}`);
   return models[0].id;
 }
@@ -150,6 +165,88 @@ function assertPolicy(value: unknown, label: string): asserts value is MentionPo
   if (value !== "require" && value !== "free") throw new Error(`${label} 只允许 require/free`);
 }
 
+export function assertInboxAuditInterval(value: unknown, label = "inbox-audit interval"): asserts value is number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < MIN_INBOX_AUDIT_INTERVAL_MS || value > MAX_INBOX_AUDIT_INTERVAL_MS) {
+    throw new Error(`${label} 必须是 ${MIN_INBOX_AUDIT_INTERVAL_MS}–${MAX_INBOX_AUDIT_INTERVAL_MS} 毫秒`);
+  }
+}
+
+export function parseInboxAuditInterval(value: string): number {
+  if (typeof value !== "string" || !value) throw new Error("inbox-audit interval 不能为空");
+  let milliseconds: number;
+  if (/^[1-9]\d*$/.test(value)) milliseconds = Number(value);
+  else {
+    const match = /^([1-9]\d*)(m|h)$/.exec(value);
+    if (!match) throw new Error("inbox-audit interval 只允许 15m/1h 或 60000–86400000 毫秒");
+    milliseconds = Number(match[1]) * (match[2] === "h" ? 3_600_000 : 60_000);
+  }
+  assertInboxAuditInterval(milliseconds);
+  return milliseconds;
+}
+
+export function formatInboxAuditInterval(intervalMs: number): string {
+  if (intervalMs % 3_600_000 === 0) return `${intervalMs / 3_600_000}h`;
+  if (intervalMs % 60_000 === 0) return `${intervalMs / 60_000}m`;
+  return `${intervalMs}ms`;
+}
+
+function parseStoredInboxAudit(value: unknown, label: string): InboxAuditSettings {
+  if (!isPlainObject(value)) throw new Error(`${label} 必须是普通 object`);
+  assertAllowedFields(value, INBOX_AUDIT_FIELDS, label);
+  const settings: InboxAuditSettings = {};
+  if (Object.hasOwn(value, "enabled")) {
+    if (typeof value.enabled !== "boolean") throw new Error(`${label}.enabled 必须是 boolean`);
+    settings.enabled = value.enabled;
+  }
+  if (Object.hasOwn(value, "intervalMs")) {
+    assertInboxAuditInterval(value.intervalMs, `${label}.intervalMs`);
+    settings.intervalMs = value.intervalMs;
+  }
+  return settings;
+}
+
+function resolvedInboxAudit(settings: InboxAuditSettings | undefined): InboxAuditResolved {
+  return {
+    enabled: settings?.enabled ?? false,
+    intervalMs: settings?.intervalMs ?? DEFAULT_INBOX_AUDIT_INTERVAL_MS,
+  };
+}
+
+export function inboxAuditMutationFromCli(input: {
+  scope: string;
+  enabled: string | undefined;
+  interval: string | undefined;
+  agentId: string;
+}): ConfigMutation {
+  if (input.scope === "global") {
+    if (input.enabled !== "on" && input.enabled !== "off") {
+      throw new Error("用法: larkin config inbox-audit global <on|off> [--interval <15m|1h>]");
+    }
+    const mutation: Extract<ConfigMutation, { kind: "set-global-inbox-audit" }> = {
+      kind: "set-global-inbox-audit", enabled: input.enabled === "on",
+    };
+    if (input.interval !== undefined) {
+      if (input.interval === "inherit") throw new Error("全局 inbox-audit 不支持 interval=inherit");
+      mutation.intervalMs = parseInboxAuditInterval(input.interval);
+    }
+    return mutation;
+  }
+  if (input.scope === "agent") {
+    if (input.enabled !== "on" && input.enabled !== "off" && input.enabled !== "inherit") {
+      throw new Error("用法: larkin config inbox-audit agent <inherit|on|off> [--agent <App ID>] [--interval <15m|inherit>]");
+    }
+    const mutation: Extract<ConfigMutation, { kind: "set-agent-inbox-audit" }> = {
+      kind: "set-agent-inbox-audit", agentId: input.agentId,
+      enabled: input.enabled === "inherit" ? "inherit" : input.enabled === "on",
+    };
+    if (input.interval !== undefined) {
+      mutation.intervalMs = input.interval === "inherit" ? "inherit" : parseInboxAuditInterval(input.interval);
+    }
+    return mutation;
+  }
+  throw new Error("inbox-audit scope 只支持 global/agent");
+}
+
 function assertModel(runtime: string, model: string): void {
   if (model === "default") return;
   const safe = runtime === "pi" ? PI_MODEL.test(model)
@@ -164,23 +261,42 @@ function runtimeSupportsEffort(runtime: string, effort: string): boolean {
       : runtime === "claude" ? CLAUDE_EFFORTS.has(effort) : false;
 }
 
+function takeLegacyAgentFields(agent: Obj): Obj {
+  const cleaned: Obj = {};
+  for (const [field, value] of Object.entries(agent)) {
+    if (!LEGACY_AGENT_FIELDS.has(field)) cleaned[field] = value;
+  }
+  return cleaned;
+}
+
+function isLegacyBuiltinAgentRecord(agent: unknown): boolean {
+  if (!isPlainObject(agent)) return false;
+  return agent.piDistribution === "builtin" || agent.runtime === "builtin-pi" || agent.runtimeOption === "builtin-pi";
+}
+
+function canonicalizeLegacyStoredAgent(key: string, agent: Obj): Obj {
+  const cleaned = takeLegacyAgentFields(agent);
+  if (cleaned.runtime === "builtin-pi" || isLegacyBuiltinAgentRecord(agent)) cleaned.runtime = "pi";
+  if (typeof cleaned.runtime !== "string" || !cleaned.runtime) throw new Error(`Agent ${key}.runtime 必须是非空字符串`);
+  return cleaned;
+}
+
 function validateStoredAgent(key: string, agent: unknown, version: 3 | 4): asserts agent is Obj {
   if (!APP_ID.test(key)) throw new Error(`Agent key 必须是安全的飞书 App ID（cli_ + ASCII 字母数字）：${key}`);
   if (!isPlainObject(agent)) throw new Error(`Agent ${key} 必须是普通 object`);
-  assertAllowedFields(agent, version === 3 ? AGENT_FIELDS_V3 : AGENT_FIELDS_V4, `Agent ${key}`);
-  if (typeof agent.runtime !== "string" || !agent.runtime) throw new Error(`Agent ${key}.runtime 必须是非空字符串`);
-  if (!loadRuntimeModels()[agent.runtime]) throw new Error(`Agent ${key}.runtime 未知：${agent.runtime}`);
-  if (typeof agent.model !== "string" || !agent.model) throw new Error(`Agent ${key}.model 必须是非空字符串`);
-  assertModel(agent.runtime, agent.model);
-  if (Object.hasOwn(agent, "piDistribution")) {
-    if (agent.runtime !== "pi" || (agent.piDistribution !== "external" && agent.piDistribution !== "builtin")) {
-      throw new Error(`Agent ${key}.piDistribution 只允许 Pi runtime 使用 external/builtin`);
-    }
-  }
+  const canonical = canonicalizeLegacyStoredAgent(key, agent);
+  assertAllowedFields(canonical, version === 3 ? AGENT_FIELDS_V3 : AGENT_FIELDS_V4, `Agent ${key}`);
+  if (typeof canonical.runtime !== "string" || !canonical.runtime) throw new Error(`Agent ${key}.runtime 必须是非空字符串`);
+  if (!isAdapterRuntime(canonical.runtime)) throw new Error(`Agent ${key}.runtime 未知：${canonical.runtime}`);
+  if (typeof canonical.model !== "string" || !canonical.model) throw new Error(`Agent ${key}.model 必须是非空字符串`);
+  assertModel(canonical.runtime, canonical.model);
+  Object.assign(agent, canonical);
+  for (const field of LEGACY_AGENT_FIELDS) delete agent[field];
+
   if (Object.hasOwn(agent, "effort") && (typeof agent.effort !== "string" || !agent.effort)) throw new Error(`Agent ${key}.effort 必须是非空字符串`);
   if (agent.model === "default" && Object.hasOwn(agent, "effort")) throw new Error(`Agent ${key}.model=default 时不能保存 effort`);
   if (typeof agent.effort === "string") {
-    if (!runtimeSupportsEffort(agent.runtime, agent.effort)) throw new Error(`Agent ${key}.effort=${agent.effort} 不在 ${agent.runtime} 安全档位中`);
+    if (!runtimeSupportsEffort(canonical.runtime, agent.effort)) throw new Error(`Agent ${key}.effort=${agent.effort} 不在 ${canonical.runtime} 安全档位中`);
   }
   if (version === 3 && Object.hasOwn(agent, "noMentionChats")) {
     if (!Array.isArray(agent.noMentionChats) || agent.noMentionChats.some((chat) => typeof chat !== "string" || !CHAT_ID.test(chat))) {
@@ -188,6 +304,7 @@ function validateStoredAgent(key: string, agent: unknown, version: 3 | 4): asser
     }
   }
   if (version === 4 && Object.hasOwn(agent, "mentionPolicy")) assertPolicy(agent.mentionPolicy, `Agent ${key}.mentionPolicy`);
+  if (version === 4 && Object.hasOwn(agent, "inboxAudit")) parseStoredInboxAudit(agent.inboxAudit, `Agent ${key}.inboxAudit`);
   if (version === 4 && Object.hasOwn(agent, "chatMentionPolicies")) {
     if (!isPlainObject(agent.chatMentionPolicies)) throw new Error(`Agent ${key}.chatMentionPolicies 必须是普通 object`);
     for (const [chatId, policy] of Object.entries(agent.chatMentionPolicies)) {
@@ -210,9 +327,9 @@ function hydratedStoredAgent(key: string, agent: Obj, version: 3 | 4): StoredAge
   return {
     runtime: agent.runtime as string,
     model: agent.model as string,
-    ...(agent.piDistribution === "external" || agent.piDistribution === "builtin" ? { piDistribution: agent.piDistribution } : {}),
     ...(typeof agent.effort === "string" ? { effort: agent.effort } : {}),
     ...(version === 4 && (agent.mentionPolicy === "require" || agent.mentionPolicy === "free") ? { mentionPolicy: agent.mentionPolicy } : {}),
+    ...(version === 4 && Object.hasOwn(agent, "inboxAudit") ? { inboxAudit: parseStoredInboxAudit(agent.inboxAudit, `Agent ${key}.inboxAudit`) } : {}),
     ...(Object.keys(chatMentionPolicies).length ? { chatMentionPolicies, noMentionChats: Object.entries(chatMentionPolicies).filter(([, policy]) => policy === "free").map(([chatId]) => chatId) } : {}),
     ...(typeof agent.createdAt === "string" ? { createdAt: agent.createdAt } : {}),
   };
@@ -223,11 +340,11 @@ export function hydrateAgent(key: string, agent: StoredAgent & { noMentionChats?
   return {
     name: key, agentId: key, feishuAppId: key, feishuProfile: key,
     runtime: agent.runtime, model: agent.model,
-    ...(agent.piDistribution ? { piDistribution: agent.piDistribution } : {}),
     workspaceDir: layout.workspaceDir(key), stateDir: layout.agentStateDir(key),
     larkConfigDir: path.join(layout.agentStateDir(key), "lark-cli-config"),
     ...(agent.effort ? { effort: agent.effort } : {}),
     ...(agent.mentionPolicy ? { mentionPolicy: agent.mentionPolicy } : {}),
+    ...(agent.inboxAudit ? { inboxAudit: { ...agent.inboxAudit } } : {}),
     ...(agent.chatMentionPolicies ? { chatMentionPolicies: { ...agent.chatMentionPolicies } } : {}),
     ...(agent.noMentionChats ? { noMentionChats: [...agent.noMentionChats] } : {}),
     ...(agent.createdAt ? { createdAt: agent.createdAt } : {}),
@@ -244,7 +361,7 @@ export function normalizeConfig(raw: unknown, configDir: string, { mint }: { min
   const version = raw.version;
   if (version !== 3 && version !== 4) throw new Error("不支持该配置格式：larkin 只接受 version=3/4");
   const topFields = version === 3 ? TOP_FIELDS_V3 : TOP_FIELDS_V4;
-  assertAllowedFields(raw, topFields, "config");
+  assertAllowedFields(raw, version === 4 ? new Set([...TOP_FIELDS_V4, ...OPTIONAL_TOP_FIELDS_V4]) : topFields, "config");
   for (const field of topFields) if (!Object.hasOwn(raw, field)) throw new Error(`config 缺少必需字段 ${field}`);
   if (typeof raw.serverId !== "string" || !raw.serverId) throw new Error("config.serverId 必须是非空字符串");
   if (version === 4) assertPolicy(raw.mentionPolicy, "config.mentionPolicy");
@@ -254,8 +371,12 @@ export function normalizeConfig(raw: unknown, configDir: string, { mint }: { min
   if (raw.activeAgent !== null && !Object.hasOwn(raw.agents, raw.activeAgent)) throw new Error(`config.activeAgent 指向不存在的 Agent：${raw.activeAgent}`);
   const agents: Record<string, HydratedAgent> = {};
   for (const [key, agent] of Object.entries(raw.agents)) agents[key] = hydrateAgent(key, hydratedStoredAgent(key, agent as Obj, version), layout.root);
+  const inboxAudit = version === 4 && Object.hasOwn(raw, "inboxAudit")
+    ? resolvedInboxAudit(parseStoredInboxAudit(raw.inboxAudit, "config.inboxAudit"))
+    : undefined;
   return {
     version: 4, serverId: raw.serverId, mentionPolicy: version === 4 ? raw.mentionPolicy as MentionPolicy : "require",
+    ...(inboxAudit ? { inboxAudit } : {}),
     configDir: layout.configDir, larkinHome: layout.larkinHome, larkConfigDir: resolveLarkConfigDir({}, layout.root), activeAgent: raw.activeAgent as string | null, agents,
   };
 }
@@ -318,9 +439,117 @@ function readConfigFile(file: string, root = path.dirname(file)): { raw: unknown
   }
 }
 
+function collectLegacyBuiltinAgentIds(raw: unknown): string[] {
+  if (!isPlainObject(raw) || !isPlainObject(raw.agents)) return [];
+  return Object.entries(raw.agents).filter(([, agent]) => isLegacyBuiltinAgentRecord(agent)).map(([agentId]) => agentId);
+}
+
+function ownedPiProviderDirectory(configDir: string, agentId: string): string {
+  if (!APP_ID.test(agentId)) throw new Error(`Pi Agent ID 格式无效：${agentId}`);
+  return path.join(path.resolve(configDir), "providers", "pi", agentId);
+}
+
+function userPiHome(env: Env): string {
+  const home = typeof env.HOME === "string" && env.HOME.trim() ? env.HOME : os.homedir();
+  return path.resolve(home, ".pi");
+}
+
+function isInsideOrEqual(candidate: string, root: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function pathExists(target: string): boolean {
+  try { fs.lstatSync(target); return true; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function shouldSkipOwnedPiDeletion(configDir: string, expected: string, env: Env): string | null {
+  let userPi: string;
+  try { userPi = fs.realpathSync(userPiHome(env)); }
+  catch { userPi = path.resolve(userPiHome(env)); }
+  let configRoot: string;
+  try { configRoot = fs.realpathSync(path.resolve(configDir)); }
+  catch { configRoot = path.resolve(configDir); }
+  let resolvedExpected: string;
+  try { resolvedExpected = fs.realpathSync(path.resolve(expected)); }
+  catch { resolvedExpected = path.resolve(expected); }
+  if (isInsideOrEqual(configRoot, userPi)) return "config root is inside the user ~/.pi directory";
+  if (isInsideOrEqual(resolvedExpected, userPi)) return "owned Pi directory is inside the user ~/.pi directory";
+  return null;
+}
+
+function deleteOwnedPiProviderDirectory(configDir: string, agentId: string, env: Env = process.env): void {
+  const expected = ownedPiProviderDirectory(configDir, agentId);
+  const skip = shouldSkipOwnedPiDeletion(configDir, expected, env);
+  if (skip) {
+    process.stderr.write(`[larkin] skipped leftover builtin Pi directory for ${agentId}: ${skip}\n`);
+    return;
+  }
+  const parent = path.dirname(expected);
+  if (!pathExists(parent) || !pathExists(expected)) return;
+  assertNoSymlinkAncestors(expected);
+  const rootReal = fs.realpathSync(path.resolve(configDir));
+  const parentReal = fs.realpathSync(parent);
+  const relative = path.relative(rootReal, parentReal);
+  if (relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) {
+    throw new Error("owned Pi provider directory escaped the config root");
+  }
+  if (path.basename(parent) !== "pi" || path.basename(path.dirname(parent)) !== "providers") {
+    throw new Error("owned Pi provider directory is not providers/pi/<agentId>");
+  }
+  const stat = fs.lstatSync(expected);
+  if (stat.isSymbolicLink()) throw new Error("owned Pi provider directory is a symlink");
+  if (!stat.isDirectory()) throw new Error("owned Pi provider directory must be a directory");
+  fs.rmSync(expected, { recursive: true, force: false });
+}
+
+function rewriteLegacyBuiltinAgents(raw: unknown): unknown {
+  if (!isPlainObject(raw) || !isPlainObject(raw.agents)) return raw;
+  const legacyIds = new Set(collectLegacyBuiltinAgentIds(raw));
+  if (legacyIds.size === 0) return raw;
+  const agents: Record<string, unknown> = {};
+  for (const [agentId, agent] of Object.entries(raw.agents)) {
+    if (!legacyIds.has(agentId) || !isPlainObject(agent)) {
+      agents[agentId] = agent;
+      continue;
+    }
+    const next = takeLegacyAgentFields(agent);
+    if (next.runtime === "builtin-pi" || isLegacyBuiltinAgentRecord(agent)) next.runtime = "pi";
+    agents[agentId] = next;
+  }
+  return { ...raw, agents };
+}
+
+function persistLegacyBuiltinMigration(layout: TargetRootLayout, opts: { mint?: () => string }, env: Env): { raw: unknown; bytes: Buffer } {
+  const current = readConfigFile(layout.configFile, layout.root);
+  const migratedIds = collectLegacyBuiltinAgentIds(current.raw);
+  if (migratedIds.length === 0) return current;
+  const rewritten = rewriteLegacyBuiltinAgents(current.raw);
+  const config = normalizeConfig(structuredClone(rewritten), layout.root, opts);
+  const bytes = atomicWriteConfig(layout.configFile, rewritten);
+  for (const agentId of migratedIds) {
+    const agent = config.agents[agentId];
+    const model = typeof agent?.model === "string" ? agent.model : "unknown";
+    process.stderr.write(`[larkin] migrated Agent ${agentId} from builtin-pi to pi (model=${model})\n`);
+    try { deleteOwnedPiProviderDirectory(layout.root, agentId, env); }
+    catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      process.stderr.write(`[larkin] failed to delete leftover builtin Pi directory for ${agentId}: ${reason}\n`);
+    }
+  }
+  return { raw: rewritten, bytes };
+}
+
 export function loadConfig(env: Env = process.env, opts: { mint?: () => string } = {}): { configDir: string; file: string; revision: string; config: HydratedConfig } {
   const layout = TargetRootLayout.fromConfigDir(resolveConfigDir(env));
-  const { raw, bytes } = readConfigFile(layout.configFile, layout.root);
+  const initial = readConfigFile(layout.configFile, layout.root);
+  const { raw, bytes } = collectLegacyBuiltinAgentIds(initial.raw).length
+    ? withConfigLock(layout, () => persistLegacyBuiltinMigration(layout, opts, env))
+    : initial;
   return { configDir: layout.configDir, file: layout.configFile, revision: revision(bytes), config: normalizeConfig(raw, layout.root, opts) };
 }
 
@@ -336,14 +565,22 @@ export function selectAgent(config: HydratedConfig, env: Env = process.env): Hyd
   return agents[config.activeAgent];
 }
 
-export function toStored(config: HydratedConfig): { version: 4; serverId: string | null; mentionPolicy: MentionPolicy; activeAgent: string | null; agents: Record<string, StoredAgent> } {
-  const out = { version: 4 as const, serverId: config.serverId, mentionPolicy: config.mentionPolicy, activeAgent: config.activeAgent, agents: {} as Record<string, StoredAgent> };
+export function toStored(config: HydratedConfig): {
+  version: 4; serverId: string | null; mentionPolicy: MentionPolicy; inboxAudit?: InboxAuditResolved;
+  activeAgent: string | null; agents: Record<string, StoredAgent>;
+} {
+  const out: ReturnType<typeof toStored> = {
+    version: 4, serverId: config.serverId, mentionPolicy: config.mentionPolicy, activeAgent: config.activeAgent, agents: {},
+  };
+  if (config.inboxAudit) out.inboxAudit = { enabled: config.inboxAudit.enabled, intervalMs: config.inboxAudit.intervalMs };
   for (const [key, agent] of Object.entries(config.agents || {})) {
     const stored: StoredAgent = { runtime: agent.runtime, model: agent.model };
-    if (agent.piDistribution) stored.piDistribution = agent.piDistribution;
     if (typeof agent.effort === "string" && agent.effort) stored.effort = agent.effort;
     if (agent.mentionPolicy) stored.mentionPolicy = agent.mentionPolicy;
     if (agent.chatMentionPolicies && Object.keys(agent.chatMentionPolicies).length) stored.chatMentionPolicies = { ...agent.chatMentionPolicies };
+    if (agent.inboxAudit && (agent.inboxAudit.enabled !== undefined || agent.inboxAudit.intervalMs !== undefined)) {
+      stored.inboxAudit = { ...agent.inboxAudit };
+    }
     if (typeof agent.createdAt === "string" && agent.createdAt) stored.createdAt = agent.createdAt;
     out.agents[key] = stored;
   }
@@ -370,6 +607,23 @@ export function resolveAgentGlobalMentionPolicy(config: HydratedConfig, agentId:
   return { effective: config.mentionPolicy, source: "global" };
 }
 
+export function resolveInboxAuditSchedule(config: HydratedConfig, agentId: string): InboxAuditResolved & {
+  enabledSource: "agent" | "global" | "default";
+  intervalSource: "agent" | "global" | "default";
+} {
+  const agent = config.agents[agentId];
+  if (!agent) throw new Error(`Agent 不存在：${agentId}`);
+  const enabled = agent.inboxAudit?.enabled ?? config.inboxAudit?.enabled ?? false;
+  const intervalMs = agent.inboxAudit?.intervalMs ?? config.inboxAudit?.intervalMs ?? DEFAULT_INBOX_AUDIT_INTERVAL_MS;
+  assertInboxAuditInterval(intervalMs);
+  return {
+    enabled,
+    intervalMs,
+    enabledSource: agent.inboxAudit?.enabled !== undefined ? "agent" : config.inboxAudit ? "global" : "default",
+    intervalSource: agent.inboxAudit?.intervalMs !== undefined ? "agent" : config.inboxAudit?.intervalMs !== undefined ? "global" : "default",
+  };
+}
+
 function revision(bytes: Buffer | string): string {
   return `sha256:${crypto.createHash("sha256").update(bytes).digest("hex")}`;
 }
@@ -379,8 +633,10 @@ function agentSignature(config: HydratedConfig, agentId: string): string {
   if (!agent) throw new Error(`Agent 不存在：${agentId}`);
   const chats = Object.fromEntries(Object.entries(agent.chatMentionPolicies || {}).sort(([left], [right]) => left.localeCompare(right)));
   return revision(JSON.stringify({
-    runtime: agent.runtime, model: agent.model, piDistribution: agent.piDistribution ?? null, effort: agent.effort ?? null,
+    schema: 2,
+    runtime: agent.runtime, model: agent.model, effort: agent.effort ?? null,
     globalMentionPolicy: config.mentionPolicy, agentMentionPolicy: agent.mentionPolicy ?? null, chatMentionPolicies: chats,
+    globalInboxAudit: config.inboxAudit ?? null, agentInboxAudit: agent.inboxAudit ?? null,
   }));
 }
 
@@ -422,25 +678,9 @@ interface ConfigRollbackJournal {
   beforeRevision: string;
   beforeConfigBytes: string;
   beforeApplyState: ConfigApplyFile;
-  migration?: PiProfileMigrationState;
-}
-
-interface ConfigMigrationJournal {
-  version: 1;
-  phase: "forward";
-  targetAgentId: string;
-  beforeRevision: string;
-  expectedAfterRevision: string;
-  migration: PiProfileMigrationState;
 }
 
 function rollbackJournalFile(root: string): string { return path.join(root, CONFIG_ROLLBACK_JOURNAL_FILE); }
-function migrationJournalFile(root: string): string { return path.join(root, ".pi-profile-migration-journal.json"); }
-function assertMigrationTarget(root: string, agentId: string, migration: PiProfileMigrationState): void {
-  if (migration.agentId !== agentId || path.resolve(migration.targetDir) !== path.join(path.resolve(root), "providers", "pi", agentId)) {
-    throw new Error("Pi profile migration target is invalid");
-  }
-}
 
 function restoreTargetApplyState(root: string, targetAgentId: string, beforeRevision: string, before: ConfigApplyFile): void {
   const current = readApplyFile(root);
@@ -469,11 +709,9 @@ function recoverRollbackJournal(root: string): void {
   const beforeRaw = JSON.parse(beforeBytes.toString("utf8"));
   normalizeConfig(beforeRaw, root);
   validateApplyState(journal.beforeApplyState);
-  if (journal.migration !== undefined) { validatePiProfileMigrationState(journal.migration); assertMigrationTarget(root, journal.targetAgentId, journal.migration); }
   const current = readConfigFile(path.join(root, "config.json"), root);
   const currentRevision = revision(current.bytes);
   if (currentRevision === journal.expectedAfterRevision) {
-    if (journal.migration) rollbackPiProfileMigration(journal.migration);
     atomicWriteBytes(path.join(root, "config.json"), beforeBytes);
     restoreTargetApplyState(root, journal.targetAgentId, journal.beforeRevision, journal.beforeApplyState as ConfigApplyFile);
   } else if (currentRevision === journal.beforeRevision) {
@@ -485,35 +723,6 @@ function recoverRollbackJournal(root: string): void {
   }
   fs.unlinkSync(file);
   fsyncDirectoryOf(file);
-}
-
-function recoverMigrationJournal(root: string): void {
-  const file = migrationJournalFile(root);
-  const bytes = readPrivateFile(file, root, PROFILE_MIGRATION_ROLLBACK_LIMIT_BYTES, "Pi profile migration journal");
-  if (bytes === null) return;
-  let journal: Partial<ConfigMigrationJournal>;
-  try { journal = JSON.parse(bytes.toString("utf8")) as Partial<ConfigMigrationJournal>; }
-  catch { throw new Error("Pi profile migration journal is invalid"); }
-  if (journal.version !== 1 || journal.phase !== "forward" || typeof journal.targetAgentId !== "string"
-      || typeof journal.beforeRevision !== "string" || typeof journal.expectedAfterRevision !== "string" || !journal.migration) {
-    throw new Error("Pi profile migration journal is invalid");
-  }
-  validatePiProfileMigrationState(journal.migration);
-  assertMigrationTarget(root, journal.targetAgentId, journal.migration);
-  const current = readConfigFile(path.join(root, "config.json"), root);
-  const currentRevision = revision(current.bytes);
-  if (currentRevision === journal.beforeRevision) {
-    // Forward import did not publish config. The migration helper restores only
-    // files still matching its expected post-import hashes.
-    try { rollbackPiProfileMigration(journal.migration); }
-    catch (error) { throw new Error(`Pi profile migration recovery refused: ${error instanceof Error ? error.message : String(error)}`); }
-  } else if (currentRevision === journal.expectedAfterRevision) {
-    // Config won the race; verify the provider target before finalizing.
-    const migration = journal.migration;
-    assertPiProfileMigrationAfterState(migration);
-  } else throw new Error("Pi profile migration journal conflicts with the current configuration");
-  releasePiProfileMigrationLock(journal.migration);
-  fs.unlinkSync(file); fsyncDirectoryOf(file);
 }
 
 export function configApplyState(env: Env, config: HydratedConfig): Record<string, unknown> {
@@ -558,11 +767,36 @@ function applyMutation(config: HydratedConfig, mutation: ConfigMutation): { scop
     config.mentionPolicy = mutation.value;
     return { scope: "global", runtimeChange: false, affectedAgentIds: Object.keys(config.agents) };
   }
+  if (mutation.kind === "set-global-inbox-audit") {
+    if (mutation.enabled === undefined && mutation.intervalMs === undefined) throw new Error("inbox-audit 全局变更必须包含 enabled 或 interval");
+    const current = resolvedInboxAudit(config.inboxAudit);
+    if (mutation.enabled !== undefined) current.enabled = mutation.enabled;
+    if (mutation.intervalMs !== undefined) {
+      assertInboxAuditInterval(mutation.intervalMs, "全局 inbox-audit interval");
+      current.intervalMs = mutation.intervalMs;
+    }
+    config.inboxAudit = current;
+    return { scope: "global", runtimeChange: false, affectedAgentIds: Object.keys(config.agents) };
+  }
   if (!APP_ID.test(mutation.agentId) || !config.agents[mutation.agentId]) throw new Error(`Agent 不存在：${mutation.agentId}`);
   const agent = config.agents[mutation.agentId];
   if (mutation.kind === "set-agent-mention") {
     if (mutation.value === "inherit") delete agent.mentionPolicy;
     else { assertPolicy(mutation.value, "Agent mention policy"); agent.mentionPolicy = mutation.value; }
+    return { scope: "agent", agentId: mutation.agentId, runtimeChange: false, affectedAgentIds: [mutation.agentId] };
+  }
+  if (mutation.kind === "set-agent-inbox-audit") {
+    if (mutation.enabled === undefined && mutation.intervalMs === undefined) throw new Error("inbox-audit Agent 变更必须包含 enabled 或 interval");
+    const current: InboxAuditSettings = { ...(agent.inboxAudit || {}) };
+    if (mutation.enabled === "inherit") delete current.enabled;
+    else if (mutation.enabled !== undefined) current.enabled = mutation.enabled;
+    if (mutation.intervalMs === "inherit") delete current.intervalMs;
+    else if (mutation.intervalMs !== undefined) {
+      assertInboxAuditInterval(mutation.intervalMs, "Agent inbox-audit interval");
+      current.intervalMs = mutation.intervalMs;
+    }
+    if (current.enabled === undefined && current.intervalMs === undefined) delete agent.inboxAudit;
+    else agent.inboxAudit = current;
     return { scope: "agent", agentId: mutation.agentId, runtimeChange: false, affectedAgentIds: [mutation.agentId] };
   }
   if (mutation.kind === "set-chat-mention") {
@@ -574,16 +808,12 @@ function applyMutation(config: HydratedConfig, mutation: ConfigMutation): { scop
     agent.noMentionChats = Object.entries(policies).filter(([, value]) => value === "free").map(([chatId]) => chatId);
     return { scope: "chat", agentId: mutation.agentId, runtimeChange: false, affectedAgentIds: [mutation.agentId] };
   }
-  if (mutation.kind === "set-agent-pi-distribution") {
-    if (agent.runtime !== "pi") throw new Error(`Agent ${mutation.agentId} 不是 Pi runtime`);
-    if (mutation.distribution !== "builtin" && mutation.distribution !== "external") throw new Error("Pi distribution 只允许 builtin/external");
-    agent.piDistribution = mutation.distribution;
-  } else if (mutation.kind === "set-agent-runtime") {
-    if (!loadRuntimeModels()[mutation.runtime]) throw new Error(`未知 runtime：${mutation.runtime}`);
-    assertModel(mutation.runtime, mutation.model || "default");
-    agent.runtime = mutation.runtime;
+  if (mutation.kind === "set-agent-runtime") {
+    if (!isUserRuntime(mutation.runtime)) throw new Error(`未知 runtime：${mutation.runtime}`);
+    const stored = fromUserRuntime(mutation.runtime);
+    assertModel(stored.runtime, mutation.model || "default");
+    agent.runtime = stored.runtime;
     agent.model = mutation.model || "default";
-    if (mutation.runtime !== "pi") delete agent.piDistribution;
     delete agent.effort;
   } else if (mutation.kind === "set-agent-model") {
     if (!mutation.model.trim()) throw new Error("model 不能为空");
@@ -708,7 +938,7 @@ function assertConfigRoot(root: string): void {
   if (typeof process.getuid === "function" && stat.uid !== process.getuid()) throw new Error("config root owner is unsafe");
 }
 
-function withConfigLock<T>(layout: TargetRootLayout, action: () => T): T {
+function acquireConfigLock(layout: TargetRootLayout): { release: () => void } {
   assertNoSymlinkAncestors(layout.root);
   fs.mkdirSync(layout.root, { recursive: true, mode: 0o700 });
   const rootStat = fs.lstatSync(layout.root);
@@ -736,15 +966,38 @@ function withConfigLock<T>(layout: TargetRootLayout, action: () => T): T {
     }
   }
   if (!acquired) throw new Error("配置正被其他进程修改，请稍后重试");
+  return {
+    release() {
+      const current = readLockRecord(lock);
+      if (current?.record?.nonce === owner.nonce && current.record.pid === owner.pid) {
+        try { fs.unlinkSync(lock); fsyncDirectoryOf(lock); } catch { /* best effort */ }
+      }
+    },
+  };
+}
+
+function withConfigLock<T>(layout: TargetRootLayout, action: () => T): T {
+  const held = acquireConfigLock(layout);
   try {
-    recoverMigrationJournal(layout.root);
     recoverRollbackJournal(layout.root);
     return action();
   } finally {
-    const current = readLockRecord(lock);
-    if (current?.record?.nonce === owner.nonce && current.record.pid === owner.pid) {
-      try { fs.unlinkSync(lock); fsyncDirectoryOf(lock); } catch { /* best effort */ }
-    }
+    held.release();
+  }
+}
+
+export function withConfigMutationLock<T>(env: Env, action: () => T): T {
+  return withConfigLock(TargetRootLayout.fromConfigDir(resolveConfigDir(env)), action);
+}
+
+export async function withConfigMutationLockAsync<T>(env: Env, action: () => Promise<T>): Promise<T> {
+  const layout = TargetRootLayout.fromConfigDir(resolveConfigDir(env));
+  const held = acquireConfigLock(layout);
+  try {
+    recoverRollbackJournal(layout.root);
+    return await action();
+  } finally {
+    held.release();
   }
 }
 
@@ -757,7 +1010,6 @@ interface ConfigSnapshot {
   beforeConfig: unknown;
   beforeConfigBytes: string;
   beforeApplyState: ConfigApplyFile;
-  migration?: PiProfileMigrationState;
 }
 
 const CONFIG_ROLLBACK_JOURNAL_FILE = ".config-rollback-journal.json";
@@ -820,10 +1072,6 @@ function readConfigSnapshot(file: string, root: string): ConfigSnapshot {
   try { beforeRaw = JSON.parse(beforeBytes.toString("utf8")); } catch { throw new Error("config snapshot before config is invalid"); }
   if (JSON.stringify(beforeRaw) !== JSON.stringify(parsed.beforeConfig)) throw new Error("config snapshot before config does not match bytes");
   validateApplyState(parsed.beforeApplyState);
-  if (parsed.migration !== undefined) {
-    validatePiProfileMigrationState(parsed.migration);
-    assertMigrationTarget(root, parsed.targetAgentId, parsed.migration);
-  }
   return parsed as ConfigSnapshot;
 }
 
@@ -846,7 +1094,7 @@ function atomicWriteConfig(file: string, value: unknown, limit = CONFIG_LIMIT_BY
   return atomicWriteBytes(file, bytes, limit);
 }
 
-export function mutateConfig(env: Env, mutation: ConfigMutation, authority: ConfigAuthority, options: { snapshotFile?: string; importExternalProfile?: boolean } = {}): ConfigMutationResult {
+export function mutateConfig(env: Env, mutation: ConfigMutation, authority: ConfigAuthority, options: { snapshotFile?: string } = {}): ConfigMutationResult {
   assertAuthority(authority, mutation);
   const layout = TargetRootLayout.fromConfigDir(resolveConfigDir(env));
   return withConfigLock(layout, () => {
@@ -854,12 +1102,6 @@ export function mutateConfig(env: Env, mutation: ConfigMutation, authority: Conf
     if (current.raw === null) throw new Error(`没找到配置 ${layout.configFile}，先跑 larkin setup`);
     const config = normalizeConfig(current.raw, layout.root);
     const priorSignatures = Object.fromEntries(Object.keys(config.agents).map((agentId) => [agentId, agentSignature(config, agentId)]));
-    if (options.importExternalProfile && (mutation.kind !== "set-agent-pi-distribution" || mutation.distribution !== "builtin")) {
-      throw new Error("external Pi profile import is only valid for builtin Pi distribution");
-    }
-    const migrationPlan = options.importExternalProfile && mutation.kind === "set-agent-pi-distribution"
-      ? preparePiProfileMigration(env, layout.root, mutation.agentId, "builtin")
-      : undefined;
     const changed = applyMutation(config, mutation);
     const stored = toStored(config);
     normalizeConfig(stored, layout.root);
@@ -874,15 +1116,7 @@ export function mutateConfig(env: Env, mutation: ConfigMutation, authority: Conf
         version: 2, targetAgentId: changed.agentId, beforeRevision: revision(current.bytes), afterRevision: nextRevision,
         afterSignature: agentSignature(config, changed.agentId), beforeConfig: current.raw,
         beforeConfigBytes: current.bytes.toString("base64"), beforeApplyState,
-        ...(migrationPlan ? { migration: migrationPlan.state } : {}),
       });
-    }
-    if (migrationPlan) {
-      atomicWriteConfig(migrationJournalFile(layout.root), {
-        version: 1, phase: "forward", targetAgentId: changed.agentId, beforeRevision: revision(current.bytes),
-        expectedAfterRevision: nextRevision, migration: migrationPlan.state,
-      }, PROFILE_MIGRATION_ROLLBACK_LIMIT_BYTES);
-      applyPiProfileMigration(migrationPlan);
     }
     atomicWriteConfig(layout.configFile, stored);
     let fullyApplied = changed.affectedAgentIds.length === 0;
@@ -903,11 +1137,6 @@ export function mutateConfig(env: Env, mutation: ConfigMutation, authority: Conf
       }
       writeApplyFile(layout.root, applyState);
     } catch { fullyApplied = false; /* Config persistence remains authoritative. */ }
-    if (migrationPlan) {
-      releasePiProfileMigrationLock(migrationPlan.state);
-      try { fs.unlinkSync(migrationJournalFile(layout.root)); fsyncDirectoryOf(migrationJournalFile(layout.root)); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    }
     return {
       revision: nextRevision, previousRevision: revision(current.bytes), changedScope: changed.scope,
       ...(changed.agentId ? { agentId: changed.agentId } : {}), persisted: true,
@@ -932,10 +1161,8 @@ export function rollbackConfig(env: Env, snapshotFile: string): { revision: stri
     const journal: ConfigRollbackJournal = {
       version: 1, targetAgentId: snapshot.targetAgentId, expectedAfterRevision: snapshot.afterRevision,
       beforeRevision: snapshot.beforeRevision, beforeConfigBytes: snapshot.beforeConfigBytes, beforeApplyState: snapshot.beforeApplyState,
-      ...(snapshot.migration ? { migration: snapshot.migration } : {}),
     };
     atomicWriteConfig(rollbackJournalFile(layout.root), journal, PROFILE_MIGRATION_ROLLBACK_LIMIT_BYTES);
-    if (snapshot.migration) rollbackPiProfileMigration(snapshot.migration);
     const bytes = atomicWriteBytes(layout.configFile, beforeBytes);
     restoreTargetApplyState(layout.root, snapshot.targetAgentId, snapshot.beforeRevision, snapshot.beforeApplyState);
     fs.unlinkSync(rollbackJournalFile(layout.root));
@@ -958,15 +1185,31 @@ export function commitSetupConfig(env: Env, expectedRevision: string, nextStored
 export function safeConfigView(config: HydratedConfig, onlyAgentId?: string, chatId?: string, applyState?: Record<string, unknown>): Record<string, unknown> {
   const entries = onlyAgentId ? [[onlyAgentId, config.agents[onlyAgentId]]] as const : Object.entries(config.agents);
   const agents = entries.filter((entry): entry is readonly [string, HydratedAgent] => Boolean(entry[1])).map(([agentId, agent]) => ({
-    agentId, runtime: agent.runtime, model: agent.model, piDistribution: agent.piDistribution ?? (agent.runtime === "pi" ? "external" : null), effort: agent.effort ?? null,
+    agentId, runtime: agent.runtime, runtimeOption: toUserRuntime(agent.runtime), model: agent.model, effort: agent.effort ?? null,
     mention: {
       override: agent.mentionPolicy ?? "inherit",
       effective: agent.mentionPolicy ?? config.mentionPolicy,
       source: agent.mentionPolicy ? "agent" : "global",
       ...(chatId ? { chat: { chatId, override: agent.chatMentionPolicies?.[chatId] ?? "inherit", ...resolveMentionPolicy(config, agentId, chatId) } } : {}),
     },
+    inboxAudit: (() => {
+      const resolved = resolveInboxAuditSchedule(config, agentId);
+      return {
+        override: {
+          enabled: agent.inboxAudit?.enabled === undefined ? "inherit" : agent.inboxAudit.enabled ? "on" : "off",
+          intervalMs: agent.inboxAudit?.intervalMs ?? "inherit",
+        },
+        effective: { enabled: resolved.enabled, intervalMs: resolved.intervalMs },
+        source: { enabled: resolved.enabledSource, intervalMs: resolved.intervalSource },
+      };
+    })(),
     chatMentionPolicies: { ...(agent.chatMentionPolicies || {}) },
     apply: (applyState?.agents as Record<string, unknown> | undefined)?.[agentId] ?? { applyState: "unknown" },
   }));
-  return { version: 4, mentionPolicy: config.mentionPolicy, persistedRevision: applyState?.persistedRevision ?? "unknown", agents };
+  const inboxAudit = resolvedInboxAudit(config.inboxAudit);
+  return {
+    version: 4, mentionPolicy: config.mentionPolicy,
+    inboxAudit: { enabled: inboxAudit.enabled, intervalMs: inboxAudit.intervalMs },
+    persistedRevision: applyState?.persistedRevision ?? "unknown", agents,
+  };
 }

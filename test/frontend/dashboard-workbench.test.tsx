@@ -6,6 +6,7 @@ import { App, useStatusPolling } from "../../src/dashboard/web/app";
 const agents = [
   {
     agentId: "cli_AgentA1", name: "cli_AgentA1", displayName: "研究员", runtime: "pi", model: "default", effort: null,
+    runtimeReadiness: null,
     running: true, issue: false, credentialReady: true, bot: null,
     connection: { state: "connected", reason: "current channel" }, inbound: { state: "pending", reason: "waiting" },
     lastActivity: { state: "working", detail: "整理资料", ageSec: 8 }, lastDeliver: { from: "idan", target: "#research", ageSec: 12 },
@@ -15,6 +16,12 @@ const agents = [
   },
   {
     agentId: "cli_AgentB2", name: "cli_AgentB2", displayName: "Builder", runtime: "codex", model: "gpt-5.6-sol", effort: "high",
+    runtimeReadiness: null as {
+      runtime: "codex" | "claude" | "pi";
+      state: "missing" | "unauthenticated" | "incompatible" | "ready";
+      reason?: string;
+      nextAction?: string;
+    } | null,
     running: true, issue: false, credentialReady: true, bot: null,
     connection: { state: "connected", reason: "current channel" }, inbound: { state: "verified", reason: "observed" },
     lastActivity: { state: "idle", detail: "等待任务", ageSec: 18 }, lastDeliver: { from: "idan", target: "#build", ageSec: 22 },
@@ -31,6 +38,15 @@ const agents = [
     ],
     feed: [{ kind: "activity", state: "idle", detail: "等待任务", at: "2026-07-24T10:00:00.000Z" }], recentErrors: [], knownChats: 1,
   },
+  {
+    agentId: "cli_AgentC3", name: "cli_AgentC3", displayName: "Pi Agent", runtime: "pi", model: "deepseek/deepseek-v4-pro", effort: null,
+    runtimeReadiness: null,
+    running: true, issue: false, credentialReady: false, bot: null,
+    connection: { state: "connected", reason: "current channel" }, inbound: { state: "pending", reason: "waiting" },
+    lastActivity: { state: "idle", detail: "等待任务", ageSec: 30 }, lastDeliver: null,
+    eyeIndicator: { pendingCount: 0, oldestAgeSec: null, stuck: false }, activeReminders: 0, remindersList: [],
+    session: null, conversation: [], feed: [], recentErrors: [], knownChats: 0,
+  },
 ];
 
 const status = {
@@ -39,14 +55,22 @@ const status = {
 };
 
 const config = (agentId?: string) => ({
-  version: 4, mentionPolicy: "free", persistedRevision: "sha256:revision",
+  version: 4, mentionPolicy: "free", inboxAudit: { enabled: false, intervalMs: 15 * 60_000 }, persistedRevision: "sha256:revision",
   runtimeModels: {
+    pi: [{ id: "default" }],
     codex: [{ id: "default" }, { id: "gpt-5.6-sol", supportedReasoningEfforts: ["low", "high"] }],
-    claude: [{ id: "default" }], pi: [{ id: "default" }],
+    claude: [{ id: "default" }],
   },
+  runtimeOptions: ["codex", "claude", "pi"] as const,
   agents: (agentId ? agents.filter((agent) => agent.agentId === agentId) : agents).map((agent) => ({
-    agentId: agent.agentId, runtime: agent.runtime, model: agent.model, effort: agent.effort,
+    agentId: agent.agentId, runtime: agent.runtime,
+    runtimeOption: agent.runtime as "codex" | "claude" | "pi",
+    model: agent.model, effort: agent.effort,
     mention: { override: agent.agentId === "cli_AgentB2" ? "require" : "inherit", effective: agent.agentId === "cli_AgentB2" ? "require" : "free", source: agent.agentId === "cli_AgentB2" ? "agent" : "global" },
+    inboxAudit: {
+      override: { enabled: "inherit", intervalMs: "inherit" }, effective: { enabled: false, intervalMs: 15 * 60_000 },
+      source: { enabled: "default", intervalMs: "default" },
+    },
     knownChats: agent.agentId === "cli_AgentB2" ? [
       { chatId: "oc_BuildRoom", displayName: "构建群", kind: "group", override: "free", effective: "free", source: "chat" },
       { chatId: "oc_InheritedRoom", displayName: "继承群", kind: "group", override: "inherit", effective: "require", source: "agent" },
@@ -129,6 +153,96 @@ describe("Agent-centric dashboard workbench", () => {
     expect(confirm).toHaveBeenCalled();
     expect(screen.getByRole("heading", { level: 1, name: "Builder" })).toBeVisible();
     expect(window.location.search).toContain("agent=cli_AgentB2");
+  });
+
+  it("saves global Inbox audit controls through the existing protected mutation", async () => {
+    const mutations: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname === "/api/status") return ok(status);
+      if (url.pathname === "/api/config" && init?.method === "PATCH") {
+        mutations.push(JSON.parse(String(init.body)));
+        return ok({ revision: "sha256:global-audit", applyState: "saved_not_applied" });
+      }
+      if (url.pathname === "/api/config") return ok(config(url.searchParams.get("agent") || undefined));
+      if (url.pathname === "/api/models/codex") return ok({ models: [{ id: "default", label: "default" }] });
+      throw new Error(`unexpected request ${url}`);
+    }));
+    render(<App />);
+    await screen.findByRole("heading", { level: 1, name: "Builder" });
+    await userEvent.click(screen.getByRole("button", { name: "全局设置" }));
+    const dialog = await screen.findByRole("dialog");
+    const gap = within(dialog).getByLabelText("全局巡检间隔（分钟）");
+    await userEvent.clear(gap);
+    await userEvent.type(gap, "0");
+    await userEvent.click(within(dialog).getByRole("button", { name: "保存全局设置" }));
+    expect(within(dialog).getByRole("status")).toHaveTextContent("巡检间隔必须在 1 到 1440 分钟之间");
+    expect(gap).toHaveValue(0);
+    expect(mutations).toEqual([]);
+    await userEvent.clear(gap);
+    await userEvent.type(gap, "30");
+    await userEvent.click(within(dialog).getByRole("button", { name: "保存全局设置" }));
+    await waitFor(() => expect(mutations).toEqual([{ operation: "set-global-inbox-audit", intervalMs: 30 * 60_000 }]));
+    expect(within(dialog).getByRole("checkbox")).not.toBeChecked();
+    await userEvent.click(within(dialog).getByRole("checkbox"));
+    await userEvent.click(within(dialog).getByRole("button", { name: "保存全局设置" }));
+    await waitFor(() => expect(mutations).toEqual([
+      { operation: "set-global-inbox-audit", intervalMs: 30 * 60_000 },
+      { operation: "set-global-inbox-audit", enabled: true },
+    ]));
+    expect(within(dialog).getByRole("status")).toHaveTextContent("已保存");
+  });
+
+  it("keeps a precise existing audit gap when saving a different global setting", async () => {
+    const mutations: Array<Record<string, unknown>> = [];
+    const persisted = config();
+    persisted.inboxAudit = { enabled: false, intervalMs: 60_060 };
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname === "/api/status") return ok(status);
+      if (url.pathname === "/api/config" && init?.method === "PATCH") {
+        mutations.push(JSON.parse(String(init.body)));
+        return ok({ revision: "sha256:precise-gap", applyState: "saved_not_applied" });
+      }
+      if (url.pathname === "/api/config") return ok(persisted);
+      if (url.pathname === "/api/models/codex") return ok({ models: [{ id: "default", label: "default" }] });
+      throw new Error(`unexpected request ${url}`);
+    }));
+    render(<App />);
+    await screen.findByRole("heading", { level: 1, name: "Builder" });
+    await userEvent.click(screen.getByRole("button", { name: "全局设置" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByLabelText("全局巡检间隔（分钟）")).toHaveValue(1.001);
+    await userEvent.selectOptions(within(dialog).getByLabelText("真人群消息默认策略"), "require");
+    await userEvent.click(within(dialog).getByRole("button", { name: "保存全局设置" }));
+    await waitFor(() => expect(mutations).toEqual([{ operation: "set-global-mention", value: "require" }]));
+    expect(within(dialog).getByRole("status")).toHaveTextContent("已保存");
+  });
+
+  it("keeps an Agent Inbox audit draft visible after a rejected save", async () => {
+    const mutations: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname === "/api/status") return ok(status);
+      if (url.pathname === "/api/config" && init?.method === "PATCH") {
+        mutations.push(JSON.parse(String(init.body)));
+        return Promise.resolve({ ok: false, status: 400, json: async () => ({ error: "configuration update rejected" }) });
+      }
+      if (url.pathname === "/api/config") return ok(config(url.searchParams.get("agent") || undefined));
+      if (url.pathname === "/api/models/codex") return ok({ models: [{ id: "default", label: "default" }] });
+      throw new Error(`unexpected request ${url}`);
+    }));
+    render(<App />);
+    await screen.findByRole("heading", { level: 1, name: "Builder" });
+    await userEvent.selectOptions(await screen.findByLabelText("Inbox 巡检设置"), "on");
+    const gap = screen.getByLabelText("Agent 巡检间隔（分钟）");
+    await userEvent.clear(gap);
+    await userEvent.type(gap, "30");
+    await userEvent.click(screen.getByRole("button", { name: "保存 Agent 配置" }));
+    await waitFor(() => expect(mutations).toEqual([{ operation: "set-agent-inbox-audit", agentId: "cli_AgentB2", enabled: true, intervalMs: 30 * 60_000 }]));
+    expect(screen.getByRole("status")).toHaveTextContent("configuration update rejected");
+    expect(screen.getByLabelText("Inbox 巡检设置")).toHaveValue("on");
+    expect(screen.getByLabelText("Agent 巡检间隔（分钟）")).toHaveValue(30);
   });
 
   it("filters the sidebar and preserves last-known status on polling errors", async () => {
@@ -324,6 +438,18 @@ describe("Agent-centric dashboard workbench", () => {
       String(input) === "/api/models/pi?agent=cli_AgentA1")).toBe(true));
     expect(screen.getByRole("option", { name: "default: openai/gpt-5.2" })).toBeVisible();
     expect(screen.getByRole("option", { name: "Claude Sonnet 4.5 · anthropic" })).toBeVisible();
+    expect(screen.queryByLabelText("Pi 发行版")).not.toBeInTheDocument();
+    const runtimeSelect = screen.getByLabelText("Runtime");
+    expect([...runtimeSelect.querySelectorAll("option")].map((option) => option.getAttribute("value"))).toEqual(["codex", "claude", "pi"]);
+    expect(screen.queryByRole("option", { name: "builtin-pi" })).not.toBeInTheDocument();
+  });
+
+  it("does not render a Pi distribution control for any runtime", async () => {
+    render(<App />);
+    expect(await screen.findByLabelText("Runtime")).toHaveValue("codex");
+    expect(screen.queryByText("内置 Pi")).not.toBeInTheDocument();
+    expect(screen.queryByText("用户安装的 Pi")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Pi 发行版")).not.toBeInTheDocument();
   });
 
   it("loads the current Codex CLI catalog instead of presenting only the authored compatibility list", async () => {
@@ -476,5 +602,70 @@ describe("Agent-centric dashboard workbench", () => {
     await screen.findByText("只读工作区");
     expect(document.querySelector(".agent-content")).toHaveClass("workspace-active");
     expect(document.querySelector(".workspace-browser")).toBeVisible();
+  });
+
+  it("does not render Provider Credentials and keeps only three runtime options", async () => {
+    window.history.replaceState(null, "", "/?agent=cli_AgentC3&tab=configuration");
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname === "/api/status") return ok(status);
+      if (url.pathname === "/api/config") return ok(config(url.searchParams.get("agent") || undefined));
+      if (url.pathname === "/api/workspace") return ok({ kind: "directory", path: "", parent: null, entries: [] });
+      if (url.pathname === "/api/models/pi" || url.pathname === "/api/models/codex" || url.pathname === "/api/models/claude") {
+        return ok({ models: [{ id: "default", label: "default" }, { id: "deepseek/deepseek-v4-pro", label: "DeepSeek" }] });
+      }
+      throw new Error(`unexpected request ${url}`);
+    }));
+    render(<App />);
+    await screen.findByRole("heading", { level: 1, name: "Pi Agent" });
+    expect(screen.queryByRole("heading", { level: 3, name: "Provider Credentials" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/pi-auth|pi-distribution|bundled Pi|auth\.json/i)).not.toBeInTheDocument();
+    const runtimeSelect = await screen.findByLabelText("Runtime");
+    expect([...runtimeSelect.querySelectorAll("option")].map((option) => option.getAttribute("value"))).toEqual(["codex", "claude", "pi"]);
+  });
+
+  it("renders readiness in Overview and Agent 配置, and shows a rejected runtime-switch error", async () => {
+    const missing = {
+      runtime: "claude" as const,
+      state: "missing" as const,
+      reason: "claude is not installed",
+      nextAction: "Install Claude Code and ensure `claude` is on PATH, or set LARKIN_CLAUDE_COMMAND.",
+    };
+    const prior = agents[1].runtimeReadiness;
+    agents[1].runtimeReadiness = {
+      runtime: "codex",
+      state: "unauthenticated",
+      reason: "codex is installed but not logged in",
+      nextAction: "Run `codex login`, then retry.",
+    };
+    try {
+      vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input), "http://localhost");
+        if (url.pathname === "/api/status") return ok(status);
+        if (url.pathname === "/api/config" && init?.method === "PATCH") {
+          return Promise.resolve({
+            ok: false,
+            status: 400,
+            json: async () => ({ error: missing.reason, readiness: missing }),
+          });
+        }
+        if (url.pathname === "/api/config") return ok(config(url.searchParams.get("agent") || undefined));
+        if (url.pathname === "/api/models/codex" || url.pathname === "/api/models/claude") {
+          return ok({ models: [{ id: "default", label: "default: claude" }] });
+        }
+        throw new Error(`unexpected request ${url}`);
+      }));
+      render(<App />);
+      await screen.findByRole("heading", { level: 1, name: "Builder" });
+      expect(screen.getByText(/^Readiness unauthenticated · codex is installed but not logged in · Run `codex login`/)).toBeVisible();
+      await userEvent.click(screen.getByRole("tab", { name: "概览" }));
+      expect(screen.getByText(/^unauthenticated · codex is installed but not logged in · Run `codex login`/)).toBeVisible();
+      await userEvent.click(screen.getByRole("tab", { name: "配置" }));
+      await userEvent.selectOptions(await screen.findByLabelText("Runtime"), "claude");
+      await userEvent.click(screen.getByRole("button", { name: "保存并应用" }));
+      const feedback = await screen.findByRole("status");
+      expect(feedback).toHaveTextContent(/claude is not installed/);
+      expect(feedback).toHaveTextContent(/Install Claude Code/);
+    } finally { agents[1].runtimeReadiness = prior; }
   });
 });

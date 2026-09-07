@@ -45,7 +45,7 @@ test("Agent CLI manifest is the single machine-readable public command inventory
   assert.deepEqual(cliModule.AGENT_CLI_CAPABILITIES.commands.reminder, ["schedule", "list", "snooze", "update", "cancel", "log"]);
   assert.deepEqual(cliModule.AGENT_CLI_CAPABILITIES.commands.interaction, ["callback-status", "callback-probe", "create", "get", "resolve"]);
   assert.deepEqual(cliModule.AGENT_CLI_CAPABILITIES.commands.profile, ["show"]);
-  assert.deepEqual(cliModule.AGENT_CLI_CAPABILITIES.commands.config, ["show", "runtime", "model", "effort", "mention", "apply"]);
+  assert.deepEqual(cliModule.AGENT_CLI_CAPABILITIES.commands.config, ["show", "runtime", "model", "effort", "mention", "inbox-audit", "apply"]);
   const f = fixture();
   try {
     const help = JSON.parse(f.run(["--help"]).stdout);
@@ -133,6 +133,9 @@ test("Agent config commands reject extra positionals and operation-inapplicable 
       ["mention", "chat", "oc_self", "free", "--json"],
       ["apply", "extra"],
       ["apply", "--chat", "oc_irrelevant"],
+      ["inbox-audit", "global", "on", "extra"],
+      ["inbox-audit", "global", "on", "--agent", f.agentId],
+      ["inbox-audit", "agent", "on", "--chat", "oc_irrelevant"],
     ];
     for (const args of invalidCases) {
       const rejected = f.run(["config", ...args]);
@@ -258,7 +261,7 @@ let input="";process.stdin.on("data",c=>{input+=c;for(;;){const i=input.indexOf(
         LARKIN_TEST_RUNTIME_MODEL_DIRECTORY_FILE: modelDirectoryFixture,
       };
       const run = (...args) => spawnSync(process.execPath, [entry, ...args], { cwd: ROOT, encoding: "utf8", env, timeout: 30_000 });
-      const directory = spawnSync(process.execPath, [path.join(ROOT, "dist/app/runtime-model-directory.mjs"), runtimeCase.runtime, path.join(root, "agents", agentId)], {
+      const directory = spawnSync(process.execPath, [path.join(ROOT, "dist/app/runtime-model-directory.mjs"), runtimeCase.runtime, path.join(root, "agents", agentId), agentId], {
         cwd: ROOT, encoding: "utf8", env, timeout: 30_000,
       });
       assert.equal(directory.status, 0, `${runtimeCase.runtime}: ${directory.stderr}`);
@@ -284,18 +287,104 @@ let input="";process.stdin.on("data",c=>{input+=c;for(;;){const i=input.indexOf(
   } finally { fs.rmSync(temp, { recursive: true, force: true }); }
 });
 
-test("inbox audit returns bounded group/topic instructions without a delivery side effect", () => {
+test("Runtime session querying another Pi Agent uses the user Pi install and ignores a host decoy", () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-agent-cli-pi-isolation-"));
+  const session = "cli_piCatalogSessionA1";
+  const target = "cli_piCatalogTargetB2";
+  const decoy = path.join(temp, "decoy-host-pi");
+  const logFile = path.join(temp, "fake-pi.log");
+  const bin = path.join(temp, "bin");
+  const entry = path.join(ROOT, "dist", "app", "agent-cli.mjs");
+  try {
+    fs.mkdirSync(bin, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(bin, "pi"), `#!${process.execPath}
+import fs from "node:fs";
+fs.appendFileSync(${JSON.stringify(logFile)}, JSON.stringify({
+  agentDir: process.env.PI_CODING_AGENT_DIR || null,
+}) + "\\n");
+process.exit(1);
+`, { mode: 0o755 });
+    fs.writeFileSync(logFile, "");
+    fs.mkdirSync(path.join(temp, "agents", session), { recursive: true });
+    fs.mkdirSync(path.join(temp, "agents", target), { recursive: true });
+    fs.writeFileSync(path.join(temp, "config.json"), `${JSON.stringify({
+      version: 4, serverId: "server-agent-cli-pi-isolation", mentionPolicy: "require", activeAgent: session,
+      agents: {
+        [session]: { runtime: "pi", model: "default" },
+        [target]: { runtime: "pi", model: "default" },
+      },
+    })}\n`, { mode: 0o600 });
+    const env = {
+      ...process.env,
+      HOME: temp,
+      PATH: `${bin}:/usr/bin:/bin`,
+      LARKIN_CONFIG_DIR: temp,
+      LARKIN_AGENT_ID: session,
+      PI_CODING_AGENT_DIR: decoy,
+    };
+    const result = spawnSync(process.execPath, [entry, "config", "model", "owned/model", "--agent", target], {
+      cwd: ROOT, encoding: "utf8", env, timeout: 30_000,
+    });
+    assert.notEqual(result.status, 0);
+    assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, new RegExp(decoy.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    const recorded = fs.readFileSync(logFile, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    assert.ok(recorded.length >= 1, "cross-agent catalog must spawn host pi for the external target");
+    for (const row of recorded) {
+      assert.equal(row.agentDir, null);
+    }
+  } finally { fs.rmSync(temp, { recursive: true, force: true }); }
+});
+
+test("inbox audit read is public and completion requires its current receipt", () => {
   const f = fixture();
   try {
-    fs.writeFileSync(path.join(f.root, "inbox-audit.json"), JSON.stringify({ version: 1, targets: [{
-      agent_id: f.agentId, target: "thread:oc_audit:omt_audit", anchor: "om_audit", observed_at: "2026-07-20T00:00:00.000Z",
+    fs.writeFileSync(path.join(f.root, "inbox-audit.json"), JSON.stringify({ version: 4, targets: [{
+      agent_id: f.agentId, generation: "00000000-0000-4000-8000-000000000001", source_seq: 1, target: "thread:oc_audit:omt_audit", anchor: "om_audit", observed_at: "2026-07-20T00:00:00.000Z", status: "pending",
     }] }), { mode: 0o600 });
     const result = f.run(["inbox", "audit", "--json"]);
     assert.equal(result.code, 0, result.stderr);
     const body = JSON.parse(result.stdout);
     assert.deepEqual(body.targets.map((row) => ({ target: row.target, anchor: row.anchor })), [{ target: "thread:oc_audit:omt_audit", anchor: "om_audit" }]);
     assert.match(body.targets[0].instruction, /threads-messages-list/);
+    assert.match(body.targets[0].instruction, /audit complete --receipt/);
+    assert.equal(typeof body.targets[0].receipt, "string");
+    assert.match(body.targets[0].revision, /^sha256:/);
     assert.equal(body.no_finding, "stay_silent");
+    const second = f.run(["inbox", "audit", "--json"]);
+    assert.equal(second.code, 0, second.stderr);
+    assert.equal(JSON.parse(second.stdout).targets.length, 1, "reading has no delivery or completion side effect");
+    const complete = f.run(["inbox", "audit", "complete", "--receipt", body.targets[0].receipt, "--outcome", "no-finding", "--json"]);
+    assert.equal(complete.code, 0, complete.stderr);
+    assert.deepEqual(JSON.parse(complete.stdout), { completed: true, reason: "completed" });
+    assert.deepEqual(JSON.parse(f.run(["inbox", "audit", "--json"]).stdout).targets, [], "explicit completion suppresses unchanged work");
+    const repeat = f.run(["inbox", "audit", "complete", "--receipt", body.targets[0].receipt, "--outcome", "no-finding", "--json"]);
+    assert.equal(repeat.code, 0, repeat.stderr);
+    assert.deepEqual(JSON.parse(repeat.stdout), { completed: false, reason: "already_completed" });
+
+    fs.writeFileSync(path.join(f.root, "inbox-audit.json"), JSON.stringify({ version: 4, targets: [{
+      agent_id: f.agentId, generation: "00000000-0000-4000-8000-000000000002", source_seq: 2, target: "chat:oc_audit", anchor: "om_audit_process", observed_at: "2026-07-21T00:00:00.000Z", status: "pending",
+    }] }), { mode: 0o600 });
+    const entry = path.join(ROOT, "dist", "app", "agent-cli.mjs");
+    const processRead = spawnSync(process.execPath, [entry, "inbox", "audit", "--json"], { encoding: "utf8", env: { ...process.env, ...f.env } });
+    assert.equal(processRead.status, 0, processRead.stderr);
+    const processBody = JSON.parse(processRead.stdout);
+    const processComplete = spawnSync(process.execPath, [entry, "inbox", "audit", "complete", "--receipt", processBody.targets[0].receipt, "--outcome", "handled", "--json"], { encoding: "utf8", env: { ...process.env, ...f.env } });
+    assert.equal(processComplete.status, 0, processComplete.stderr);
+    assert.deepEqual(JSON.parse(processComplete.stdout), { completed: true, reason: "completed" }, "compiled public CLI completes only the exact read receipt");
+
+    const sameTime = "2026-07-22T00:00:00.000Z";
+    const writeTarget = (anchor, generation, source_seq) => fs.writeFileSync(path.join(f.root, "inbox-audit.json"), JSON.stringify({ version: 4, targets: [{
+      agent_id: f.agentId, generation, source_seq, target: "chat:oc_audit", anchor, observed_at: sameTime, status: "pending",
+    }] }), { mode: 0o600 });
+    writeTarget("om_aba_a", "00000000-0000-4000-8000-000000000003", 3);
+    const abaRead = spawnSync(process.execPath, [entry, "inbox", "audit", "--json"], { encoding: "utf8", env: { ...process.env, ...f.env } });
+    assert.equal(abaRead.status, 0, abaRead.stderr);
+    const staleReceipt = JSON.parse(abaRead.stdout).targets[0].receipt;
+    writeTarget("om_aba_b", "00000000-0000-4000-8000-000000000004", 4);
+    writeTarget("om_aba_a", "00000000-0000-4000-8000-000000000005", 5);
+    const staleAck = spawnSync(process.execPath, [entry, "inbox", "audit", "complete", "--receipt", staleReceipt, "--outcome", "no-finding", "--json"], { encoding: "utf8", env: { ...process.env, ...f.env } });
+    assert.equal(staleAck.status, 0, staleAck.stderr);
+    assert.deepEqual(JSON.parse(staleAck.stdout), { completed: false, reason: "stale" }, "compiled CLI rejects an ABA receipt with an equal timestamp");
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
@@ -577,7 +666,7 @@ test("profile show is local and the removed internal IM surface points to larkin
     assert.equal(profile.code, 0, profile.stderr);
     assert.deepEqual(JSON.parse(profile.stdout), {
       kind: "agent", id: f.agentId, isSelf: true, name: "Larkin Bot", displayName: "Larkin Bot", openId: "ou_bot",
-      avatarUrl: "https://example.test/avatar.png", runtime: "codex", model: "gpt-5.6-sol", reasoningEffort: "high",
+      avatarUrl: "https://example.test/avatar.png", runtime: "codex", runtimeOption: "codex", model: "gpt-5.6-sol", reasoningEffort: "high",
       createdAt: "2026-07-19T00:00:00.000Z",
     });
 

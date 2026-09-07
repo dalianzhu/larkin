@@ -8,11 +8,13 @@ import * as path from "node:path";
 import { createAgentStateStore, type AgentStateStore } from "../agent/agent-state-store.js";
 import * as larkinConfig from "../platform/config.js";
 import { projectInboxCheck, projectInboxEvents, type InboxEnvelope } from "../agent/inbox-projection.js";
-import { inboxAuditRegistryFile, readInboxAuditTargets } from "../agent/missed-outbound-scan.js";
+import { completeInboxAuditTarget, inboxAuditRegistryFile, readInboxAuditTargets } from "../agent/missed-outbound-scan.js";
 import { createReminderRoutes } from "../agent/reminder-routes.js";
 import { InteractionStateMachine } from "../agent/interaction-state-machine.js";
 import { issueCallbackProbe, readCallbackCapability } from "../platform/callback-capability.js";
 import { requestAgentUpsert } from "./local-control.js";
+import { isUserRuntime } from "../runtime/user-runtime.js";
+import { resolveRuntimeExecutable, runtimeInstallNextAction } from "../runtime/runtime-readiness.js";
 export { AGENT_CLI_CAPABILITIES } from "../agent/agent-cli-capabilities.js";
 import { AGENT_CLI_CAPABILITIES } from "../agent/agent-cli-capabilities.js";
 import { CONFIG_CLI_USAGE, CONFIG_CLI_VALUES } from "../agent/config-cli-contract.js";
@@ -52,7 +54,7 @@ function discoverRuntimeModelDirectorySync(
   input: { agentId: string; cwd: string; runtime: string },
   env: Env,
 ): RuntimeDirectoryModel[] {
-  const childSpec = internalCommandSpec("runtime-model-directory", [input.runtime, input.cwd], env);
+  const childSpec = internalCommandSpec("runtime-model-directory", [input.runtime, input.cwd, input.agentId], env);
   const result = spawnSync(childSpec.command, childSpec.args, {
     encoding: "utf8", env: { ...process.env, ...env }, timeout: 20_000, maxBuffer: 1024 * 1024,
   });
@@ -175,7 +177,7 @@ function agentConfigRequest(
   const [operation = "show", ...rest] = argv;
   const authority = { kind: "agent" as const, agentId: agent.agentId };
   const options = parseOptions(rest, new Set(["--json"]));
-  const unknownFlags = [...options.values.keys()].filter((flag) => !["--agent", "--chat", "--model"].includes(flag));
+  const unknownFlags = [...options.values.keys()].filter((flag) => !["--agent", "--chat", "--model", "--interval"].includes(flag));
   if (unknownFlags.length) throw new Error(`config 不支持参数：${unknownFlags.join(", ")}；运行 larkin config --help`);
   const assertOnlyFlags = (valueFlags: readonly string[], booleanFlags: readonly string[] = []): void => {
     const allowedValues = new Set(valueFlags);
@@ -189,7 +191,7 @@ function agentConfigRequest(
   const targetId = options.values.get("--agent") || agent.agentId;
   const target = config.agents[targetId];
   if (!target) throw new Error(`Agent 不存在：${targetId}；运行 larkin config show --json 查看可用 Agent`);
-  const currentDirectory = (runtime = target.runtime): RuntimeDirectoryModel[] => (dependencies.modelDirectory ?? ((input) => discoverRuntimeModelDirectorySync(input, env)))({
+  const currentDirectory = (runtime = larkinConfig.toUserRuntime(target.runtime)): RuntimeDirectoryModel[] => (dependencies.modelDirectory ?? ((input) => discoverRuntimeModelDirectorySync(input, env)))({
     agentId: target.agentId, cwd: target.workspaceDir, runtime,
   });
   if (operation === "show") {
@@ -203,6 +205,15 @@ function agentConfigRequest(
     assertOnlyFlags(["--agent", "--model"]);
     const runtime = options.positionals[0];
     if (!runtime || options.positionals.length > 1) throw new Error("用法: larkin config runtime <runtime> [--model <model>] [--agent <App ID>]");
+    if (!isUserRuntime(runtime)) throw new Error(`未知 runtime：${runtime}`);
+    const command = runtime === "pi"
+      ? env.LARKIN_PI_COMMAND || "pi"
+      : runtime === "codex"
+        ? env.LARKIN_CODEX_COMMAND || "codex"
+        : env.LARKIN_CLAUDE_COMMAND || "claude";
+    if (!resolveRuntimeExecutable(command, env)) {
+      throw new Error(`${runtime} is not installed；${runtimeInstallNextAction(runtime)}`);
+    }
     const model = options.values.get("--model");
     if (model && !currentDirectory(runtime).some((item) => item.id === model)) throw new Error(`model 不在 ${runtime} 当前目录中：${model}`);
     mutation = { kind: "set-agent-runtime", agentId: targetId, runtime, ...(model ? { model } : {}) };
@@ -237,6 +248,20 @@ function agentConfigRequest(
     } else if (scope === "chat" && options.positionals.length === 3 && first?.startsWith("oc_") && ["inherit", "require", "free"].includes(second || "")) {
       mutation = { kind: "set-chat-mention", agentId: targetId, chatId: first, value: second as larkinConfig.MentionPolicyOverride };
     } else throw new Error("用法: larkin config mention global <require|free> | mention agent <inherit|require|free> | mention chat <oc_id> <inherit|require|free> [--agent <App ID>]");
+  } else if (operation === "inbox-audit") {
+    const [scope, first] = options.positionals;
+    if (scope === "global") assertOnlyFlags(["--interval"]);
+    else if (scope === "agent") assertOnlyFlags(["--agent", "--interval"]);
+    else assertOnlyFlags([]);
+    if (options.positionals.length !== 2) {
+      throw new Error("用法: larkin config inbox-audit global <on|off> [--interval <15m|1h>] | inbox-audit agent <inherit|on|off> [--agent <App ID>] [--interval <15m|inherit>]");
+    }
+    mutation = larkinConfig.inboxAuditMutationFromCli({
+      scope: scope || "",
+      enabled: first,
+      interval: options.values.get("--interval"),
+      agentId: targetId,
+    });
   } else if (operation === "apply") {
     assertOnlyFlags(["--agent"]);
     if (options.positionals.length) throw new Error("用法: larkin config apply [--agent <App ID>]");
@@ -246,7 +271,7 @@ function agentConfigRequest(
       larkinConfig.markConfigApplied(env, targetId, expectedSignature);
       return { ok: true, agentId: targetId, applyState: "applied", result };
     }).catch((error) => { throw new Error(`配置已保存但未应用：${error instanceof Error ? error.message : String(error)}`); });
-  } else throw new Error("config 只支持 show/runtime/model/effort/mention/apply；运行 larkin config --help");
+  } else throw new Error("config 只支持 show/runtime/model/effort/mention/inbox-audit/apply；运行 larkin config --help");
   const result = larkinConfig.mutateConfig(env, mutation, authority);
   return { ok: true, revision: result.revision, persisted: true, applyState: result.applyState, changedScope: result.changedScope };
 }
@@ -490,10 +515,21 @@ export function runAgentCli(
       }
       const options = parseOptions(rest, new Set(["--json"]));
       if (subcommand === "audit") {
-        if (options.positionals.length || options.values.size || options.booleans.size > 1) {
-          throw new Error("inbox audit 只接受 --json");
+        const file = inboxAuditRegistryFile(config.larkinHome);
+        if (options.positionals[0] === "complete") {
+          if (options.positionals.length !== 1 || options.booleans.size > 1 || [...options.values.keys()].some((key) => !["--receipt", "--outcome"].includes(key))) {
+            throw new Error("用法: larkin inbox audit complete --receipt <receipt> --outcome <no-finding|handled> [--json]");
+          }
+          const receipt = options.values.get("--receipt");
+          const outcome = options.values.get("--outcome");
+          if (!receipt || !outcome) throw new Error("用法: larkin inbox audit complete --receipt <receipt> --outcome <no-finding|handled> [--json]");
+          const completion = completeInboxAuditTarget(file, agent.agentId, receipt, outcome);
+          emitJson(io, completion);
+          return completion.reason === "invalid_receipt" || completion.reason === "invalid_outcome" ? 2 : 0;
         }
-        emitJson(io, readInboxAuditTargets(inboxAuditRegistryFile(config.larkinHome), agent.agentId));
+        if (options.positionals.length || options.values.size || options.booleans.size > 1) throw new Error("inbox audit 只接受 --json；完成检查用 inbox audit complete");
+        const audit = readInboxAuditTargets(file, agent.agentId);
+        emitJson(io, audit);
         return 0;
       }
       if (options.positionals.length || [...options.values.keys()].some((flag) => !["--target", "--limit"].includes(flag))) {
@@ -569,7 +605,9 @@ export function runAgentCli(
         kind: "agent", id: agent.agentId, isSelf: true, name, displayName: name,
         openId: identity?.open_id ?? identity?.openId ?? null,
         avatarUrl: identity?.avatar_url ?? identity?.avatarUrl ?? null,
-        runtime: agent.runtime, model: agent.model, reasoningEffort: agent.effort ?? null,
+        runtime: agent.runtime,
+        runtimeOption: larkinConfig.toUserRuntime(agent.runtime),
+        model: agent.model, reasoningEffort: agent.effort ?? null,
         createdAt: agent.createdAt ?? "1970-01-01T00:00:00.000Z",
       });
       return 0;

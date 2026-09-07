@@ -14,6 +14,9 @@ import {
   prepareOwnedPiDirectory,
   mergeOwnedPiSettings,
   hasProjectPiCompactionOverride,
+  writeOwnedPiSettings,
+  readOwnedPiSettings,
+  projectPiSettingsFile,
   isPiNativeCompactionRequired,
   PiCompactionBreaker,
   PiCompactionRecoveryMachine,
@@ -74,6 +77,26 @@ test("project compaction/context overrides are refused before Pi starts", () => 
   assert.equal(hasProjectPiCompactionOverride({ contextWindow: 128_000 }), true);
 });
 
+test("workspace project settings receive Larkin compaction and preserve unrelated keys", () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-pi-project-settings-"));
+  try {
+    fs.mkdirSync(path.join(workspace, ".pi"), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(workspace, ".pi", "settings.json"), `${JSON.stringify({
+      theme: "dark", packages: { enabled: true },
+    }, null, 2)}\n`);
+    writeOwnedPiSettings(workspace, calculatePiCompactionSettings(32_000));
+    const file = projectPiSettingsFile(workspace);
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal(parsed.theme, "dark");
+    assert.deepEqual(parsed.packages, { enabled: true });
+    assert.deepEqual(parsed.compaction, { enabled: true, reserveTokens: 4_800, keepRecentTokens: 20_000 });
+    assert.deepEqual(readOwnedPiSettings(workspace).compaction, parsed.compaction);
+    if (process.platform !== "win32") assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
 test("owned Pi directory is 0700, current-user owned, and never a symlink", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-pi-owned-"));
   const directory = ensureOwnedPiAgentDirectory(root, "cli_ownedA1");
@@ -92,34 +115,72 @@ test("owned Pi directory is 0700, current-user owned, and never a symlink", () =
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test("Pi executable version parsing rejects spoofed suffixes and extra tokens", () => {
+test("Pi executable version parsing accepts the minimum and newer display forms", () => {
   assert.equal(parsePiExecutableVersion("0.84.2\n"), "0.84.2");
-  assert.equal(parsePiExecutableVersion("pi-coding-agent version v0.84.2\n"), "0.84.2");
+  assert.equal(parsePiExecutableVersion("0.84.4\n"), "0.84.4");
+  assert.equal(parsePiExecutableVersion("pi 0.84.4\n"), "0.84.4");
+  assert.equal(parsePiExecutableVersion("pi-coding-agent version v0.84.4\n"), "0.84.4");
+  assert.equal(parsePiExecutableVersion("PI-CODING-AGENT VERSION V0.85.0\n"), "0.85.0");
+  assert.equal(parsePiExecutableVersion("1.0.0\n"), "1.0.0");
+  assert.throws(
+    () => parsePiExecutableVersion("0.84.1\n"),
+    { message: "Pi executable version 0.84.1 is older than the minimum 0.84.2" },
+  );
+  assert.throws(
+    () => parsePiExecutableVersion("0.83.9\n"),
+    { message: "Pi executable version 0.83.9 is older than the minimum 0.84.2" },
+  );
   for (const output of ["0.84.2-beta", "0.84.2 dirty", "0.84.2 extra", "pi 0.84.2 extra", "0.84.2\nattacker", "v0.84.2", "0x84x2", "0-84-2"]) {
-    assert.throws(() => parsePiExecutableVersion(output), /exactly|version/i);
+    assert.throws(() => parsePiExecutableVersion(output), /version/i);
   }
 });
 
 test("external capability guard fails closed and accepts only the required Pi protocol", () => {
-  assert.doesNotThrow(() => verifyPiCapabilities({
-    distribution: "external", version: "0.84.2", contextWindow: 272_000, autoCompactionEnabled: true,
+  const handshake = {
+    distribution: "external", contextWindow: 272_000, autoCompactionEnabled: true,
     reserveTokens: 40_800, keepRecentTokens: 20_000, compactRpc: true,
     events: ["compaction_start", "compaction_end", "agent_end", "agent_settled"],
-  }));
-  assert.throws(() => verifyPiCapabilities({
-    distribution: "external", version: "0.82.0", contextWindow: 272_000, autoCompactionEnabled: true,
-    reserveTokens: 40_800, keepRecentTokens: 20_000, compactRpc: true,
-    events: ["compaction_start", "compaction_end", "agent_end", "agent_settled"],
-  }), /version|capabilit/i);
+  };
+  for (const version of ["0.84.2", "0.84.4", "0.85.0", "1.0.0"]) {
+    assert.equal(verifyPiCapabilities({ ...handshake, version }), "handshake-reported");
+  }
+  assert.throws(() => verifyPiCapabilities({ ...handshake, version: "0.84.2-beta" }), {
+    message: "Pi executable version 0.84.2-beta is unsupported: SemVer 0.84.2-beta < 0.84.2; Larkin supports stable external pi only",
+  });
+  assert.throws(() => verifyPiCapabilities({ ...handshake, version: "0.85.0-rc.1" }), {
+    message: "Pi executable version 0.85.0-rc.1 is unsupported: SemVer 0.85.0-rc.1 < 0.85.0; Larkin supports stable external pi only",
+  });
+  assert.throws(() => verifyPiCapabilities({ ...handshake, version: "0.84.1" }), {
+    message: "Pi executable version 0.84.1 is older than the minimum 0.84.2",
+  });
+  assert.throws(() => verifyPiCapabilities({ ...handshake, version: "0.82.0" }), /older than the minimum/i);
   assert.throws(() => verifyPiCapabilities({
     distribution: "external", version: "0.84.2", contextWindow: 128_000, autoCompactionEnabled: true,
     reserveTokens: 40_800, keepRecentTokens: 20_000, compactRpc: true,
     events: ["compaction_start", "compaction_end", "agent_end", "agent_settled"],
   }), /context/i);
-  assert.throws(() => verifyPiCapabilities({
+  assert.equal(verifyPiCapabilities({
     distribution: "external", version: "0.84.2", contextWindow: 272_000, autoCompactionEnabled: true,
     compactRpc: true,
-  }), /unproven|reserve|event/i);
+  }), "larkin-settings-only");
+  assert.equal(verifyPiCapabilities({
+    distribution: "external", version: "0.84.2", contextWindow: 272_000, autoCompactionEnabled: true,
+    compactRpc: true, compactionCapabilities: {
+      reserveTokens: 40_800, keepRecentTokens: 20_000,
+      events: ["compaction_start", "compaction_end", "agent_end", "agent_settled"],
+    },
+  }), "handshake-reported");
+  assert.throws(() => verifyPiCapabilities({
+    distribution: "external", version: "0.84.2", contextWindow: 272_000, autoCompactionEnabled: true,
+    compactRpc: true, compactionCapabilities: {
+      reserveTokens: 16_384, keepRecentTokens: 20_000,
+      events: ["compaction_start", "compaction_end", "agent_end", "agent_settled"],
+    },
+  }), /unproven/i);
+  assert.throws(() => verifyPiCapabilities({
+    distribution: "external", version: "0.84.2", contextWindow: 272_000, autoCompactionEnabled: false,
+    compactRpc: true,
+  }), /disabled/i);
   assert.throws(() => verifyPiCapabilities({
     distribution: "external", version: "0.84.2", contextWindow: 272_000,
     reserveTokens: 40_800, keepRecentTokens: 20_000, compactRpc: true,
@@ -128,11 +189,26 @@ test("external capability guard fails closed and accepts only the required Pi pr
   assert.throws(() => verifyPiCapabilities({
     distribution: "external", version: "0.84.2", contextWindow: 272_000, autoCompactionEnabled: true,
     compactRpc: true, trustedProtocol: true,
-  }), /external|trusted|unproven/i);
-  assert.doesNotThrow(() => verifyPiCapabilities({
+  }), /external|trusted/i);
+  assert.throws(() => verifyPiCapabilities({
     distribution: "builtin", version: "0.84.2", contextWindow: 272_000, autoCompactionEnabled: true,
     compactRpc: true, trustedProtocol: true,
-  }));
+  }), /external|trusted/i);
+});
+
+test("verifyPiCapabilities accepts absent stock handshake and rejects mismatch or disabled compaction", () => {
+  const required = {
+    distribution: "external", version: "0.84.2", contextWindow: 272_000, autoCompactionEnabled: true, compactRpc: true,
+  };
+  assert.equal(verifyPiCapabilities(required), "larkin-settings-only");
+  assert.throws(() => verifyPiCapabilities({
+    ...required,
+    compactionCapabilities: {
+      reserveTokens: 1, keepRecentTokens: 20_000,
+      events: ["compaction_start", "compaction_end", "agent_end", "agent_settled"],
+    },
+  }), /unproven/i);
+  assert.throws(() => verifyPiCapabilities({ ...required, autoCompactionEnabled: false }), /disabled/i);
 });
 
 test("breaker refuses operations without an explicit canonical lock", () => {
