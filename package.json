@@ -1,6 +1,6 @@
 {
   "name": "larkin",
-  "version": "0.5.10",
+  "version": "0.5.11",
   "private": false,
   "larkinPackageRole": "npm-published",
   "files": [
@@ -116,5 +116,8 @@
     "typescript": "^7.0.2",
     "vite": "^8.1.5",
     "vitest": "^4.1.10"
+  },
+  "overrides": {
+    "@larksuiteoapi/node-sdk": "^1.74.0"
   }
 }
