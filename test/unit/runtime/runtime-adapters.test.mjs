@@ -1802,3 +1802,20 @@ test("Codex capacity rejection before turn acceptance retries the unaccepted inp
   assert.equal(child.writes.filter(r => r.method === "turn/start").length, 5);
   await session.close("done");
 });
+
+test("Codex cancellation of a rejected retry does not block a later user prompt", async () => {
+  const { child, session } = await startedCodexTurn("cancel-rejected", "cancel-rejected-turn", { codexCapacityRetryDelaysMs: [1] });
+  capacityFail(child, "cancel-rejected-turn");
+  await retryTick();
+  const request = child.writes.at(-1);
+  await session.cancel("user request");
+  child.stdout.write(`${JSON.stringify({ id: request.id, error: { message: capacityMessage } })}\n`);
+  const next = session.prompt({ inputId: "new-work", kind: "wake", text: "new work", attempt: 0 });
+  await new Promise(resolve => setImmediate(resolve));
+  const nextRequest = child.writes.at(-1);
+  assert.equal(nextRequest.method, "turn/start");
+  assert.notEqual(nextRequest.id, request.id);
+  child.stdout.write(`${JSON.stringify({ id: nextRequest.id, result: { turn: { id: "new-work-turn" } } })}\n`);
+  assert.equal((await next).status, "accepted");
+  await session.close("done");
+});
