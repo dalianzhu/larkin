@@ -308,6 +308,7 @@ class CodexSession extends EventSession {
     this.retryAwaitingOwnership = null;
     if (!recovery) return;
     this.finishTurnInputs(recovery.turnId, message, false);
+    this.completeTurn(recovery.turnId);
     this.emit({ type: "turn-end", ...(this.threadId ? { sessionId: this.threadId } : {}) });
   }
 
@@ -347,7 +348,11 @@ class CodexSession extends EventSession {
       const pending = this.pending.get(Number(message.id))!;
       this.pending.delete(Number(message.id));
       if (pending.recovery) {
-        if (this.stopped || this.cancelledRecoveries.has(pending.recovery)) return;
+        if (this.stopped) return;
+        if (this.cancelledRecoveries.has(pending.recovery)) {
+          if (message.error && this.retryAwaitingOwnership === pending.recovery) this.retryAwaitingOwnership = null;
+          return;
+        }
         if (message.error) {
           const reason = String(message.error.message || "Codex capacity retry submission failed");
           const recovery = this.capacityRecovery;
@@ -373,6 +378,7 @@ class CodexSession extends EventSession {
           this.assignTurnInput(turnId, pending.inputId);
           this.ownershipFor(turnId).capacityInput = (pending.params as { input?: unknown })?.input;
           if (this.scheduleCapacityRetry(turnId, errorMessage)) {
+            this.completeTurn(turnId);
             this.emit({ type: "turn-start" });
             pending.resolve?.({ status: "accepted", inputId: pending.inputId });
           } else {
