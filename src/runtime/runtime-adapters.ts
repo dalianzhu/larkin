@@ -65,6 +65,7 @@ interface ProcessLike {
   stdout: ReadableLike | null;
   stderr: ReadableLike | null;
   once(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
+  once(event: "close", listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
   once(event: "error", listener: (error: Error) => void): unknown;
   kill(signal?: NodeJS.Signals): boolean;
 }
@@ -1074,10 +1075,12 @@ async function discoverEffectivePiContextWindow(input: RuntimeSessionCreate, com
   env: NodeJS.ProcessEnv, spawn: (command: string, args: readonly string[], options: Record<string, unknown>) => ProcessLike,
   rpcOptions?: PiRpcClientOptions): Promise<PiProbeResult> {
   // The isolated context-window probe must load the same extensions as the real
-  // session handshake: provider-registered models (e.g. Pi packages that add a
-  // model provider such as `kiro/*`) do not exist under `--no-extensions`, so a
-  // `--model <extension-provided>` probe would fail with a spurious "model not
-  // found" that then misclassifies the runtime as not installed.
+  // session handshake. Pi packages can register additional model providers, so a
+  // configured `--model <provider>/<id>` only resolves once extensions load.
+  // Probing with `--no-extensions` makes any extension-provided model fail with a
+  // spurious "model not found", which createPiRpcBackend then classifies as a
+  // missing prerequisite ("pi is not installed") even though pi is installed,
+  // authenticated, and the model works in a real session.
   const probeArgs = [...commandPrefix, "--mode", "rpc", "--no-session",
     ...(requestedModel ? ["--model", requestedModel] : [])];
   const probe = spawn(command, probeArgs, {

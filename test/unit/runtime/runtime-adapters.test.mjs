@@ -185,7 +185,7 @@ test("context prompt references only the supplied previous session archive", () 
 
 test("default context prompt consumes the Agent CLI manifest", () => {
   const prompt = new ContextPromptBuilder().build({ agentId: "cli_test", runtime: "pi" });
-  assert.equal(prompt.version, "larkin-standing-v30");
+  assert.equal(prompt.version, "larkin-standing-v32");
   assert.doesNotMatch(prompt.content, /## Previous session archive/);
   assert.match(prompt.content, /never emit feishu\.cn for a Lark tenant/);
   assert.match(prompt.content, /larkin reminder schedule/);
@@ -242,6 +242,10 @@ test("default context prompt consumes the Agent CLI manifest", () => {
     /explicitly silent envelope only.*must not.*`true`.*`:`.*sleep.*echo.*pwd.*status.*goal.*read.*history.*write.*no-op.*control.*tool.*next independent.*trigger.*new phase.*poll again.*before.*explicit work.*must not.*anticipate.*later phase/i);
   assert.match(prompt.content,
     /Every other successfully polled envelope.*ordinary reminder envelope.*execute.*stated payload.*target-scoped history read.*perform.*no-hit.*required read.*must not create.*outbound/i);
+  assert.match(prompt.content,
+    /unrelated Inbox event.*does not cancel or supersede.*already-owed user-visible reply.*another target.*required canonical poll.*first safe write boundary.*before optional discovery or unrelated reminder work.*never reply.*synthetic reminder or redelivery id/i);
+  assert.match(prompt.content,
+    /Inbox Audit.*completed work.*promised status.*delivery.*real @mention.*absent.*authoritative conversation history.*finding until.*outbound exists.*waiting for review.*without.*unfulfilled promise.*unanswered human ask.*stay silent/i);
   assert.match(prompt.content, /thread:<chat_id>:<thread_id>/);
   assert.match(prompt.content, /\+threads-messages-list --thread <thread_id> --order desc --page-size 10 --no-reactions --json/);
   assert.match(prompt.content, /response messages.*data\.messages/i);
@@ -897,11 +901,9 @@ test("production Pi probe uses isolated get_state only and preserves the verifie
     const runtimeArgs = rows.find((row) => row.kind === "argv" && !row.probe && !row.args.includes("--version"));
     assert.ok(probeArgs);
     assert.ok(probeArgs.args.includes("--no-session"), JSON.stringify(probeArgs));
-    // Regression: the isolated context-window probe must NOT pass --no-extensions.
-    // Provider-registered models (e.g. Pi packages that add a `kiro/*` provider)
-    // only exist when extensions load; probing with --no-extensions made a
-    // `--model kiro/auto` probe fail with a spurious "model not found" that was
-    // then misclassified as "pi is not installed".
+    // The isolated context-window probe must not pass --no-extensions: models
+    // registered by a Pi package provider only exist when extensions load, so
+    // probing with --no-extensions would spuriously fail model resolution.
     assert.equal(probeArgs.args.includes("--no-extensions"), false, JSON.stringify(rows));
     assert.equal(probeArgs.args.includes("-e"), false);
     assert.deepEqual(probeRequests, ["get_state"]);

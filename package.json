@@ -1,6 +1,6 @@
 {
   "name": "larkin",
-  "version": "0.5.8",
+  "version": "0.5.14",
   "private": true,
   "larkinPackageRole": "development-source-checkout",
   "files": [
@@ -116,5 +116,8 @@
     "typescript": "^7.0.2",
     "vite": "^8.1.5",
     "vitest": "^4.1.10"
+  },
+  "overrides": {
+    "@larksuiteoapi/node-sdk": "^1.74.0"
   }
 }
