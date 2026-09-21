@@ -2279,7 +2279,8 @@ test("RuntimeHost with the native Codex adapter keeps capacity retries inside on
     });
     return true;
   } };
-  const adapter = createNativeRuntimeAdapter("codex", { spawn: () => child, codexCapacityRetryDelaysMs: [5, 5, 5] });
+  const nativeAdapter = createNativeRuntimeAdapter("codex", { spawn: () => child, codexCapacityRetryDelaysMs: [5, 5, 5] });
+  const adapter = { ...nativeAdapter, async probe() { return { runtime: "codex", state: "ready" }; } };
   const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder() });
   const events = []; host.subscribe(e => events.push(e));
   try {
