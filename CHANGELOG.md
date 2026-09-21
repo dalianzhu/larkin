@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.8
+
+Codex turns that fail with the exact “Selected model is at capacity. Please try a different model.” provider error now continue in the same thread after 5, 15, and 30 seconds, up to three retries. Native Codex retries retain ownership until they finish; cancellation and shutdown stop pending recovery. Other provider failures keep their existing handling.
+
 ## 0.5.5
 
 Pi uses a small Larkin-owned tmux Bash extension when tmux is available on macOS/Linux. Commands preserve their working directory, including non-Git paths with spaces; a foreground wait can return while the same command continues. The returned task ID supports inspection and cancellation, and background completion resumes the Agent. Native Windows and environments without tmux retain Pi's native Bash.
