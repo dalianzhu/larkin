@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.14
+
+Sync upstream 0.5.13: reconcile Lark permission grants and explain optional capability impacts, repair card callback registration, preserve owed replies across Inbox wakes, improve Pi process failure handling and Runtime diagnostics, and deduplicate release inventory. Retain downstream authenticated external enqueue and Pi extension discovery.
+
+Codex turns that fail with the exact “Selected model is at capacity. Please try a different model.” provider error now continue in the same thread after 5, 15, and 30 seconds, up to three retries. Native Codex retries retain ownership until they finish; cancellation and shutdown stop pending recovery. Other provider failures keep their existing handling.
+
+## 0.5.8 (upstream)
+
+Lark setup now reconciles requested tenant permissions with actual grants and links missing scopes to the same application in the developer console. Required permissions still block setup until granted; optional permissions and event/callback verification are reported separately. Existing-application authorization preserves and checks its App ID before recording any capability state.
+
 ## 0.5.5
 
 Pi uses a small Larkin-owned tmux Bash extension when tmux is available on macOS/Linux. Commands preserve their working directory, including non-Git paths with spaces; a foreground wait can return while the same command continues. The returned task ID supports inspection and cancellation, and background completion resumes the Agent. Native Windows and environments without tmux retain Pi's native Bash.
