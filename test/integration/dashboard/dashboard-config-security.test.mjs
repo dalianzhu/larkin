@@ -98,6 +98,13 @@ test("dashboard config API is sanitized, same-origin/CSRF protected, bounded, an
       override: { enabled: "on", intervalMs: 30 * 60_000 }, effective: { enabled: true, intervalMs: 30 * 60_000 },
       source: { enabled: "agent", intervalMs: "agent" },
     });
+    assert.equal("processingEye" in auditView, false, "config view must not project a processingEye switch");
+    assert.equal("processingEye" in auditView.agents[0], false);
+    const savedEye = await fetch(`${base}/api/config`, {
+      method: "PATCH", headers: { "Content-Type": "application/json", Origin: base, "X-Larkin-CSRF": csrf },
+      body: JSON.stringify({ operation: "set-global-processing-eye", enabled: true }),
+    });
+    assert.equal(savedEye.status, 400, "retired processing-eye mutations must be rejected");
 
     const inherit = await fetch(`${base}/api/config`, { method: "PATCH", headers: { "Content-Type": "application/json", Origin: base, "X-Larkin-CSRF": csrf }, body: JSON.stringify({ operation: "set-chat-mention", agentId: APP, chatId: "oc_legacy", value: "inherit" }) });
     assert.equal(inherit.status, 200);

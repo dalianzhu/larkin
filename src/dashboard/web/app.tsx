@@ -265,7 +265,7 @@ function GlobalSettingsSheet({ open, onOpenChange, onSaved }: { open: boolean; o
       </label>
       <p className="field-help">未单独设置的 Agent 和群会使用这个值。机器人消息仍必须精确 @ 当前 Agent。</p>
       <div className="audit-controls" aria-labelledby="global-inbox-audit-title">
-        <div className="audit-heading"><div><h3 id="global-inbox-audit-title">Inbox 巡检</h3><p>定时检查仍待处理的入站工作；关闭时不会安排巡检。</p></div><label className="audit-switch"><input type="checkbox" checked={draftAudit.enabled} disabled={loading} onChange={(event) => setDraftAudit((current) => ({ ...current, enabled: event.target.checked }))} /><span aria-hidden="true" /><b>{draftAudit.enabled ? "已开启" : "已关闭"}</b></label></div>
+        <div className="audit-heading"><div><h3 id="global-inbox-audit-title">Inbox 巡检</h3><p>定时检查仍待处理的入站工作；关闭时不会安排巡检。</p></div><label className="audit-switch"><input aria-label="Inbox 巡检开关" type="checkbox" checked={draftAudit.enabled} disabled={loading} onChange={(event) => setDraftAudit((current) => ({ ...current, enabled: event.target.checked }))} /><span aria-hidden="true" /><b>{draftAudit.enabled ? "已开启" : "已关闭"}</b></label></div>
         <label><span>巡检间隔（分钟）</span><input aria-label="全局巡检间隔（分钟）" type="number" min={MIN_AUDIT_GAP_MINUTES} max={MAX_AUDIT_GAP_MINUTES} step="any" inputMode="decimal" value={draftAuditGapMinutes} disabled={loading} onChange={(event) => setDraftAuditGapMinutes(event.target.value)} /></label>
         <p className="field-help">可在关闭时预先调整；保存间隔本身不会开启巡检。</p>
       </div>

@@ -183,14 +183,26 @@ describe("Agent-centric dashboard workbench", () => {
     await userEvent.type(gap, "30");
     await userEvent.click(within(dialog).getByRole("button", { name: "保存全局设置" }));
     await waitFor(() => expect(mutations).toEqual([{ operation: "set-global-inbox-audit", intervalMs: 30 * 60_000 }]));
-    expect(within(dialog).getByRole("checkbox")).not.toBeChecked();
-    await userEvent.click(within(dialog).getByRole("checkbox"));
+    expect(within(dialog).getByLabelText("Inbox 巡检开关")).not.toBeChecked();
+    await userEvent.click(within(dialog).getByLabelText("Inbox 巡检开关"));
     await userEvent.click(within(dialog).getByRole("button", { name: "保存全局设置" }));
     await waitFor(() => expect(mutations).toEqual([
       { operation: "set-global-inbox-audit", intervalMs: 30 * 60_000 },
       { operation: "set-global-inbox-audit", enabled: true },
     ]));
     expect(within(dialog).getByRole("status")).toHaveTextContent("已保存");
+  });
+
+  it("does not expose a processing-eye toggle after the switch was removed", async () => {
+    render(<App />);
+    await screen.findByRole("heading", { level: 1, name: "Builder" });
+    await userEvent.click(screen.getByRole("button", { name: "全局设置" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).queryByLabelText("处理中表情开关")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("处理中表情")).not.toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole("button", { name: "关闭面板" }));
+    expect(screen.queryByLabelText("处理中表情设置")).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "处理中表情" })).not.toBeInTheDocument();
   });
 
   it("keeps a precise existing audit gap when saving a different global setting", async () => {
@@ -657,7 +669,7 @@ describe("Agent-centric dashboard workbench", () => {
       }));
       render(<App />);
       await screen.findByRole("heading", { level: 1, name: "Builder" });
-      expect(screen.getByText(/^Readiness unauthenticated · codex is installed but not logged in · Run `codex login`/)).toBeVisible();
+      expect(await screen.findByText(/^Readiness unauthenticated · codex is installed but not logged in · Run `codex login`/)).toBeVisible();
       await userEvent.click(screen.getByRole("tab", { name: "概览" }));
       expect(screen.getByText(/^unauthenticated · codex is installed but not logged in · Run `codex login`/)).toBeVisible();
       await userEvent.click(screen.getByRole("tab", { name: "配置" }));

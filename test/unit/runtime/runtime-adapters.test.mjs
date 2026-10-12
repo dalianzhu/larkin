@@ -129,9 +129,9 @@ function clearProductionPiLog(log) {
   }
 }
 
-async function startedCodexTurn(inputId = "input-A", turnId = "turn-A") {
+async function startedCodexTurn(inputId = "input-A", turnId = "turn-A", dependencies = {}) {
   const child = new FakeProcess();
-  const session = await createNativeRuntimeAdapter("codex", { spawn: () => child }).createSession(create());
+  const session = await createNativeRuntimeAdapter("codex", { spawn: () => child, ...dependencies }).createSession(create());
   const events = [];
   session.subscribe((event) => events.push(event));
   child.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} })}\n`);
@@ -185,7 +185,7 @@ test("context prompt references only the supplied previous session archive", () 
 
 test("default context prompt consumes the Agent CLI manifest", () => {
   const prompt = new ContextPromptBuilder().build({ agentId: "cli_test", runtime: "pi" });
-  assert.equal(prompt.version, "larkin-standing-v30");
+  assert.equal(prompt.version, "larkin-standing-v34");
   assert.doesNotMatch(prompt.content, /## Previous session archive/);
   assert.match(prompt.content, /never emit feishu\.cn for a Lark tenant/);
   assert.match(prompt.content, /larkin reminder schedule/);
@@ -208,15 +208,20 @@ test("default context prompt consumes the Agent CLI manifest", () => {
   for (const command of [
     "im +messages-send", "im +messages-reply", "im +chat-messages-list", "im +messages-mget",
     "im +chat-list", "im +chat-search", "im chats get", "im +messages-resources-download",
+    "docs +create", "docs +update", "docs +fetch",
   ]) assert.match(prompt.content, new RegExp(command.replace(/[+.]/g, "\\$&")), command);
+  assert.match(prompt.content, /`larkin docs \+create`/);
+  assert.match(prompt.content, /`larkin docs \+update`/);
+  assert.match(prompt.content, /`larkin docs \+fetch`/);
+  assert.match(prompt.content, /Do not invent Larkin commands that are absent from this list/);
   assert.doesNotMatch(prompt.content, /larkin (?:message|channel|attachment|server|task claim)\b/);
   assert.match(prompt.content, /Only a real Feishu `message_id` beginning with `om_`/);
   assert.match(prompt.content, /`rem_`, `redeliver_`.*synthetic ID must never be replied to/);
-  assert.match(prompt.content, /nonzero `freshness_conflict`.*direct-acks/);
+  assert.match(prompt.content, /Freshness is a non-blocking reminder.*never rejected for freshness.*larkin_notice/i);
   assert.doesNotMatch(prompt.content, /larkin-draft|draft-id|send --draft/);
   assert.match(prompt.content, /ordinary plain-text message bodies.*`--text`.*brief one-line replies.*multiline status lines.*paragraphs.*`--markdown`.*intentional.*headings.*lists.*fenced code.*Markdown links/i);
   assert.match(prompt.content, /native `--text`.*ordinary plain text.*logs.*literal code.*exact whitespace/i);
-  assert.doesNotMatch(prompt.content, /rejected|--literal-text/i);
+  assert.doesNotMatch(prompt.content, /--literal-text/i);
   assert.match(prompt.content, /attachment-only send\/reply.*attachment flag.*without a text body flag/i);
   assert.match(prompt.content, /passes one argument with real newline characters/);
   assert.match(prompt.content, /ordinary (?:double )?quotes.*do not decode.*`\\n`.*backslash.*letter `n`/i);
@@ -242,6 +247,10 @@ test("default context prompt consumes the Agent CLI manifest", () => {
     /explicitly silent envelope only.*must not.*`true`.*`:`.*sleep.*echo.*pwd.*status.*goal.*read.*history.*write.*no-op.*control.*tool.*next independent.*trigger.*new phase.*poll again.*before.*explicit work.*must not.*anticipate.*later phase/i);
   assert.match(prompt.content,
     /Every other successfully polled envelope.*ordinary reminder envelope.*execute.*stated payload.*target-scoped history read.*perform.*no-hit.*required read.*must not create.*outbound/i);
+  assert.match(prompt.content,
+    /unrelated Inbox event.*does not cancel or supersede.*already-owed user-visible reply.*another target.*required canonical poll.*first safe write boundary.*before optional discovery or unrelated reminder work.*never reply.*synthetic reminder or redelivery id/i);
+  assert.match(prompt.content,
+    /Inbox Audit.*completed work.*promised status.*delivery.*real @mention.*absent.*authoritative conversation history.*finding until.*outbound exists.*waiting for review.*without.*unfulfilled promise.*unanswered human ask.*stay silent/i);
   assert.match(prompt.content, /thread:<chat_id>:<thread_id>/);
   assert.match(prompt.content, /\+threads-messages-list --thread <thread_id> --order desc --page-size 10 --no-reactions --json/);
   assert.match(prompt.content, /response messages.*data\.messages/i);
@@ -277,7 +286,7 @@ test("default context prompt consumes the Agent CLI manifest", () => {
   assert.match(prompt.content,
     /Use the .--reply-in-thread. recipe only when the source is a thread or the user or current Inbox event explicitly asks.*topic.*in-thread.*thread reply.*Never invent a topic request from ordinary reply wording or a bare source message id.*thread membership.*thread:.*target.*thread_id.*explicit request.*never from wording alone/i);
   assert.match(prompt.content,
-    /exactly one post-poll.*model tool call.*must not.*skill.*reference.*help.*discovery.*without.*freshness_conflict.*two.*model tool calls.*pre-commit.*provider-not-reached.*retry.*identical.*three.*model tool calls/i);
+    /exactly one post-poll.*model tool call.*must not.*skill.*reference.*help.*discovery.*freshness notice.*advisory.*must not cause a duplicate send/i);
   assert.match(prompt.content,
     /larkin im \+messages-send --chat-id <confirmed_chat_id> --text '<exact_body_as_one_literal_argument>' --json/i);
   assert.match(prompt.content, /complete canonical exact send and reply paths.*must not.*messages-send --help.*messages-reply --help/i);
@@ -289,9 +298,8 @@ test("default context prompt consumes the Agent CLI manifest", () => {
   assert.match(prompt.content, /does not waive.*skill.*safety.*unknown.*high-risk/i);
   assert.match(prompt.content, /exact.*`--text`.*overrides.*ordinary-body guidance/i);
   assert.match(prompt.content, /wrapper derives.*stable.*idempotency key.*do not pass.*--idempotency-key/i);
-  assert.match(prompt.content, /freshness_unavailable.*freshness_conflict.*pre-commit.*provider-not-reached.*retry.*identical.*`--text`.*`--content`.*wrapper reuses/i);
-  assert.match(prompt.content, /target or body changes.*revised ordinary command.*derive a new key/i);
-  assert.match(prompt.content, /`committed=true` must not be repeated.*ambiguous termination.*wrapper same-key recovery/i);
+  assert.match(prompt.content, /`larkin_notice` freshness reminder.*stderr only after.*provider write.*re-read the target.*revised follow-up.*materially changes.*must not be repeated/i);
+  assert.match(prompt.content, /result with `committed=true`.*must not be repeated.*ambiguous termination.*wrapper same-key recovery/i);
   assert.doesNotMatch(prompt.content, /oc_eval_exact|om_eval_anchor|原文：“修复 A\/B”|收到：“A\/B”|引用：“抢到”|消息原文：“保持”/);
 });
 
@@ -307,7 +315,7 @@ test("Codex, Claude and Pi receive the clickable-link and exact-content standing
     assert.match(content, /explicit exact or verbatim direct literal uses `--text`.*overrides.*ordinary-body guidance/i);
     assert.match(content, /tool-sourced exact or verbatim text.*deterministic native `--jq`.*`--content`/i);
     assert.match(content, /native `--text`.*ordinary plain text.*logs.*literal code.*exact whitespace/i);
-    assert.doesNotMatch(content, /rejected|--literal-text/i);
+    assert.doesNotMatch(content, /--literal-text/i);
     assert.match(content, /attachment-only send\/reply.*attachment flag.*without a text body flag/i);
   };
 
@@ -395,6 +403,55 @@ test("Codex native notifications normalize start, intermediate output, and termi
   assert.deepEqual(events.filter((event) => ["turn-start", "activity", "turn-end"].includes(event.type))
     .map((event) => event.type === "activity" ? `${event.type}:${event.activity}` : event.type),
   ["turn-start", "activity:thinking", "activity:text", "turn-end"]);
+});
+
+test("Codex child notifications cannot replace, fail or complete the root turn", async () => {
+  const { child, session, events, turnId } = await startedCodexTurn();
+  const before = events.length;
+  const notify = (method, params) => child.stdout.write(`${JSON.stringify({ method, params })}\n`);
+  notify("thread/started", { thread: { id: "child-thread" } });
+  for (const threadField of ["threadId", "thread_id"]) {
+    const scope = { [threadField]: "child-thread" };
+    notify("turn/started", { ...scope, turn: { id: "child-turn" } });
+    notify("item/agentMessage/delta", { ...scope, delta: "child answer" });
+    notify("item/reasoning/summaryTextDelta", { ...scope, delta: "child reasoning" });
+    notify("error", { ...scope, turnId: "child-turn", error: { message: "child failed" }, willRetry: false });
+    notify("codex/event/error", { ...scope, message: "child failed", willRetry: false });
+    notify("turn/completed", { ...scope, turn: { id: "child-turn", status: "failed" } });
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(session.sessionId, "thread-owned");
+  assert.equal(events.length, before, "child lifecycle, output and errors never enter root RuntimeHost state");
+  const pending = session.busyInput({ inputId: "root-update", kind: "inbox_update", text: "next task", attempt: 0 });
+  await new Promise((resolve) => setImmediate(resolve));
+  const steer = child.writes.at(-1);
+  assert.equal(steer.params.threadId, "thread-owned");
+  assert.equal(steer.params.expectedTurnId, turnId);
+  child.stdout.write(`${JSON.stringify({ id: steer.id, result: {} })}\n`);
+  assert.equal((await pending).status, "accepted");
+  notify("turn/completed", { threadId: "thread-owned", turn: { id: turnId, status: "completed" } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(events.filter((event) => event.type === "turn-end").length, 1);
+  assert.equal((await session.busyInput({ inputId: "after", kind: "inbox_update", text: "after", attempt: 0 })).status, "deferred");
+});
+
+test("Codex stale root completion and late steer rejection cannot clear a newer root turn", async () => {
+  const { child, session, events, turnId } = await startedCodexTurn();
+  const pending = session.busyInput({ inputId: "old-update", kind: "inbox_update", text: "old", attempt: 0 });
+  await new Promise((resolve) => setImmediate(resolve));
+  const oldSteer = child.writes.at(-1);
+  child.stdout.write(`${JSON.stringify({ method: "turn/started", params: { threadId: "thread-owned", turn: { id: "new-root-turn" } } })}\n`);
+  child.stdout.write(`${JSON.stringify({ id: oldSteer.id, error: { message: "old turn already ended" } })}\n`);
+  assert.equal((await pending).status, "deferred");
+  child.stdout.write(`${JSON.stringify({ method: "turn/completed", params: { threadId: "thread-owned", turn: { id: turnId, status: "completed" } } })}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(events.filter((event) => event.type === "turn-end").length, 0);
+  const next = session.busyInput({ inputId: "new-update", kind: "inbox_update", text: "new", attempt: 0 });
+  await new Promise((resolve) => setImmediate(resolve));
+  const steer = child.writes.at(-1);
+  assert.equal(steer.params.expectedTurnId, "new-root-turn");
+  child.stdout.write(`${JSON.stringify({ id: steer.id, result: {} })}\n`);
+  assert.equal((await next).status, "accepted");
 });
 
 test("Pi unowned turn_start occupies busy and settles on agent_settled", async () => {
@@ -897,11 +954,9 @@ test("production Pi probe uses isolated get_state only and preserves the verifie
     const runtimeArgs = rows.find((row) => row.kind === "argv" && !row.probe && !row.args.includes("--version"));
     assert.ok(probeArgs);
     assert.ok(probeArgs.args.includes("--no-session"), JSON.stringify(probeArgs));
-    // Regression: the isolated context-window probe must NOT pass --no-extensions.
-    // Provider-registered models (e.g. Pi packages that add a `kiro/*` provider)
-    // only exist when extensions load; probing with --no-extensions made a
-    // `--model kiro/auto` probe fail with a spurious "model not found" that was
-    // then misclassified as "pi is not installed".
+    // The isolated context-window probe must not pass --no-extensions: models
+    // registered by a Pi package provider only exist when extensions load, so
+    // probing with --no-extensions would spuriously fail model resolution.
     assert.equal(probeArgs.args.includes("--no-extensions"), false, JSON.stringify(rows));
     assert.equal(probeArgs.args.includes("-e"), false);
     assert.deepEqual(probeRequests, ["get_state"]);
@@ -1691,4 +1746,130 @@ test("Codex update timeout terminates then kills the child and settles once", as
   assert.equal(result.recovered, false);
   assert.match(result.reason, /timed out/);
   assert.deepEqual(update.killed, ["SIGTERM", "SIGKILL"]);
+});
+
+const capacityMessage = "Selected model is at capacity. Please try a different model.";
+const codexNotify = (child, method, params) => child.stdout.write(`${JSON.stringify({ method, params })}\n`);
+const capacityFail = (child, turnId) => {
+  codexNotify(child, "error", { turnId, willRetry: false, error: { message: capacityMessage } });
+  codexNotify(child, "turn/completed", { turn: { id: turnId, status: "failed", error: { message: capacityMessage } } });
+};
+const retryTick = () => new Promise((resolve) => setTimeout(resolve, 15));
+
+for (const notificationFirst of [true, false]) test(`Codex capacity recovery preserves input ownership and bounds retries (notificationFirst=${notificationFirst})`, async () => {
+  const { child, session, events } = await startedCodexTurn("capacity-input", "capacity-0", { codexCapacityRetryDelaysMs: [1, 1, 1] });
+  for (let i = 0; i < 3; i++) {
+    capacityFail(child, `capacity-${i}`);
+    // A duplicate terminal notification must neither end the logical turn nor schedule another retry.
+    capacityFail(child, `capacity-${i}`);
+    await retryTick();
+    const request = child.writes.at(-1);
+    assert.equal(request.method, "turn/start");
+    assert.equal(request.params.threadId, "thread-owned");
+    assert.match(request.params.input[0].text, /Preserve completed work/);
+    const started = () => codexNotify(child, "turn/started", { turn: { id: `capacity-${i + 1}` } });
+    if (notificationFirst) started();
+    child.stdout.write(`${JSON.stringify({ id: request.id, result: { turn: { id: `capacity-${i + 1}` } } })}\n`);
+    if (!notificationFirst) started();
+    assert.equal(events.filter(e => e.type === "turn-end").length, 0);
+    assert.equal(events.filter(e => e.type === "input-error" && !e.willRetry).length, 0);
+  }
+  capacityFail(child, "capacity-3");
+  await retryTick();
+  assert.equal(child.writes.filter(r => r.method === "turn/start").length, 4);
+  const terminal = events.filter(e => e.type === "input-error" && !e.willRetry);
+  assert.equal(terminal.length, 1);
+  assert.equal(terminal[0].inputId, "capacity-input");
+  assert.equal(terminal[0].retryable, false);
+  assert.equal(events.filter(e => e.type === "turn-end").length, 1);
+  await session.close("done");
+});
+
+test("Codex native retries do not trigger host retries; capacity recovery can succeed", async () => {
+  const { child, session, events } = await startedCodexTurn("capacity-input", "original", { codexCapacityRetryDelaysMs: [1] });
+  codexNotify(child, "error", { turnId: "original", willRetry: true, error: { message: capacityMessage } });
+  await retryTick();
+  assert.equal(child.writes.filter(r => r.method === "turn/start").length, 1);
+  // Also exercise a provider that emits only a failed completion.
+  codexNotify(child, "turn/completed", { turn: { id: "original", status: "failed", error: { message: capacityMessage } } });
+  await retryTick();
+  const request = child.writes.at(-1);
+  child.stdout.write(`${JSON.stringify({ id: request.id, result: { turn: { id: "recovered" } } })}\n`);
+  codexNotify(child, "turn/started", { turn: { id: "recovered" } });
+  codexNotify(child, "turn/completed", { turn: { id: "recovered", status: "completed" } });
+  assert.equal(events.filter(e => e.type === "turn-end").length, 1);
+  assert.equal(events.filter(e => e.type === "input-error" && !e.willRetry).length, 0);
+  await session.close("done");
+});
+
+for (const action of ["cancel", "close"]) test(`Codex ${action} cancels capacity backoff`, async () => {
+  const { child, session } = await startedCodexTurn("cancel-input", "cancel-turn", { codexCapacityRetryDelaysMs: [20] });
+  capacityFail(child, "cancel-turn");
+  await session[action]("user request");
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal(child.writes.filter(r => r.method === "turn/start").length, 1);
+});
+
+test("Codex capacity retry submission errors consume the same bounded retry budget", async () => {
+  const { child, session, events } = await startedCodexTurn("rpc-input", "rpc-turn", { codexCapacityRetryDelaysMs: [1, 1, 1] });
+  capacityFail(child, "rpc-turn");
+  for (let i = 0; i < 3; i++) {
+    await retryTick();
+    const request = child.writes.at(-1);
+    child.stdout.write(`${JSON.stringify({ id: request.id, error: { message: capacityMessage } })}\n`);
+  }
+  await retryTick();
+  assert.equal(child.writes.filter(r => r.method === "turn/start").length, 4);
+  assert.equal(events.filter(e => e.type === "input-error" && !e.willRetry).length, 1);
+  assert.equal(events.filter(e => e.type === "turn-end").length, 1);
+  await session.close("done");
+});
+
+test("Codex cancellation interrupts a capacity retry accepted after cancellation", async () => {
+  const { child, session, events } = await startedCodexTurn("cancel-race", "cancel-race-turn", { codexCapacityRetryDelaysMs: [1] });
+  capacityFail(child, "cancel-race-turn");
+  await retryTick();
+  const request = child.writes.at(-1);
+  await session.cancel("user request");
+  child.stdout.write(`${JSON.stringify({ id: request.id, result: { turn: { id: "late-retry" } } })}\n`);
+  codexNotify(child, "turn/started", { turn: { id: "late-retry" } });
+  assert.equal(child.writes.at(-1).method, "turn/interrupt");
+  codexNotify(child, "turn/completed", { turn: { id: "late-retry", status: "interrupted" } });
+  assert.equal(events.filter(e => e.type === "turn-end").length, 1);
+  await session.close("done");
+});
+
+test("Codex capacity rejection before turn acceptance retries the unaccepted input with a finite budget", async () => {
+  const { child, session } = await startedCodexTurn("previous", "previous-turn", { codexCapacityRetryDelaysMs: [1, 1, 1] });
+  codexNotify(child, "turn/completed", { turn: { id: "previous-turn", status: "completed" } });
+  const prompt = session.prompt({ inputId: "unaccepted", kind: "wake", text: "original unaccepted input", attempt: 0 });
+  await new Promise(resolve => setImmediate(resolve));
+  child.stdout.write(`${JSON.stringify({ id: child.writes.at(-1).id, error: { message: capacityMessage } })}\n`);
+  assert.equal((await prompt).status, "accepted");
+  for (let i = 0; i < 3; i++) {
+    await retryTick();
+    const request = child.writes.at(-1);
+    assert.match(JSON.stringify(request.params.input), /original unaccepted input/);
+    child.stdout.write(`${JSON.stringify({ id: request.id, error: { message: capacityMessage } })}\n`);
+  }
+  await retryTick();
+  assert.equal(child.writes.filter(r => r.method === "turn/start").length, 5);
+  await session.close("done");
+});
+
+test("Codex cancellation of a rejected retry does not block a later user prompt", async () => {
+  const { child, session } = await startedCodexTurn("cancel-rejected", "cancel-rejected-turn", { codexCapacityRetryDelaysMs: [1] });
+  capacityFail(child, "cancel-rejected-turn");
+  await retryTick();
+  const request = child.writes.at(-1);
+  await session.cancel("user request");
+  child.stdout.write(`${JSON.stringify({ id: request.id, error: { message: capacityMessage } })}\n`);
+  const next = session.prompt({ inputId: "new-work", kind: "wake", text: "new work", attempt: 0 });
+  await new Promise(resolve => setImmediate(resolve));
+  const nextRequest = child.writes.at(-1);
+  assert.equal(nextRequest.method, "turn/start");
+  assert.notEqual(nextRequest.id, request.id);
+  child.stdout.write(`${JSON.stringify({ id: nextRequest.id, result: { turn: { id: "new-work-turn" } } })}\n`);
+  assert.equal((await next).status, "accepted");
+  await session.close("done");
 });

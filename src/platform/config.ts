@@ -18,7 +18,6 @@ export type MentionPolicy = "require" | "free";
 export type MentionPolicyOverride = MentionPolicy | "inherit";
 export type InboxAuditEnabledOverride = boolean | "inherit";
 export type InboxAuditIntervalOverride = number | "inherit";
-
 export interface InboxAuditSettings {
   enabled?: boolean;
   intervalMs?: number;
@@ -97,7 +96,7 @@ const TOP_FIELDS_V4 = new Set(["version", "serverId", "mentionPolicy", "activeAg
 const OPTIONAL_TOP_FIELDS_V4 = new Set(["inboxAudit"]);
 const AGENT_FIELDS_V3 = new Set(["runtime", "model", "effort", "noMentionChats", "createdAt"]);
 const AGENT_FIELDS_V4 = new Set(["runtime", "model", "effort", "mentionPolicy", "chatMentionPolicies", "inboxAudit", "createdAt"]);
-const LEGACY_AGENT_FIELDS = new Set(["piDistribution", "runtimeOption"]);
+const LEGACY_AGENT_FIELDS = new Set(["piDistribution", "runtimeOption", "processingEye"]);
 const INBOX_AUDIT_FIELDS = new Set(["enabled", "intervalMs"]);
 const APP_ID = /^cli_[A-Za-z0-9]+$/;
 const CHAT_ID = /^oc_[A-Za-z0-9_-]+$/;
@@ -210,6 +209,14 @@ function resolvedInboxAudit(settings: InboxAuditSettings | undefined): InboxAudi
     enabled: settings?.enabled ?? false,
     intervalMs: settings?.intervalMs ?? DEFAULT_INBOX_AUDIT_INTERVAL_MS,
   };
+}
+
+function dropRetiredProcessingEye(raw: Obj): void {
+  delete raw.processingEye;
+  if (!isPlainObject(raw.agents)) return;
+  for (const agent of Object.values(raw.agents)) {
+    if (isPlainObject(agent)) delete agent.processingEye;
+  }
 }
 
 export function inboxAuditMutationFromCli(input: {
@@ -358,6 +365,7 @@ export function normalizeConfig(raw: unknown, configDir: string, { mint }: { min
     configDir: layout.configDir, larkinHome: layout.larkinHome, larkConfigDir: resolveLarkConfigDir({}, layout.root), activeAgent: null, agents: {},
   };
   if (!isPlainObject(raw)) throw new Error("config 必须是普通 object");
+  dropRetiredProcessingEye(raw);
   const version = raw.version;
   if (version !== 3 && version !== 4) throw new Error("不支持该配置格式：larkin 只接受 version=3/4");
   const topFields = version === 3 ? TOP_FIELDS_V3 : TOP_FIELDS_V4;
@@ -637,6 +645,8 @@ function agentSignature(config: HydratedConfig, agentId: string): string {
     runtime: agent.runtime, model: agent.model, effort: agent.effort ?? null,
     globalMentionPolicy: config.mentionPolicy, agentMentionPolicy: agent.mentionPolicy ?? null, chatMentionPolicies: chats,
     globalInboxAudit: config.inboxAudit ?? null, agentInboxAudit: agent.inboxAudit ?? null,
+    // 0.5.19 起不再有 processingEye 开关；固定 null 以免未配过该 key 的 Agent 升级后无意义 pending apply。
+    globalProcessingEye: null, agentProcessingEye: null,
   }));
 }
 

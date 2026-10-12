@@ -83,7 +83,7 @@ git push origin main
 - release commit 必须保持工作树干净、已推送，并通过 typecheck、build、测试、license 和 publication checks；安装工件必须显示 `sourceDirty: false`。
 - 发现上下游使用了相同版本号时，不覆盖、不移动已有 tag；下游直接递增到新的未使用版本，并从明确的上游 commit 重新构建。
 
-当前发行关系：下游已同步上游 `eddiearc/larkin@5a78e2d`（`0.5.5`），该版本上游已移除内置（builtin）Pi、全面转向外部安装的 `pi` 运行时；下游在此基础上保留 external enqueue，发行版本为 `0.5.6`。后续同步时以实际的 `upstream/main` 和下游最新 release 为准，不把本段中的 commit 当作永久固定基线。
+当前发行关系：下游已同步上游 `eddiearc/larkin@eeb3487`（`0.5.13`），保留 external enqueue 和外部 Pi 扩展发现，增加 Codex 容量错误有限重试，候选发行版本为 `0.5.14`。后续同步时以实际的 `upstream/main` 和下游最新 release 为准，不把本段中的 commit 当作永久固定基线。
 
 ## Requirements
 
@@ -190,6 +190,10 @@ larkin config inbox-audit global off
 ```
 
 When enabled, audit only revisits originally wake-eligible human group/topic work and does not wake a model for an empty work list. Reading an audit list does not complete it: the managed Agent follows the returned inspection instructions and explicitly confirms the receipt after checking. A failed check remains retryable; newer messages cannot be completed by an older receipt. Old audit-index records without proven eligibility or observation identity are ignored; ordinary Inbox messages and conversation history are preserved.
+
+### Processing eye (OnIt)
+
+The Feishu "processing eye" is an OnIt reaction on the inbound message while the Agent works. It is automatic and not configurable: Larkin adds it after a successful deliver only for private chats (DM / p2p), when the inbound event marked the bot as mentioned, or when the user is talking inside a topic the bot started. Ordinary group messages without @ and outside a bot-started topic never get the reaction. The 0.5.18 `processingEye` config key, CLI, and Dashboard toggle are removed; leftover keys are ignored.
 
 <details>
 <summary>Windows support and optional autostart</summary>
