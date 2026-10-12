@@ -17,7 +17,14 @@ import {
   safeConversationExcerpt,
   shouldPreventiveReconnect,
 } from "./host-business-state.js";
-import { ProcessingEyeOrchestrator } from "./host-processing-eye.js";
+import {
+  isBotStartedTopic,
+  listBotTopicRoots,
+  persistBotTopicRoot,
+  ProcessingEyeOrchestrator,
+  shouldShowProcessingEye,
+} from "./host-processing-eye.js";
+import { feishuImTarget, serializeFeishuImTarget } from "./im-freshness-adapter.js";
 import { RUNTIME_EXTERNAL_TARGET, projectInboxEnvelope, targetKeyOfInboxEnvelope } from "../agent/inbox-projection.js";
 import { HostReminderOrchestrator } from "../agent/host-reminder-orchestrator.js";
 import { boundedInboxAuditDiagnostic, InboxAuditHeartbeat, INBOX_AUDIT_CADENCE_MS } from "../agent/inbox-audit-heartbeat.js";
@@ -40,7 +47,7 @@ import { readDocumentCommentSubscription, verifyCallbackProbe, type EffectiveDoc
 import { loadConfig, resolveInboxAuditSchedule, resolveMentionPolicy } from "../platform/config.js";
 import { processCommandToken } from "../app/internal-command.js";
 import { managedOfficialLarkCli } from "../app/agent-lark-cli-workspace.js";
-import { isChannelReconnecting, isRuntimeReadinessCurrent } from "../app/agent-readiness.js";
+import { isChannelReconnecting, isRuntimeReadinessCurrent, isSessionCurrent } from "../app/agent-readiness.js";
 import {
   documentCommentMessageId,
   documentCommentNoticeType,
@@ -205,6 +212,38 @@ export function memberNamesFromPayloads(payloads: readonly unknown[]): Record<st
 }
 
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+type OutboundProgressState = {
+  version?: unknown;
+  cursors?: Record<string, unknown>;
+  last_outbound_at?: unknown;
+  last_outbound_by_target?: Record<string, unknown>;
+};
+
+function canonicalImTarget(target?: string): string | null {
+  if (!target) return null;
+  try { return serializeFeishuImTarget(feishuImTarget(target)); }
+  catch { return null; }
+}
+
+export function lastOutboundAtForTarget(store: AgentStateStore, target?: string): number | null {
+  const state = store.readJson<OutboundProgressState>("freshnessState", {});
+  const canonicalTarget = canonicalImTarget(target);
+  const value = canonicalTarget ? state.last_outbound_by_target?.[canonicalTarget] : state.last_outbound_at;
+  const timestamp = typeof value === "string" ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function recordOutboundAtForTarget(store: AgentStateStore, target?: string): void {
+  const canonicalTarget = canonicalImTarget(target);
+  store.mutateJson<OutboundProgressState, void>("freshnessState", { version: 1, cursors: {} }, (state) => {
+    const at = new Date().toISOString();
+    state.last_outbound_at = at;
+    if (!canonicalTarget) return;
+    state.last_outbound_by_target ??= {};
+    state.last_outbound_by_target[canonicalTarget] = at;
+  });
+}
+
 function safeRuntimeStatusDiagnostic(error: unknown): string {
   return safeProviderDiagnostic(error, "Runtime entered an error state", 500);
 }
@@ -443,6 +482,8 @@ export function createHostShell({
     recordStatusError: (agent, text) => hostState.recordStatusError(agent, text),
     readPending: (agent) => stateStore(agent as ConfiguredAgent).readJson<{ items?: Array<{ msgId: string; reactionId: string }> }>("pendingReact", {}).items || [],
     writePending: (agent, items) => stateStore(agent as ConfiguredAgent).writeJson("pendingReact", { items }),
+    lastOutboundAt: (agent, target) => lastOutboundAtForTarget(stateStore(agent as ConfiguredAgent), target),
+    recordOutboundAt: (agent, target) => recordOutboundAtForTarget(stateStore(agent as ConfiguredAgent), target),
     cliForAgent: (agent) => {
       const managed = managedCliForAgent(agent as ConfiguredAgent);
       return { command: managed.command.command, argsPrefix: managed.command.argsPrefix, env: managed.env };
@@ -635,7 +676,29 @@ export function createHostShell({
         excerpt: safeConversationExcerpt(event.content, 180),
         at: new Date().toISOString(),
       }, 30);
-      if (inboxEnvelope.sender_type === "human" || inboxEnvelope.sender_type === "agent") processingEyes.add(agent, String(inboxEnvelope.message_id || ""));
+      if (inboxEnvelope.sender_type === "human" || inboxEnvelope.sender_type === "agent") {
+        // 私聊、入站 @bot，或 inbound root/thread 落在本 bot 已发出的话题根上才点 OnIt。
+        const botStartedTopic = isBotStartedTopic({
+          threadId: event.thread_id,
+          rootId: event.root_id,
+          ownedIds: listBotTopicRoots(stateStore(agent).readJson("freshnessState", {})),
+        });
+        if (shouldShowProcessingEye({
+          chatType: event.chat_type,
+          channelType: typeof inboxEnvelope.channel_type === "string" ? inboxEnvelope.channel_type : undefined,
+          parentChannelType: typeof inboxEnvelope.parent_channel_type === "string" ? inboxEnvelope.parent_channel_type : undefined,
+          mentionedBot: event._mentioned_bot === true,
+          botStartedTopic,
+        })) {
+          if (botStartedTopic) persistBotTopicRoot(stateStore(agent), event.thread_id);
+          processingEyes.add(agent, String(inboxEnvelope.message_id || ""), {
+            replyInThread: String(inboxEnvelope.target || "").startsWith("thread:"),
+            target: String(inboxEnvelope.target || ""),
+          });
+        } else {
+          log(`👀 跳过群未@且非 AI 话题消息 agent=${agent.name} chat=${event.chat_id}`);
+        }
+      }
       if (receipt.status === "deferred") log(`Runtime 暂缓投递，消息保留在 inbox seq=${inboxEnvelope.seq}: ${receipt.reason}`);
     } catch (error) {
       if (wake) telemetry?.delivery(agent.agentId, telemetryMessageId, "error");
@@ -1604,9 +1667,12 @@ export function createHostShell({
         const status = hostState.readStatus(agent);
         const turns = status.session && typeof status.session === "object"
           ? Math.max(0, Number((status.session as { turns?: unknown }).turns) || 0) : 0;
-        const sessionStartedAt = status.session && typeof status.session === "object"
-          ? Date.parse(String((status.session as { startedAt?: unknown }).startedAt || "")) : Number.NaN;
-        const sessionCurrent = Number.isFinite(sessionStartedAt) && sessionStartedAt >= Date.parse(daemonStartedAt);
+        const sessionCurrent = isSessionCurrent(
+          status.session && typeof status.session === "object"
+            ? status.session as { startedAt?: unknown; lastSeenAt?: unknown }
+            : null,
+          daemonStartedAt,
+        );
         const runtimeReady = sessionCurrent && isRuntimeReadinessCurrent(
           status.runtimeReadiness as { state?: "missing" | "unauthenticated" | "incompatible" | "ready" | "unavailable"; observedAt?: string } | undefined,
           daemonStartedAt,
@@ -1690,9 +1756,12 @@ export function createHostShell({
         const status = hostState.readStatus(agent);
         const turns = status.session && typeof status.session === "object"
           ? Math.max(0, Number((status.session as { turns?: unknown }).turns) || 0) : 0;
-        const sessionStartedAt = status.session && typeof status.session === "object"
-          ? Date.parse(String((status.session as { startedAt?: unknown }).startedAt || "")) : Number.NaN;
-        const sessionCurrent = Number.isFinite(sessionStartedAt) && sessionStartedAt >= Date.parse(daemonStartedAt);
+        const sessionCurrent = isSessionCurrent(
+          status.session && typeof status.session === "object"
+            ? status.session as { startedAt?: unknown; lastSeenAt?: unknown }
+            : null,
+          daemonStartedAt,
+        );
         const runtimeReady = sessionCurrent && isRuntimeReadinessCurrent(
           status.runtimeReadiness as { state?: "missing" | "unauthenticated" | "incompatible" | "ready" | "unavailable"; observedAt?: string } | undefined,
           daemonStartedAt,

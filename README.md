@@ -191,6 +191,10 @@ larkin config inbox-audit global off
 
 When enabled, audit only revisits originally wake-eligible human group/topic work and does not wake a model for an empty work list. Reading an audit list does not complete it: the managed Agent follows the returned inspection instructions and explicitly confirms the receipt after checking. A failed check remains retryable; newer messages cannot be completed by an older receipt. Old audit-index records without proven eligibility or observation identity are ignored; ordinary Inbox messages and conversation history are preserved.
 
+### Processing eye (OnIt)
+
+The Feishu "processing eye" is an OnIt reaction on the inbound message while the Agent works. It is automatic and not configurable: Larkin adds it after a successful deliver only for private chats (DM / p2p), when the inbound event marked the bot as mentioned, or when the user is talking inside a topic the bot started. Ordinary group messages without @ and outside a bot-started topic never get the reaction. The 0.5.18 `processingEye` config key, CLI, and Dashboard toggle are removed; leftover keys are ignored.
+
 <details>
 <summary>Windows support and optional autostart</summary>
 
