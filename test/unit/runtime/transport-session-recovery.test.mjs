@@ -267,3 +267,14 @@ test("startup moves legacy healthy error fields into historical diagnostics", as
     assert.equal(health.lastFailure.reason, "historical failure"); assert.equal(health.lastFailure.state, "error");
   });
 });
+
+test("an owned native retry keeps reconciliation pending until its eventual explicit outcome", async () => {
+  await withFixture(async (f) => {
+    await f.fail(); const { plan } = await f.inspect(); await f.commit(plan, f.review(plan));
+    const input = f.current().inputs.at(-1);
+    f.current().emit({ type: "input-error", inputId: input.inputId, retryable: true, willRetry: true, errorCategory: "provider", message: "synthetic native retry pending" });
+    assert.equal(f.store.readJson("transportRecovery", {}).phase, "reconciling");
+    await f.finish();
+    assert.equal(f.store.readJson("transportRecovery", {}).phase, "complete");
+  });
+});
