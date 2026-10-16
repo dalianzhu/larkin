@@ -255,3 +255,15 @@ test("a new explicit attempt requires its own success even if a prior turn left 
     assert.equal(f.store.readJson("transportRecovery", {}).phase, "complete");
   }, { now: () => now, onPrompt() { duringRetry?.(); } });
 });
+
+test("startup moves legacy healthy error fields into historical diagnostics", async () => {
+  await withFixture(async (f) => {
+    f.store.writeJson("status", { ...f.store.readJson("status", {}), inboundDeliveryHealth: { state: "healthy", at: "2026-01-01T00:00:00Z",
+      recoveredAt: "2026-01-01T00:01:00Z", code: "runtime_delivery_event", reason: "historical failure", nextAction: "historical action", messageIds: ["om_old_consumed"] } });
+    await f.restart();
+    const health = f.store.readJson("status", {}).inboundDeliveryHealth;
+    assert.equal(health.state, "healthy"); assert.equal(health.reason, undefined); assert.equal(health.nextAction, undefined);
+    assert.equal(health.at, "2026-01-01T00:01:00Z");
+    assert.equal(health.lastFailure.reason, "historical failure"); assert.equal(health.lastFailure.state, "error");
+  });
+});
