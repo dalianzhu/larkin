@@ -195,6 +195,9 @@ export async function main(env: NodeJS.ProcessEnv = process.env, overrides: {
     async enqueue(request) {
       return await hostShell.enqueueExternal(request);
     },
+    async recoverTransportSession(request) {
+      return hostShell.recoverTransportSession(request.agentId, request);
+    },
     async recoverSession(request) {
       const result = await hostShell.recoverSession(request.agentId, request.reason, request.waitReadyMs);
       return { ok: result.recoveryCommitted, agentId: request.agentId, ...result };

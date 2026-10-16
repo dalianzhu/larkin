@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import { readTransportRecovery, transportRecoveryHeld } from "../runtime/transport-session-recovery.js";
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { TargetRootLayout, type AgentStatePaths } from "../platform/root-layout.js";
@@ -8,11 +9,11 @@ import { isCanonicalInboxTarget, isUserDeliveryTarget, RUNTIME_REMINDER_TARGET, 
 import { buildStrictProviderErrorInput, classifyStrictProviderError } from "../runtime/provider-error-classifier.js";
 
 export type JsonStateKey = "agentState" | "status" | "map" | "replyctx" | "botIdentity" |
-  "senderProfiles" | "readReceipts" | "pendingReact" | "runtimeDeliveries" | "inboxState" | "freshnessState" | "documentComments" | "reminders" | "interactions" | "externalEnqueue";
+  "senderProfiles" | "readReceipts" | "pendingReact" | "transportRecovery" | "runtimeDeliveries" | "inboxState" | "freshnessState" | "documentComments" | "reminders" | "interactions" | "externalEnqueue";
 export type NdjsonStateKey = "conversation" | "inbox";
 
 const JSON_KEYS: ReadonlySet<string> = new Set([
-  "agentState", "status", "map", "replyctx", "botIdentity", "senderProfiles", "readReceipts", "pendingReact", "runtimeDeliveries", "inboxState", "freshnessState", "documentComments", "reminders", "interactions", "externalEnqueue",
+  "agentState", "status", "map", "replyctx", "botIdentity", "senderProfiles", "readReceipts", "pendingReact", "transportRecovery", "runtimeDeliveries", "inboxState", "freshnessState", "documentComments", "reminders", "interactions", "externalEnqueue",
 ]);
 const NDJSON_KEYS: ReadonlySet<string> = new Set(["conversation", "inbox"]);
 const INBOX_LOCK_TIMEOUT_MS = 2_000;
@@ -838,6 +839,71 @@ export class AgentStateStore {
     });
   }
 
+  /** Atomic, read-only evidence for an operator recovery plan. Never marks a message seen. */
+  inspectTransportRecovery(): { fingerprint: string; failures: Array<{ deliveryId: string; messageId: string; target: string; pendingRows: number; pendingMessageIds: string[]; reason: string; errorCategory?: string }>; active: number } {
+    return this.withInboxTransaction(() => this.inspectTransportRecoveryUnlocked());
+  }
+
+  private inspectTransportRecoveryUnlocked(): ReturnType<AgentStateStore["inspectTransportRecovery"]> {
+    const rows = this.readNdjson<InboxEnvelope>("inbox");
+    const pending = new Map<string, InboxEnvelope>();
+    const counts = new Map<string, number>();
+    for (const row of rows) {
+      if (typeof row.message_id !== "string" || !/^[A-Za-z0-9_-]{1,160}$/.test(row.message_id) || pending.has(row.message_id)) throw new Error("canonical_inbox_invalid");
+      const target = targetKeyOfInboxEnvelope(row);
+      pending.set(row.message_id, row); counts.set(target, (counts.get(target) || 0) + 1);
+    }
+    const ledger = this.readJson<{ records: Array<{ deliveryId: string; messageId: string; status: string; target?: string; reason?: string; errorCategory?: string }> }>("runtimeDeliveries", { records: [] });
+    if (!Array.isArray(ledger.records)) throw new Error("delivery_ledger_invalid");
+    const identities = new Set<string>();
+    const failures = ledger.records.filter((record) => {
+      if (!record || !/^[A-Za-z0-9_-]{1,160}$/.test(record.deliveryId) || !/^[A-Za-z0-9_-]{1,160}$/.test(record.messageId)
+        || identities.has(record.deliveryId)) throw new Error("delivery_identity_invalid");
+      identities.add(record.deliveryId);
+      return record.status === "error";
+    }).map((record) => {
+      const row = pending.get(record.messageId);
+      if (!row) throw new Error("canonical_inbox_row_missing");
+      const target = targetKeyOfInboxEnvelope(row);
+      const state = this.inboxState();
+      const known = state.messages[record.messageId];
+      if (!known || known.target !== target || !validSequence(known.seq)
+        || (record.target !== undefined && record.target !== target)
+        || state.targets[target]?.model_seen_seq >= known.seq) throw new Error("canonical_inbox_conflict");
+      if (!/^[A-Za-z0-9_:.\-]{1,512}$/.test(target)) throw new Error("canonical_target_invalid");
+      return { deliveryId: record.deliveryId, messageId: record.messageId, target, pendingRows: counts.get(target) || 0, pendingMessageIds: rows.filter((candidate) => targetKeyOfInboxEnvelope(candidate) === target).map((candidate) => String(candidate.message_id)),
+        reason: String(record.reason || ""), ...(record.errorCategory ? { errorCategory: record.errorCategory } : {}) };
+    });
+    const hash = crypto.createHash("sha256");
+    for (const key of ["inbox", "inboxState", "runtimeDeliveries"] as const) {
+      let text = "";
+      try { text = this.readText(this.file(key)); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      hash.update(key); hash.update("\0"); hash.update(text); hash.update("\0");
+    }
+    return { fingerprint: `sha256:${hash.digest("hex")}`, failures,
+      active: ledger.records.filter((record) => record.status !== "error" && record.status !== "consumed").length };
+  }
+
+  /** A durable switch intent precedes session persistence; restart rolls it forward, never replays work. */
+  commitTransportRecovery(fingerprint: string, journal: { phase: string; sessionId: string; previousSession: unknown }): void {
+    this.withInboxTransaction(() => {
+      if (this.inspectTransportRecoveryUnlocked().fingerprint !== fingerprint) throw new Error("recovery_plan_stale");
+      this.writeJson("transportRecovery", { ...journal, phase: "switching" });
+      this.restoreTransportRecoverySession();
+      this.writeJson("transportRecovery", { ...journal, phase: "awaiting" });
+    });
+  }
+
+  restoreTransportRecoverySession(): void {
+    const journal = this.readJson<{ sessionId?: string; previousSession?: { sessionId?: string }; runtime?: string }>("transportRecovery", {});
+    if (!journal.sessionId || !journal.previousSession?.sessionId || journal.runtime !== "codex") throw new Error("recovery_journal_invalid");
+    const state = this.readJson<Record<string, any>>("agentState", { sessions: {} });
+    const current = state.sessions?.codex;
+    if (current !== journal.sessionId && current !== journal.previousSession.sessionId) throw new Error("recovery_session_conflict");
+    this.writeJson("agentState", { ...state, sessions: { ...state.sessions, codex: journal.sessionId },
+      previousSessions: { ...state.previousSessions, codex: journal.previousSession } });
+  }
+
   /** Prove delivery consumption without requiring unrelated passive Inbox rows to drain. */
   areRuntimeDeliveriesConsumed(requiredMessageIds: readonly string[] = []): boolean {
     return this.withInboxLock(this.file("inbox"), () => {
@@ -1086,6 +1152,15 @@ export class AgentStateStore {
         const selectedTarget = targetKeyOfInboxEnvelope(row);
         if (envelopes.length < limit && (!options.target || options.target === selectedTarget)) envelopes.push(row);
         else remaining.push(row);
+      }
+      // Recovery authority is a snapshot of exact canonical rows, checked under
+      // the same lock as consumption. A concurrent poll or later same-target
+      // arrival cannot turn an old row limit into permission to drain new work.
+      const recovery = readTransportRecovery(this.readJson("transportRecovery", null));
+      if (transportRecoveryHeld(recovery)) {
+        if (!["submitting", "reconciling"].includes(recovery!.phase) || !options.target) throw new Error("recovery_poll_refused");
+        const allowed = new Set(recovery!.failures.filter((failure) => failure.target === options.target).flatMap((failure) => failure.pendingMessageIds));
+        if (envelopes.some((row) => !allowed.has(String(row.message_id)))) throw new Error("recovery_poll_outside_snapshot");
       }
       const pendingCount = remaining.reduce((count, row) => {
         if (!options.target) return count + 1;

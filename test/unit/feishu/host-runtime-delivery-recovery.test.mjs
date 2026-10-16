@@ -100,7 +100,7 @@ test("Host/Runtime recover terminal model-access failure only after successful t
     assert.equal(after.runtimeReadiness.state, "ready");
     assert.equal(after.inboundDeliveryHealth.state, "healthy");
     assert.ok(after.inboundDeliveryHealth.recoveredAt);
-    assert.equal(after.inboundDeliveryHealth.at, before.inboundDeliveryHealth.at);
+    assert.equal(after.inboundDeliveryHealth.lastFailure.at, before.inboundDeliveryHealth.at);
     assert.deepEqual(after.recentErrors, before.recentErrors, "historical diagnostics remain intact");
     assert.ok(after.deliverLog.some((entry) => entry.status === "error"));
     assert.equal(events.filter((event) => event.type === "delivery-recovered").length, 1);
