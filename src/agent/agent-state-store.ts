@@ -1,5 +1,5 @@
 import * as fs from "node:fs";
-import { readTransportRecovery, transportRecoveryHeld } from "../runtime/transport-session-recovery.js";
+import { readTransportRecovery, transportRecoveryHeld, isRecoveryWake, type TransportSnapshot } from "../runtime/transport-session-recovery.js";
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { TargetRootLayout, type AgentStatePaths } from "../platform/root-layout.js";
@@ -840,7 +840,7 @@ export class AgentStateStore {
   }
 
   /** Atomic, read-only evidence for an operator recovery plan. Never marks a message seen. */
-  inspectTransportRecovery(): { fingerprint: string; failures: Array<{ deliveryId: string; messageId: string; target: string; pendingRows: number; pendingMessageIds: string[]; reason: string; errorCategory?: string }>; active: number } {
+  inspectTransportRecovery(): TransportSnapshot {
     return this.withInboxTransaction(() => this.inspectTransportRecoveryUnlocked());
   }
 
@@ -874,13 +874,23 @@ export class AgentStateStore {
       return { deliveryId: record.deliveryId, messageId: record.messageId, target, pendingRows: counts.get(target) || 0, pendingMessageIds: rows.filter((candidate) => targetKeyOfInboxEnvelope(candidate) === target).map((candidate) => String(candidate.message_id)),
         reason: String(record.reason || ""), ...(record.errorCategory ? { errorCategory: record.errorCategory } : {}) };
     });
+    const health = this.readJson<{ inboundDeliveryHealth?: { state?: string; messageIds?: string[] } }>("status", {}).inboundDeliveryHealth;
+    const state = this.inboxState();
+    const hostFailureIds = health?.state === "error" && Array.isArray(health.messageIds) ? health.messageIds.filter((id) => {
+      const known = state.messages[id];
+      return pending.has(id) || !known || !validSequence(known.seq) || !(state.targets[known.target]?.model_seen_seq >= known.seq);
+    }) : [];
+    const submittedIds = new Set(ledger.records.map((record) => record.messageId));
+    const undispatchedWakeIds = rows.filter((row) => isRecoveryWake(row) && !submittedIds.has(String(row.message_id))
+      && !hostFailureIds.includes(String(row.message_id))).map((row) => String(row.message_id));
     const hash = crypto.createHash("sha256");
+    hash.update(JSON.stringify([...hostFailureIds].sort()));
     for (const key of ["inbox", "inboxState", "runtimeDeliveries"] as const) {
       let text = "";
       try { text = this.readText(this.file(key)); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
       hash.update(key); hash.update("\0"); hash.update(text); hash.update("\0");
     }
-    return { fingerprint: `sha256:${hash.digest("hex")}`, failures,
+    return { fingerprint: `sha256:${hash.digest("hex")}`, failures, undispatchedWakeIds, hostFailureIds, inboxMessageIds: rows.map((row) => String(row.message_id)),
       active: ledger.records.filter((record) => record.status !== "error" && record.status !== "consumed").length };
   }
 

@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { requestTransportSessionRecovery } from "./local-control.js";
-import type { TransportRecoveryReview } from "../runtime/transport-session-recovery.js";
+import { MAX_TRANSPORT_RECOVERY_REVIEW_BYTES, type TransportRecoveryReview } from "../runtime/transport-session-recovery.js";
 import { loadConfig } from "../platform/config.js";
 import { requestSessionRecovery, requestSessionReset, type SessionResetResponse } from "./local-control.js";
 
@@ -87,7 +87,8 @@ export async function runSessionCli(
           const fd = fs.openSync(parsed.reviewFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
           try {
             const stat = fs.fstatSync(fd);
-            if (!stat.isFile() || stat.size > 16_384) throw new Error("invalid instructions file");
+            if (!stat.isFile()) throw new Error("invalid instructions file");
+            if (stat.size > MAX_TRANSPORT_RECOVERY_REVIEW_BYTES) return fail("recovery_review_too_large", "recovery review JSON exceeds 16 KiB", agentId);
             review = JSON.parse(fs.readFileSync(fd, "utf8"));
           } finally { fs.closeSync(fd); }
         } catch { return fail("recovery_review_invalid", "unable to read recovery review JSON", agentId); }
