@@ -41,6 +41,7 @@ import {
   readinessForPersistedAuthFailure,
   RuntimePrerequisiteError,
   type PersistedAuthFailure,
+  type RuntimeReadiness,
 } from "../runtime/runtime-readiness.js";
 import { providerFinishReason, safeProviderDiagnostic } from "../runtime/provider-error-classifier.js";
 import { readDocumentCommentSubscription, verifyCallbackProbe, type EffectiveDocumentCommentSubscription } from "../platform/callback-capability.js";
@@ -370,7 +371,7 @@ export function createHostShell({
       return null;
     }
   };
-  const projectReadyUnlessUnresolvedAuth = (agent: ConfiguredAgent, observedAt: string): void => {
+  const projectReadyUnlessUnresolvedFailure = (agent: ConfiguredAgent, observedAt: string, deliveryRecovered = false, readiness?: RuntimeReadiness): void => {
     const failure = unresolvedCurrentAuth(agent);
     if (failure) {
       hostState.updateStatus(agent, {
@@ -378,12 +379,18 @@ export function createHostShell({
       });
       return;
     }
-    hostState.updateStatus(agent, { runtimeReadiness: { runtime: agent.runtime, state: "ready", observedAt } });
+    if (!deliveryRecovered && (hostState.readStatus(agent).inboundDeliveryHealth as { state?: string } | undefined)?.state === "error") {
+      hostState.updateStatus(agent, { runtimeReadiness: { runtime: agent.runtime, state: "unavailable", source: "inbound-delivery", observedAt,
+        reason: "Inbound Runtime delivery recovery is not yet proven.",
+        nextAction: "Resolve pending deliveries and complete a successful Runtime turn before resuming dispatch." } });
+      return;
+    }
+    hostState.updateStatus(agent, { runtimeReadiness: { runtime: agent.runtime, state: "ready", ...readiness, observedAt } });
   };
   const projectFallbackRuntimeReadiness = (
     agent: ConfiguredAgent,
     observedAt: string,
-    fallback: { state: "missing" | "unavailable"; reason: string; nextAction?: string },
+    fallback: { state: "missing" | "unavailable"; reason: string; nextAction?: string; source?: string },
     preserveCurrentUnavailableDiagnostic = false,
   ): void => {
     const failure = unresolvedCurrentAuth(agent);
@@ -422,7 +429,7 @@ export function createHostShell({
     hostState.updateStatus(agent, {
       inboundDeliveryHealth: { state: "error", code, at, reason, nextAction },
     });
-    projectFallbackRuntimeReadiness(agent, at, { state: "unavailable", reason, nextAction }, true);
+    projectFallbackRuntimeReadiness(agent, at, { state: "unavailable", reason, nextAction, source: "inbound-delivery" }, true);
     hostState.recordStatusError(agent, `${reason} ${nextAction} code=${code}`);
   };
   const agentStates = new Map<string, AgentStateRecord>();
@@ -1452,6 +1459,7 @@ export function createHostShell({
         } else {
           projectFallbackRuntimeReadiness(agent, observedAt, message.status === "error" ? {
             state: "unavailable",
+            source: "runtime-status",
             reason: safeRuntimeStatusDiagnostic(message.error),
             nextAction: "Inspect the Runtime status error, correct the Runtime availability issue, then retry.",
           } : {
@@ -1461,13 +1469,13 @@ export function createHostShell({
         }
       }
       else if (message.readiness) {
-        if (message.readiness.state === "ready" && unresolvedCurrentAuth(agent)) {
-          projectReadyUnlessUnresolvedAuth(agent, observedAt);
+        if (message.readiness.state === "ready") {
+          projectReadyUnlessUnresolvedFailure(agent, observedAt, false, message.readiness);
         } else {
           hostState.updateStatus(agent, { runtimeReadiness: { ...message.readiness, observedAt } });
         }
       }
-      else if (message.status === "active") projectReadyUnlessUnresolvedAuth(agent, observedAt);
+      else if (message.status === "active") projectReadyUnlessUnresolvedFailure(agent, observedAt);
       if (message.status === "active") {
         const redeliveryTimer = setTimeout(() => {
           void reminder.redeliverUnread(agent).catch((error) => log("启动补投失败", errorMessage(error)));
@@ -1488,6 +1496,26 @@ export function createHostShell({
         agentStates.get(agent.agentId)?.state.sessions[agent.runtime] || null);
       if (patch) hostState.updateStatus(agent, patch);
       processingEyes.observeActivity(agent, message.activity);
+      return;
+    }
+    if (message.type === "delivery-recovered") {
+      const status = hostState.readStatus(agent);
+      const session = status.session as { runtime?: string; id?: string; launchId?: string } | undefined;
+      const readiness = status.runtimeReadiness as { state?: string; source?: string } | undefined;
+      if (agent.runtime !== message.runtime || session?.runtime !== message.runtime
+        || session.id !== message.sessionId || session.launchId !== message.launchId
+        || unresolvedCurrentAuth(agent) || (readiness?.state !== "ready"
+          && !(readiness?.state === "unavailable" && ["inbound-delivery", "runtime-status"].includes(readiness.source || "")))) return;
+      // Runtime supplies successful-turn evidence; canonical state independently
+      // covers Host failures that occurred before any ledger record was created.
+      try {
+        if (!stateStore(agent).areRuntimeDeliveriesConsumed()) return;
+      } catch { return; }
+      const observedAt = new Date().toISOString();
+      if ((status.inboundDeliveryHealth as { state?: string } | undefined)?.state === "error") {
+        hostState.updateStatus(agent, { inboundDeliveryHealth: { ...(status.inboundDeliveryHealth as object), state: "healthy", recoveredAt: observedAt } });
+      }
+      projectReadyUnlessUnresolvedFailure(agent, observedAt, true);
       return;
     }
     if (message.type === "delivery") {
@@ -1705,9 +1733,9 @@ export function createHostShell({
             session: { runtime: agent.runtime, id: null, launchId: null, startedAt: observedAt,
               lastSeenAt: null, lastTurnAt: null, turns: 0 },
           });
-          projectReadyUnlessUnresolvedAuth(agent, observedAt);
+          projectReadyUnlessUnresolvedFailure(agent, observedAt);
         } else if (reset.runtimeReady) {
-          projectReadyUnlessUnresolvedAuth(agent, new Date().toISOString());
+          projectReadyUnlessUnresolvedFailure(agent, new Date().toISOString());
         }
       } catch (error) {
         const projection = readinessProjection();
@@ -1778,7 +1806,7 @@ export function createHostShell({
         throw Object.assign(error instanceof Error ? error : new Error(String(error)), readinessProjection());
       }
       if (recovery.runtimeReady) {
-        projectReadyUnlessUnresolvedAuth(agent, new Date().toISOString());
+        projectReadyUnlessUnresolvedFailure(agent, new Date().toISOString());
       }
       const record = agentStates.get(agentId);
       try {
