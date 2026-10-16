@@ -26,7 +26,7 @@ class FakeNativeSession {
   replayStore = null;
   constructor(runtime) { this.sessionId = `${runtime}-session`; }
   subscribe(listener) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
-  emit(event) { for (const listener of this.listeners) listener(event); }
+  emit(event) { if (event.type === "turn-end") event = { outcome: "success", ...event }; for (const listener of this.listeners) listener(event); }
   async prompt(input) {
     this.prompts.push(input);
     if (this.replayStore) setTimeout(() => { this.emit({ type: "turn-start" }); this.replayStore.pollInbox({ limit: 1 }); this.emit({ type: "turn-end" }); }, 0);
