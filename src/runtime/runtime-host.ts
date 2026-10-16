@@ -1807,14 +1807,6 @@ export function createRuntimeHost(options: {
     const messageId = String(envelope.message_id || envelope.seq || crypto.randomUUID());
     const agent = managed.get(agentId);
     if (!agent) { telemetry?.delivery(agentId, messageId, "error"); throw new Error(`unknown runtime Agent: ${agentId}`); }
-    if (recoveryHeld(agent)) {
-      const journal = journalFor(agent)!;
-      if (!agent.byMessage.has(messageId) && !journal.failures.some((failure) => failure.messageId === messageId)) {
-        saveJournal(agent, { ...journal, heldMessageIds: [...(journal.heldMessageIds || []), messageId] });
-      }
-      return { status: "deferred", deliveryId: `recovery-held-${crypto.createHash("sha256").update(messageId).digest("hex").slice(0, 24)}`,
-        reason: "operator reconciliation is required before dispatch" };
-    }
     let target: string;
     try {
       target = targetKeyOfInboxEnvelope(envelope);
@@ -1824,6 +1816,17 @@ export function createRuntimeHost(options: {
       telemetry?.delivery(agentId, messageId, "error");
       emit({ type: "delivery", agentId, deliveryId, messageId, status: "error", reason });
       return { status: "error", deliveryId, reason, retryable: false };
+    }
+    if (recoveryHeld(agent)) {
+      const journal = journalFor(agent)!;
+      const source = agent.stateStore?.resolveInboxDeliverySource?.(messageId);
+      if (!/^[A-Za-z0-9_-]{1,160}$/.test(messageId) || !source || source.status === "missing" || source.status === "invalid"
+        || source.target !== target) throw new TransportRecoveryError("recovery_canonical_input_invalid");
+      if (source.status === "pending" && !agent.byMessage.has(messageId) && !journal.failures.some((failure) => failure.messageId === messageId)) {
+        saveJournal(agent, { ...journal, heldMessageIds: [...(journal.heldMessageIds || []), messageId] });
+      }
+      return { status: "deferred", deliveryId: `recovery-held-${crypto.createHash("sha256").update(messageId).digest("hex").slice(0, 24)}`,
+        reason: "operator reconciliation is required before dispatch" };
     }
     reconcileExternalConsumption(agent);
     const existingId = agent.byMessage.get(messageId);

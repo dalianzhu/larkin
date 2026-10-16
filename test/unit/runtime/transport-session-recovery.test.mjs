@@ -416,3 +416,14 @@ test("a lost child acceptance cannot retain the held queue or block its later wa
     assert.equal(f.store.readJson("runtimeDeliveries", {}).records.find((record) => record.messageId === "om_transport_failed").status, "consumed");
   }, { onPrompt(input) { if (hangNext && input.kind === "wake") { hangNext = false; return new Promise(() => {}); } } });
 });
+
+test("invalid held ingress cannot poison the persistent recovery journal", async () => {
+  await withFixture(async (f) => {
+    await f.fail(); const { plan } = await f.inspect(); await f.commit(plan, f.review(plan));
+    const journal = fs.readFileSync(f.store.paths.transportRecovery, "utf8");
+    await assert.rejects(f.runtime().deliver(fixtureAgentId, { message_id: "invalid message id", target: "chat:oc_transport" }), (error) => error.code === "recovery_canonical_input_invalid");
+    await assert.rejects(f.runtime().deliver(fixtureAgentId, { message_id: "om_not_canonical", target: "chat:oc_transport" }), (error) => error.code === "recovery_canonical_input_invalid");
+    assert.equal(fs.readFileSync(f.store.paths.transportRecovery, "utf8"), journal);
+    await f.finish(); assert.equal(f.store.readJson("transportRecovery", {}).phase, "complete");
+  });
+});
