@@ -330,13 +330,14 @@ class CodexSession extends EventSession {
           : threadParams);
       }
       const thread = message.result?.thread;
-      if (thread?.id) this.adoptThread(String(thread.id));
+      if ((pending.method === "thread/start" || pending.method === "thread/resume") && thread?.id) this.adoptThread(String(thread.id));
       return;
     }
     // app-server also publishes subagent notifications on this connection. Only
     // correlated thread/start or thread/resume responses establish our session;
     // a child's thread/started must never replace the root thread.
     if (message.method === "thread/started") return;
+    // Legacy unscoped notifications remain supported; isolation requires thread scope.
     const notificationThreadId = message.params?.threadId ?? message.params?.thread_id;
     if (notificationThreadId != null && String(notificationThreadId) !== this.threadId) return;
     if (message.method === "turn/started") {
@@ -441,7 +442,7 @@ class CodexSession extends EventSession {
     ownership.outcome = { message, retryable, configuration };
     if (configuration) {
       for (const inputId of ownership.inputIds) ownership.terminalInputIds.add(inputId);
-      if (!ownership.configurationTerminal) {
+      if (!ownership.configurationTerminal && this.activeTurnId === turnId) {
         ownership.configurationTerminal = true;
         this.activeTurnId = null;
         this.emit({ type: "configuration-error", message });

@@ -426,32 +426,63 @@ test("Codex child notifications cannot replace, fail or complete the root turn",
   const steer = child.writes.at(-1);
   assert.equal(steer.params.threadId, "thread-owned");
   assert.equal(steer.params.expectedTurnId, turnId);
-  child.stdout.write(`${JSON.stringify({ id: steer.id, result: {} })}\n`);
+  child.stdout.write(`${JSON.stringify({ id: steer.id, result: { thread: { id: "child-thread" } } })}\n`);
   assert.equal((await pending).status, "accepted");
+  assert.equal(session.sessionId, "thread-owned", "non-thread responses cannot adopt a child");
+  await session.cancel("cancel root despite child noise");
+  assert.deepEqual(child.writes.at(-1).params, { threadId: "thread-owned", turnId });
+  assert.equal(child.writes.at(-1).method, "turn/interrupt");
   notify("turn/completed", { threadId: "thread-owned", turn: { id: turnId, status: "completed" } });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(events.filter((event) => event.type === "turn-end").length, 1);
   assert.equal((await session.busyInput({ inputId: "after", kind: "inbox_update", text: "after", attempt: 0 })).status, "deferred");
 });
 
-test("Codex stale root completion and late steer rejection cannot clear a newer root turn", async () => {
-  const { child, session, events, turnId } = await startedCodexTurn();
-  const pending = session.busyInput({ inputId: "old-update", kind: "inbox_update", text: "old", attempt: 0 });
-  await new Promise((resolve) => setImmediate(resolve));
-  const oldSteer = child.writes.at(-1);
-  child.stdout.write(`${JSON.stringify({ method: "turn/started", params: { threadId: "thread-owned", turn: { id: "new-root-turn" } } })}\n`);
-  child.stdout.write(`${JSON.stringify({ id: oldSteer.id, error: { message: "old turn already ended" } })}\n`);
-  assert.equal((await pending).status, "deferred");
-  child.stdout.write(`${JSON.stringify({ method: "turn/completed", params: { threadId: "thread-owned", turn: { id: turnId, status: "completed" } } })}\n`);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(events.filter((event) => event.type === "turn-end").length, 0);
-  const next = session.busyInput({ inputId: "new-update", kind: "inbox_update", text: "new", attempt: 0 });
-  await new Promise((resolve) => setImmediate(resolve));
-  const steer = child.writes.at(-1);
-  assert.equal(steer.params.expectedTurnId, "new-root-turn");
-  child.stdout.write(`${JSON.stringify({ id: steer.id, result: {} })}\n`);
-  assert.equal((await next).status, "accepted");
-});
+for (const eventKind of ["late steer rejection", "completed", "failed", "interrupted", "configuration completion", "error", "codex/event/error"]) {
+  test(`Codex stale ${eventKind} preserves a newer root turn and old input ownership`, async () => {
+    const { child, session, events, turnId } = await startedCodexTurn();
+    const notify = (method, params) => child.stdout.write(`${JSON.stringify({ method, params })}\n`);
+    const pending = session.busyInput({ inputId: "old-update", kind: "inbox_update", text: "old", attempt: 0 });
+    await new Promise((resolve) => setImmediate(resolve));
+    const oldSteer = child.writes.at(-1);
+    notify("turn/started", { threadId: "thread-owned", turn: { id: "new-root-turn" } });
+    const configuration = ["configuration completion", "error", "codex/event/error"].includes(eventKind);
+    const message = configuration ? "model requires a newer version of Codex" : "old turn already ended";
+    if (eventKind === "late steer rejection") {
+      child.stdout.write(`${JSON.stringify({ id: oldSteer.id, error: { message } })}\n`);
+      assert.equal((await pending).status, "deferred");
+    } else {
+      if (["error", "codex/event/error"].includes(eventKind)) {
+        notify(eventKind, { threadId: "thread-owned", turnId, error: { message }, willRetry: false });
+      } else {
+        notify("turn/completed", { threadId: "thread-owned", turn: {
+          id: turnId, status: configuration ? "failed" : eventKind, error: { message },
+        } });
+      }
+      child.stdout.write(`${JSON.stringify({ id: oldSteer.id, result: {} })}\n`);
+      assert.deepEqual(await pending, { status: "rejected", inputId: "old-update",
+        retryable: eventKind === "completed" || eventKind === "interrupted",
+        reason: eventKind === "completed" ? "Codex turn ended before steer acceptance" : message });
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(events.filter((event) => event.type === "turn-end" || event.type === "configuration-error").length, 0);
+    if (configuration) {
+      assert.equal(events.some((event) => event.type === "input-error"), false);
+    } else if (["failed", "interrupted"].includes(eventKind)) {
+      assert.equal(events.filter((event) => event.type === "input-error" && event.inputId === "input-A").length, 1);
+      assert.equal(events.some((event) => event.type === "input-error" && !["input-A", "old-update"].includes(event.inputId)), false);
+    }
+    const next = session.busyInput({ inputId: "new-update", kind: "inbox_update", text: "new", attempt: 0 });
+    await new Promise((resolve) => setImmediate(resolve));
+    const steer = child.writes.at(-1);
+    assert.equal(steer.params.expectedTurnId, "new-root-turn");
+    child.stdout.write(`${JSON.stringify({ id: steer.id, result: {} })}\n`);
+    assert.equal((await next).status, "accepted");
+    notify("turn/completed", { threadId: "thread-owned", turn: { id: "new-root-turn", status: "completed" } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(events.filter((event) => event.type === "turn-end").length, 1);
+  });
+}
 
 test("Pi unowned turn_start occupies busy and settles on agent_settled", async () => {
   let listener;
