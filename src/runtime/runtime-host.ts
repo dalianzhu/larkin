@@ -62,6 +62,7 @@ interface DeliveryStateStore {
   writeJson(key: "runtimeDeliveries" | "agentState", value: unknown): void;
   withInboxTransaction<T>(operation: () => T): T;
   resolveInboxDeliverySource?(messageId: string): InboxDeliverySourceResolution;
+  areRuntimeDeliveriesConsumed?(): boolean;
   paths?: { reminders: string };
   resolveCurrentReminder?(): { reminderId: string; deliveryTarget: string; deliveryAnchor: string; deliveryCommitted?: boolean; deliveryMessageId?: string } | null;
   resolveCurrentReminders?(): Array<{ reminderId: string; deliveryTarget: string; deliveryAnchor: string; deliveryCommitted?: boolean; deliveryMessageId?: string }>;
@@ -81,6 +82,7 @@ export type RuntimeHostEvent =
     previousSession?: PreviousSessionRef | null }
   | { type: "activity"; agentId: string; activity: string; activityKind?: string; detailKind?: string; isHeartbeat?: boolean }
   | { type: "delivery"; agentId: string; deliveryId: string; messageId: string; status: "accepted" | "consumed" | "deferred" | "error"; reason?: string }
+  | { type: "delivery-recovered"; agentId: string; runtime: string; launchId: string; sessionId: string }
   | { type: "runtime"; agentId: string; event: NormalizedRuntimeEvent };
 
 export type DeliveryReceipt =
@@ -434,6 +436,25 @@ export function createRuntimeHost(options: {
     if (event.type === "delivery") telemetry?.delivery(event.agentId, event.messageId, event.status);
     for (const listener of listeners) listener(event);
   };
+  // Evidence is local to this daemon and exact child generation, never restored
+  // from activity/status timestamps or a historical consumed ledger entry.
+  const successfulDeliveryTurns = new WeakMap<ManagedAgent, { session: RuntimeSession; generation: number }>();
+  const projectDeliveryRecovery = (agent: ManagedAgent): void => {
+    const proof = successfulDeliveryTurns.get(agent);
+    if (!proof || agent.session !== proof.session || agent.generation !== proof.generation
+      || agent.stopped || agent.disabledReason || agent.configurationRecovery || agent.authFailureActive
+      || agent.readiness?.state !== "ready" || !proof.session.sessionId) return;
+    const store = agent.stateStore;
+    if (!store?.areRuntimeDeliveriesConsumed) return;
+    try {
+      const recovered = [...agent.records.values()].every((record) => record.status === "consumed")
+        && store.areRuntimeDeliveriesConsumed();
+      if (!recovered) return;
+      successfulDeliveryTurns.delete(agent);
+      emit({ type: "delivery-recovered", agentId: agent.config.agentId, runtime: agent.adapter.id,
+        launchId: agent.launchId, sessionId: proof.session.sessionId });
+    } catch { /* Missing or malformed canonical state cannot prove recovery. */ }
+  };
   const runtimeEnv = (config: AgentRuntimeConfig, generation?: string): NodeJS.ProcessEnv => {
     const base: NodeJS.ProcessEnv = {
       LARKIN_AGENT_ID: config.agentId,
@@ -560,6 +581,7 @@ export function createRuntimeHost(options: {
     if (agent.stateStore) {
       agent.stateStore.withInboxTransaction(() => reconcileFile(agent,
         agent.stateStore!.readJson<DeliveryFile>("runtimeDeliveries", { version: 1, records: [] })));
+      projectDeliveryRecovery(agent);
       return;
     }
     const file = deliveryFile(agent);
@@ -567,6 +589,7 @@ export function createRuntimeHost(options: {
     let external: DeliveryFile;
     try { external = readDeliveryFile(file); } catch (error) { log("delivery reconcile failed", String(error)); return; }
     reconcileFile(agent, external);
+    projectDeliveryRecovery(agent);
   };
 
   const reconcileFile = (agent: ManagedAgent, external: DeliveryFile): void => {
@@ -1163,6 +1186,7 @@ export function createRuntimeHost(options: {
       emit({ type: "session", agentId: agent.config.agentId, runtime: agent.adapter.id, sessionId: event.sessionId, launchId: agent.launchId,
         ...(event.model ? { model: event.model } : {}), ...(event.reasoningEffort ? { reasoningEffort: event.reasoningEffort } : {}) });
     } else if (event.type === "turn-start") {
+      successfulDeliveryTurns.delete(agent);
       // Clear a source left by a crashed/aborted prior turn before a new turn
       // can execute a direct task without an Inbox poll.
       agent.stateStore?.clearCurrentInboxSource?.();
@@ -1179,6 +1203,7 @@ export function createRuntimeHost(options: {
         machine.close();
         if (["closed", "fallback_committed"].includes(machine.state)) agent.compactionMachines.delete(inputId);
       }
+      const successfulTurn = agent.turnInProgress && agent.turnHadAuthenticatedOutput && !agent.turnHadFailure;
       const recoveredAuthentication = agent.authFailureActive && agent.turnInProgress
         && agent.turnHadAuthenticatedOutput && !agent.turnHadFailure && namedAuthProviderPresent(agent);
       agent.turnInProgress = false;
@@ -1203,6 +1228,10 @@ export function createRuntimeHost(options: {
         };
         emit({ type: "agent-status", agentId: agent.config.agentId, status: "active", readiness: agent.readiness });
       }
+      if (successfulTurn) {
+        successfulDeliveryTurns.set(agent, { session, generation: agent.generation });
+        projectDeliveryRecovery(agent);
+      }
       const proactive = proactivelyCompactPiAtIdle(agent, session);
       void (proactive ?? Promise.resolve("noop" as const)).then(() => retryPending(agent));
       queueMicrotask(() => { void scanAndPromoteAcceptedInboxUpdates(agent); });
@@ -1210,11 +1239,12 @@ export function createRuntimeHost(options: {
       if (agent.turnInProgress && event.activity !== "internal") agent.turnHadAuthenticatedOutput = true;
       emit({ type: "activity", agentId: agent.config.agentId, activity: event.activity, activityKind: event.activity });
     } else if (event.type === "input-error") {
+      successfulDeliveryTurns.delete(agent);
+      agent.turnHadFailure = true;
       const record = event.inputId
         ? agent.records.get(event.inputId) ?? [...agent.records.values()].find((candidate) => candidate.input.inputId === event.inputId)
         : undefined;
       if (!record || record.status === "consumed" || record.status === "error") return;
-      agent.turnHadFailure = true;
       if (agent.adapter.id === "pi" && event.errorCategory === "context_window" && event.willRetry === true && session.compact) {
         beginPiManualCompaction(agent, session, record, true);
         return;
@@ -1280,6 +1310,8 @@ export function createRuntimeHost(options: {
       }
       if (!terminal && event.retryable && !agent.busy && !agent.turnInProgress) void retryPending(agent);
     } else if (event.type === "configuration-error") {
+      successfulDeliveryTurns.delete(agent);
+      agent.turnHadFailure = true;
       recoverConfiguration(agent, session, event.message);
     } else if (event.type === "error" || event.type === "closed") {
       replaceSession(agent, session, event.type === "error" ? event.message : `runtime closed (${event.code ?? event.signal ?? "unknown"})`);

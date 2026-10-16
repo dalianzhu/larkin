@@ -838,6 +838,25 @@ export class AgentStateStore {
     });
   }
 
+  /** Prove recovery from one locked canonical Inbox/ledger snapshot. */
+  areRuntimeDeliveriesConsumed(): boolean {
+    return this.withInboxLock(this.file("inbox"), () => {
+      if (this.readNdjson("inbox").length !== 0) return false;
+      const state = this.readJson<InboxStateFile | null>("inboxState", null);
+      if (!state || state.version !== 2 || !state.targets || typeof state.targets !== "object" || Array.isArray(state.targets)
+        || !Object.keys(state.targets).length || !state.messages || typeof state.messages !== "object" || Array.isArray(state.messages)) return false;
+      if (!Object.entries(state.targets).every(([target, row]) => isCanonicalInboxTarget(target)
+        && row && validSequence(row.latest_received_seq) && row.model_seen_seq === row.latest_received_seq)) return false;
+      if (!Object.values(state.messages).every((row) => row && validSequence(row.seq)
+        && state.targets[row.target]?.model_seen_seq >= row.seq)) return false;
+      // The messages index is bounded; old consumed ledger entries need not
+      // remain in it. Target watermarks above prove there is no unseen Inbox work.
+      const ledger = this.readJson<RuntimeDeliveryStore>("runtimeDeliveries", { version: 1, records: [] });
+      return Array.isArray(ledger.records) && ledger.records.length > 0
+        && ledger.records.every((record) => record && record.status === "consumed");
+    });
+  }
+
   /**
    * Re-arm only the durable deliveries proven to be the context-window incident.
    * The Inbox bytes are intentionally untouched. An optional synchronous commit
