@@ -1387,7 +1387,7 @@ export function createRuntimeHost(options: {
         : undefined;
       if (!record || record.status === "consumed" || record.status === "error") {
         const recovery = journalFor(agent);
-        if (recovery && event.inputId === recovery.inputId && ["submitting", "reconciling"].includes(recovery.phase)) {
+        if (recovery && event.inputId === recovery.inputId && event.willRetry !== true && ["submitting", "reconciling"].includes(recovery.phase)) {
           saveJournal(agent, { ...recovery, phase: "failed", code: "reconciliation_failed" });
           if (event.errorCategory === "auth") projectAuthFailure(agent,
             providerAuthenticationFailureReadiness(agent.adapter.id as "codex", event.upstream?.provider),
