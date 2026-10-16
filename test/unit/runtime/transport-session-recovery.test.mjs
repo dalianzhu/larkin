@@ -61,7 +61,7 @@ for (const invalid of ["token", "target", "owner", "evidence"]) test(`operator r
   });
 });
 
-for (const [category, reason] of [["auth", "authentication failed"], ["quota", "quota exceeded"], ["context_window", "context window exceeded"], ["provider", "Runtime configuration invalid"]]) {
+for (const [category, reason] of [["auth", "authentication failed"], ["quota", "quota exceeded"], ["context_window", "context window exceeded"], ["provider", "Runtime configuration invalid"], ["provider", "stream connection failed: authentication failed"], ["provider", "stream connection failed: quota exceeded"]]) {
   test(`transport recovery does not bypass ${category} prerequisite/failure`, async () => {
     await withFixture(async (f) => {
       await f.fail({ category, reason });

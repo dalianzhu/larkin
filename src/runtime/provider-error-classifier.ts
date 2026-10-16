@@ -94,5 +94,5 @@ export function isRecoverableStreamFailure(source: { reason?: string; errorCateg
   if (source.errorCategory && !["provider", "transport"].includes(source.errorCategory)) return false;
   const message = (source.reason || "").replace(/^Codex error: /, "").trim();
   return /^stream disconnected before completion: stream closed before response\.completed\.?$/i.test(message)
-    || /^stream connection failed(?:[.:] .*)?$/i.test(message);
+    || /^stream connection failed\.?$/i.test(message);
 }
