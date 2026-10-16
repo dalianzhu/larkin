@@ -372,7 +372,15 @@ export function createHostShell({
       });
       return;
     }
+    let unresolvedDeliveries = false;
     if (!deliveryRecovered && (hostState.readStatus(agent).inboundDeliveryHealth as { state?: string } | undefined)?.state === "error") {
+      try { unresolvedDeliveries = !stateStore(agent).areRuntimeDeliveriesConsumed(
+        (hostState.readStatus(agent).inboundDeliveryHealth as { messageIds?: string[] }).messageIds || []); }
+      catch { unresolvedDeliveries = true; }
+    }
+    // A fresh prerequisite probe may restore Runtime readiness after a drained
+    // historical fault. Delivery health still needs successful-turn evidence.
+    if (unresolvedDeliveries) {
       hostState.updateStatus(agent, { runtimeReadiness: { runtime: agent.runtime, state: "unavailable", source: "inbound-delivery", observedAt,
         reason: "Inbound Runtime delivery recovery is not yet proven.",
         nextAction: "Resolve pending deliveries and complete a successful Runtime turn before resuming dispatch." } });
@@ -415,12 +423,18 @@ export function createHostShell({
   const recordInboundDeliveryFailure = (
     agent: ConfiguredAgent,
     code: "non_retryable_receipt" | "runtime_delivery_exception" | "runtime_delivery_event",
+    messageId?: string,
   ): void => {
     const at = new Date().toISOString();
     const reason = "Inbound Runtime delivery failed non-retryably; durable Inbox/ledger state is retained for recovery.";
     const nextAction = "Inspect the delivery/status error, correct the Runtime or canonical Inbox state, then restart to replay safely.";
+    const previous = hostState.readStatus(agent).inboundDeliveryHealth as { state?: string; messageIds?: unknown } | undefined;
+    const messageIds = [...new Set([
+      ...(previous?.state === "error" && Array.isArray(previous.messageIds) ? previous.messageIds.filter((id): id is string => typeof id === "string") : []),
+      ...(messageId ? [messageId] : []),
+    ])];
     hostState.updateStatus(agent, {
-      inboundDeliveryHealth: { state: "error", code, at, reason, nextAction },
+      inboundDeliveryHealth: { state: "error", code, at, reason, nextAction, messageIds },
     });
     projectFallbackRuntimeReadiness(agent, at, { state: "unavailable", reason, nextAction, source: "inbound-delivery" }, true);
     hostState.recordStatusError(agent, `${reason} ${nextAction} code=${code}`);
@@ -663,7 +677,7 @@ export function createHostShell({
       if (!wake || !inboxEnvelope) return;
       const receipt = await runtimeHost.deliver(agent.agentId, inboxEnvelope);
       if (receipt.status === "error") {
-        recordInboundDeliveryFailure(agent, "non_retryable_receipt");
+        recordInboundDeliveryFailure(agent, "non_retryable_receipt", String(inboxEnvelope.message_id || ""));
         hostState.appendStatusLog(agent, "deliverLog", {
           at: new Date().toISOString(), status: "error",
           reason: "non-retryable Runtime delivery error; durable recovery state retained",
@@ -704,7 +718,7 @@ export function createHostShell({
       if (wake) telemetry?.delivery(agent.agentId, telemetryMessageId, "error");
       if (canonicalInboxDurable) {
         log(`onFeishuMessage Runtime delivery failed agent=${agent.name}; canonical Inbox retained`);
-        recordInboundDeliveryFailure(agent, "runtime_delivery_exception");
+        recordInboundDeliveryFailure(agent, "runtime_delivery_exception", event.message_id);
       } else {
         log(`onFeishuMessage 异常 agent=${agent.name}: ${error instanceof Error ? error.stack || error.message : String(error)}`);
         hostState.recordStatusError(agent, `onFeishuMessage: ${errorMessage(error)}`);
@@ -1471,6 +1485,8 @@ export function createHostShell({
       else if (message.status === "active") projectReadyUnlessUnresolvedFailure(agent, observedAt);
       if (message.status === "active") {
         const redeliveryTimer = setTimeout(() => {
+          const readiness = hostState.readStatus(agent).runtimeReadiness as { state?: string } | undefined;
+          if (readiness?.state !== "ready") return;
           void reminder.redeliverUnread(agent).catch((error) => log("启动补投失败", errorMessage(error)));
         }, 5_000);
         redeliveryTimer.unref?.();
@@ -1502,7 +1518,8 @@ export function createHostShell({
       // Runtime supplies successful-turn evidence; canonical state independently
       // covers Host failures that occurred before any ledger record was created.
       try {
-        if (!stateStore(agent).areRuntimeDeliveriesConsumed()) return;
+        if (!stateStore(agent).areRuntimeDeliveriesConsumed(
+          (status.inboundDeliveryHealth as { messageIds?: string[] } | undefined)?.messageIds || [])) return;
       } catch { return; }
       const observedAt = new Date().toISOString();
       if ((status.inboundDeliveryHealth as { state?: string } | undefined)?.state === "error") {
@@ -1512,7 +1529,7 @@ export function createHostShell({
       return;
     }
     if (message.type === "delivery") {
-      if (message.status === "error") recordInboundDeliveryFailure(agent, "runtime_delivery_event");
+      if (message.status === "error") recordInboundDeliveryFailure(agent, "runtime_delivery_event", message.messageId);
       hostState.appendStatusLog(agent, "deliverLog", {
         at: new Date().toISOString(), deliveryId: message.deliveryId, messageId: message.messageId,
         status: message.status,

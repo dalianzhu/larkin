@@ -838,22 +838,38 @@ export class AgentStateStore {
     });
   }
 
-  /** Prove recovery from one locked canonical Inbox/ledger snapshot. */
-  areRuntimeDeliveriesConsumed(): boolean {
+  /** Prove delivery consumption without requiring unrelated passive Inbox rows to drain. */
+  areRuntimeDeliveriesConsumed(requiredMessageIds: readonly string[] = []): boolean {
     return this.withInboxLock(this.file("inbox"), () => {
-      if (this.readNdjson("inbox").length !== 0) return false;
+      if (!Array.isArray(requiredMessageIds)) return false;
+      const rows = this.readNdjson<InboxEnvelope>("inbox");
+      const pendingIds = new Set<string>();
+      for (const row of rows) {
+        if (!row || typeof row.message_id !== "string" || !row.message_id) return false;
+        try { targetKeyOfInboxEnvelope(row); } catch { return false; }
+        pendingIds.add(row.message_id);
+      }
       const state = this.readJson<InboxStateFile | null>("inboxState", null);
       if (!state || state.version !== 2 || !state.targets || typeof state.targets !== "object" || Array.isArray(state.targets)
         || !Object.keys(state.targets).length || !state.messages || typeof state.messages !== "object" || Array.isArray(state.messages)) return false;
-      if (!Object.entries(state.targets).every(([target, row]) => isCanonicalInboxTarget(target)
-        && row && validSequence(row.latest_received_seq) && row.model_seen_seq === row.latest_received_seq)) return false;
-      if (!Object.values(state.messages).every((row) => row && validSequence(row.seq)
-        && state.targets[row.target]?.model_seen_seq >= row.seq)) return false;
-      // The messages index is bounded; old consumed ledger entries need not
-      // remain in it. Target watermarks above prove there is no unseen Inbox work.
+      const knownConsumed = (messageId: string, expectedTarget?: unknown): boolean => {
+        const known = state.messages[messageId];
+        if (!known || !validSequence(known.seq) || !isCanonicalInboxTarget(known.target)) return false;
+        const target = state.targets[known.target];
+        return Boolean(target && Number.isSafeInteger(target.model_seen_seq) && target.model_seen_seq >= known.seq
+          && Number.isSafeInteger(target.latest_received_seq) && target.latest_received_seq >= target.model_seen_seq
+          && (expectedTarget === undefined || expectedTarget === known.target));
+      };
       const ledger = this.readJson<RuntimeDeliveryStore>("runtimeDeliveries", { version: 1, records: [] });
-      return Array.isArray(ledger.records) && ledger.records.length > 0
-        && ledger.records.every((record) => record && record.status === "consumed");
+      if (!Array.isArray(ledger.records) || !ledger.records.length) return false;
+      const records = ledger.records;
+      // The bounded messages index may prune old consumed ledger entries. A
+      // retained entry must agree with canonical state; pending rows never count.
+      if (!records.every((record) => record && record.status === "consumed" && typeof record.messageId === "string"
+        && !pendingIds.has(record.messageId)
+        && (!state.messages[record.messageId] || knownConsumed(record.messageId, record.target)))) return false;
+      return requiredMessageIds.every((id) => typeof id === "string" && !pendingIds.has(id)
+        && (knownConsumed(id) || (!state.messages[id] && records.some((record) => record.messageId === id))));
     });
   }
 
