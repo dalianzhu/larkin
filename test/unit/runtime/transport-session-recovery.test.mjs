@@ -268,13 +268,151 @@ test("startup moves legacy healthy error fields into historical diagnostics", as
   });
 });
 
-test("an owned native retry keeps reconciliation pending until its eventual explicit outcome", async () => {
+for (const native of [false, true]) test(`an owned native retry keeps reconciliation pending until its eventual explicit outcome${native ? " through the real Codex adapter" : ""}`, async () => {
   await withFixture(async (f) => {
     await f.fail(); const { plan } = await f.inspect(); await f.commit(plan, f.review(plan));
     const input = f.current().inputs.at(-1);
+    f.current().emit({ type: "turn-start" });
     f.current().emit({ type: "input-error", inputId: input.inputId, retryable: true, willRetry: true, errorCategory: "provider", message: "synthetic native retry pending" });
     assert.equal(f.store.readJson("transportRecovery", {}).phase, "reconciling");
-    await f.finish();
+    f.store.pollInbox({ target: "chat:oc_transport", limit: 1 });
+    f.current().emit({ type: "activity", activity: "text", text: "Native retry eventually succeeded." });
+    f.current().emit({ type: "turn-end", outcome: "success" });
     assert.equal(f.store.readJson("transportRecovery", {}).phase, "complete");
+  }, { native });
+});
+
+for (const restart of [false, true]) test(`new wakes received during recovery resume once after reconciliation${restart ? " across a restart" : " after the startup timer elapsed"}`, { timeout: 10_000 }, async () => {
+  let now = Date.now();
+  await withFixture(async (f) => {
+    if (!restart) await new Promise((resolve) => setTimeout(resolve, 5_200));
+    await f.fail(); let { plan } = await f.inspect(); await f.commit(plan, f.review(plan));
+    await f.host().ingest(fixtureAgentId, { message_id: "om_held_resume", event_id: "evt_held_resume", chat_id: "oc_new", chat_type: "group",
+      sender_id: "ou_fixture", content: "new distinct work", _mentioned_bot: true, _sender_is_bot: true });
+    assert.deepEqual(f.store.readJson("transportRecovery", {}).heldMessageIds, ["om_held_resume"]);
+    if (restart) {
+      await f.restart(); assert.equal(f.current().inputs.length, 0);
+      now += 60_001; ({ plan } = await f.inspect()); await f.commit(plan, f.review(plan));
+    }
+    await f.finish();
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.equal(f.current().inputs.length, 2);
+    assert.deepEqual(f.store.readJson("transportRecovery", {}).heldMessageIds, []);
+    const records = f.store.readJson("runtimeDeliveries", {}).records;
+    assert.equal(records.find((record) => record.messageId === "om_transport_failed").status, "consumed");
+    assert.equal(records.filter((record) => record.messageId === "om_held_resume").length, 1);
+    assert.equal(f.current().inputs.filter((input) => input.kind === "wake").length, 1);
+    assert.doesNotMatch(f.current().inputs.at(-1).text, /ORIGINAL_SIDE_EFFECT_MUST_NOT_REPLAY/);
+  }, { now: () => now });
+});
+
+test("a retry plan excludes a later same-target wake from old-task reconciliation and dispatches it once", async () => {
+  let now = Date.now();
+  await withFixture(async (f) => {
+    await f.fail(); let { plan } = await f.inspect(); await f.commit(plan, f.review(plan));
+    await f.host().ingest(fixtureAgentId, { message_id: "om_same_target_held", event_id: "evt_same_target_held", chat_id: "oc_transport", chat_type: "group",
+      sender_id: "ou_fixture", content: "new independent work", _mentioned_bot: true, _sender_is_bot: true });
+    await f.finish({ outcome: "error", poll: false });
+    now += 60_001; ({ plan } = await f.inspect());
+    assert.equal(plan.failures[0].pendingRows, 1);
+    assert.deepEqual(plan.failures[0].pendingMessageIds, ["om_transport_failed"]);
+    await f.commit(plan, f.review(plan));
+    assert.throws(() => f.store.pollInbox({ target: "chat:oc_transport", limit: 2 }), /recovery_poll_outside_snapshot/);
+    await f.finish();
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.equal(f.current().inputs.filter((input) => input.kind === "wake").length, 1);
+    assert.equal(f.store.readJson("runtimeDeliveries", {}).records.find((record) => record.messageId === "om_same_target_held").status, "accepted");
+    assert.ok(f.store.readNdjson("inbox").some((row) => row.message_id === "om_same_target_held"));
+  }, { now: () => now });
+});
+
+test("an internal reminder wake held during recovery is handed to normal dispatch once", async () => {
+  await withFixture(async (f) => {
+    await f.fail(); const { plan } = await f.inspect(); await f.commit(plan, f.review(plan));
+    const envelope = { kind: "reminder", message_id: "rem_transport_held", target: "runtime:reminder", content: "synthetic new reminder", source: { kind: "manual" } };
+    f.store.appendCanonicalInboxOnce(envelope);
+    await f.runtime().deliver(fixtureAgentId, envelope);
+    assert.deepEqual(f.store.readJson("transportRecovery", {}).heldMessageIds, [envelope.message_id]);
+    await f.finish();
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.equal(f.store.readJson("runtimeDeliveries", {}).records.filter((record) => record.messageId === envelope.message_id).length, 1);
+    assert.match(f.current().inputs.at(-1).text, /runtime:reminder/);
+    assert.deepEqual(f.store.readJson("transportRecovery", {}).heldMessageIds, []);
   });
+});
+
+test("a crash between canonical append and held registration preserves only the new wake for later dispatch", async () => {
+  let now = Date.now();
+  await withFixture(async (f) => {
+    await f.fail(); let { plan } = await f.inspect(); await f.commit(plan, f.review(plan));
+    f.store.appendCanonicalInboxOnce({ message_id: "om_append_crash_wake", target: "chat:oc_transport", wake: true, content: "new wake persisted before a crash" });
+    f.store.appendCanonicalInboxOnce({ message_id: "om_append_crash_passive", target: "chat:oc_passive", wake: false, content: "passive row" });
+    assert.deepEqual(f.store.readJson("transportRecovery", {}).heldMessageIds, []);
+    await f.restart(); assert.equal(f.current().inputs.length, 0);
+    now += 60_001; ({ plan } = await f.inspect());
+    assert.deepEqual(plan.failures[0].pendingMessageIds, ["om_transport_failed"]);
+    await f.commit(plan, f.review(plan)); await f.finish();
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    const records = f.store.readJson("runtimeDeliveries", {}).records;
+    assert.equal(records.filter((row) => row.messageId === "om_append_crash_wake").length, 1);
+    assert.equal(records.some((row) => row.messageId === "om_append_crash_passive"), false);
+    assert.equal(records.find((row) => row.messageId === "om_transport_failed").status, "consumed");
+  }, { now: () => now });
+});
+
+test("an initially unsubmitted same-target wake stays outside the failed task's read-only review", async () => {
+  await withFixture(async (f) => {
+    await f.fail();
+    f.store.appendCanonicalInboxOnce({ message_id: "om_initial_unsubmitted", target: "chat:oc_transport", wake: true, content: "never submitted new task" });
+    const { plan } = await f.inspect();
+    assert.deepEqual(plan.failures[0].pendingMessageIds, ["om_transport_failed"]);
+    await f.commit(plan, f.review(plan)); await f.finish();
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.equal(f.current().inputs.filter((input) => input.kind === "wake").length, 1);
+    assert.equal(f.store.readJson("runtimeDeliveries", {}).records.find((row) => row.messageId === "om_initial_unsubmitted").status, "accepted");
+    assert.ok(f.store.readNdjson("inbox").some((row) => row.message_id === "om_initial_unsubmitted"));
+  });
+});
+
+for (const completed of [false, true]) test(`Host-only failed wakes cannot become automatic recovery backlog${completed ? " after recovery completed" : " in the initial recovery plan"}`, async () => {
+  await withFixture(async (f) => {
+    await f.fail();
+    if (completed) { const { plan } = await f.inspect(); await f.commit(plan, f.review(plan)); await f.finish(); }
+    const inputs = f.current().inputs.length;
+    const original = f.runtime().deliver;
+    f.runtime().deliver = async () => { throw new Error("synthetic uncertain Host-only delivery exception"); };
+    await f.host().ingest(fixtureAgentId, { message_id: "om_host_uncertain", event_id: "evt_host_uncertain", chat_id: "oc_transport", chat_type: "group",
+      sender_id: "ou_fixture", content: "unknown prior effects", _mentioned_bot: true, _sender_is_bot: true });
+    f.runtime().deliver = original;
+    assert.ok(f.store.readJson("status", {}).inboundDeliveryHealth.messageIds.includes("om_host_uncertain"));
+    if (!completed) await assert.rejects(f.inspect(), (error) => error.code === "recovery_unreviewed_host_failure");
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(f.current().inputs.length, inputs);
+    assert.equal(f.store.readJson("runtimeDeliveries", {}).records.some((row) => row.messageId === "om_host_uncertain"), false);
+    assert.ok(f.store.readNdjson("inbox").some((row) => row.message_id === "om_host_uncertain"));
+    assert.equal(f.store.readJson("status", {}).inboundDeliveryHealth.state, "error");
+  });
+});
+
+test("a lost child acceptance cannot retain the held queue or block its later wakes after child replacement", { timeout: 8_000 }, async () => {
+  let hangNext = false;
+  await withFixture(async (f) => {
+    await f.fail(); const { plan } = await f.inspect(); await f.commit(plan, f.review(plan));
+    for (const suffix of ["a", "b"]) await f.host().ingest(fixtureAgentId, { message_id: `om_held_hang_${suffix}`, event_id: `evt_held_hang_${suffix}`,
+      chat_id: `oc_hang_${suffix}`, chat_type: "group", sender_id: "ou_fixture", content: "new task", _mentioned_bot: true, _sender_is_bot: true });
+    hangNext = true; await f.finish();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(f.store.readJson("transportRecovery", {}).heldMessageIds, [], "normal ledger ownership must not wait for acceptance");
+    const old = f.current(); old.emit({ type: "closed", code: 1, signal: null });
+    const deadline = Date.now() + 5_000;
+    while (f.current() === old && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.notEqual(f.current(), old);
+    const fresh = f.current();
+    while (!fresh.inputs.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    fresh.emit({ type: "turn-start" }); f.store.pollInbox({ target: "chat:oc_hang_a", limit: 1 });
+    fresh.emit({ type: "activity", activity: "text", text: "first new task finished" }); fresh.emit({ type: "turn-end", outcome: "success" });
+    while (!fresh.inputs.some((input) => input.text.includes("chat:oc_hang_b")) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.ok(fresh.inputs.some((input) => input.text.includes("chat:oc_hang_b")));
+    assert.equal(f.store.readJson("runtimeDeliveries", {}).records.find((record) => record.messageId === "om_transport_failed").status, "consumed");
+  }, { onPrompt(input) { if (hangNext && input.kind === "wake") { hangNext = false; return new Promise(() => {}); } } });
 });

@@ -15,7 +15,11 @@ const fixture = await createTransportFixture(root, {
   now: () => Number(fs.readFileSync(path.join(root, "clock"), "utf8")),
   onPrompt(input) { fs.appendFileSync(path.join(root, "inputs.ndjson"), JSON.stringify(input) + "\n"); },
 });
-if (!fixture.store.readJson("runtimeDeliveries", { records: [] }).records.length) await fixture.fail();
+const failureCount = Number(process.env.LARKIN_TRANSPORT_FAILURE_COUNT || 1);
+if (!fixture.store.readJson("runtimeDeliveries", { records: [] }).records.length) {
+  await fixture.fail();
+  for (let index = 1; index < failureCount; index++) await fixture.fail({ direct: true, messageId: `om_transport_failed_${index}` });
+}
 const server = createAgentControlServer({ larkinHome: root, authorityToken,
   async upsert() { throw new Error("unsupported"); },
   recoverTransportSession(request) { return fixture.host().recoverTransportSession(request.agentId, request); },
@@ -26,7 +30,7 @@ const timer = setInterval(async () => {
   const marker = path.join(root, "finish");
   if (finishing || !fs.existsSync(marker)) return;
   finishing = true; fs.unlinkSync(marker);
-  try { await fixture.finish(); fs.writeFileSync(path.join(root, "finished"), "yes"); }
+  try { await fixture.finish({ limit: failureCount }); fs.writeFileSync(path.join(root, "finished"), "yes"); }
   catch (error) { console.error(error); process.exitCode = 1; }
   finally { finishing = false; }
 }, 20);

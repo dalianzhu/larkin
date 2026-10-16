@@ -1,4 +1,4 @@
-import type { TransportRecoveryRequest, TransportRecoveryResult } from "../runtime/transport-session-recovery.js";
+import { MAX_TRANSPORT_RECOVERY_REVIEW_BYTES, type TransportRecoveryRequest, type TransportRecoveryResult } from "../runtime/transport-session-recovery.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
@@ -64,6 +64,8 @@ const AGENT_ID = /^cli_[A-Za-z0-9]+$/;
 const OPERATION_ID = /^[A-Za-z0-9_-]{8,128}$/;
 const AUTHORIZATION = /^[A-Za-z0-9_-]{43,128}$/;
 const CONFIG_SIGNATURE = /^sha256:[a-f0-9]{64}$/;
+// A 16 KiB review plus authenticated framing fits below this bounded request cap.
+const MAX_CONTROL_REQUEST_BYTES = 65_536;
 const UNIX_SOCKET_PATH_MAX_BYTES = process.platform === "darwin" ? 103 : 107;
 
 function recoveryErrorText(code: string | undefined): string {
@@ -187,6 +189,9 @@ function parseRequest(line: string): AgentControlRequest {
     throw new Error("invalid agent control request");
   }
   if (value.operation === "session-transport-recover") {
+    if (value.review && Buffer.byteLength(JSON.stringify(value.review)) > MAX_TRANSPORT_RECOVERY_REVIEW_BYTES) {
+      throw Object.assign(new Error("transport recovery review too large"), { code: "recovery_review_too_large" });
+    }
     if (Object.keys(value).some((key) => !["operation", "agentId", "authorization", "planToken", "review", "abort"].includes(key))
       || (value.planToken !== undefined && (typeof value.planToken !== "string" || !CONFIG_SIGNATURE.test(value.planToken)))
       || (value.abort !== undefined && typeof value.abort !== "boolean")
@@ -542,13 +547,21 @@ export function createSupervisorControlServer({
       prepareSocket(socket);
       server = net.createServer((connection) => {
         connection.setEncoding("utf8");
+        connection.on("error", () => { /* a broken local client must not terminate the daemon */ });
+        let finished = false;
         let input = "";
         connection.on("data", (chunk) => {
+          if (finished) return;
           input += chunk;
-          if (input.length > 4096) connection.destroy(new Error("control request too large"));
+          if (Buffer.byteLength(input) > 4096) {
+            finished = true; input = "";
+            connection.end(`${JSON.stringify({ ok: false, agentId: "invalid", code: "control_request_too_large", error: "control request too large" })}\n`);
+            return;
+          }
           const newline = input.indexOf("\n");
           if (newline < 0) return;
           const line = input.slice(0, newline);
+          finished = true;
           input = "";
           void (async () => {
             let request: { operationId: string; operation: string; authorization: string; agentId?: string };
@@ -674,19 +687,27 @@ export function createAgentControlServer({
       prepareSocket(socket);
       server = net.createServer((connection) => {
         connection.setEncoding("utf8");
+        connection.on("error", () => { /* a broken local client must not terminate the daemon */ });
+        let finished = false;
         let input = "";
         connection.on("data", (chunk) => {
+          if (finished) return;
           input += chunk;
-          if (input.length > 4096) connection.destroy(new Error("control request too large"));
+          if (Buffer.byteLength(input) > MAX_CONTROL_REQUEST_BYTES) {
+            finished = true; input = "";
+            connection.end(`${JSON.stringify({ ok: false, agentId: "invalid", code: "control_request_too_large", error: "control request too large" })}\n`);
+            return;
+          }
           const newline = input.indexOf("\n");
           if (newline < 0) return;
           const line = input.slice(0, newline);
+          finished = true;
           input = "";
           void (async () => {
             let request: AgentControlRequest;
             try { request = parseRequest(line); }
             catch (error) {
-              connection.end(`${JSON.stringify({ ok: false, agentId: "invalid", error: (error as Error).message })}\n`);
+              connection.end(`${JSON.stringify({ ok: false, agentId: "invalid", code: (error as { code?: string }).code || "invalid_arguments", error: (error as Error).message })}\n`);
               return;
             }
             try {

@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { digestRecovery, planTransportRecovery, readTransportRecovery, reconciliationInput, transportRecoveryHeld, validateRecoveryReview,
+import { digestRecovery, planTransportRecovery, readTransportRecovery, isRecoveryWake, reconciliationInput, transportRecoveryHeld, validateRecoveryReview,
   TRANSPORT_RECOVERY_COOLDOWN_MS, TRANSPORT_RECOVERY_MAX_ATTEMPTS, TRANSPORT_RECOVERY_WINDOW_MS, TransportRecoveryError,
   type TransportRecoveryJournal, type TransportRecoveryRequest, type TransportRecoveryResult, type TransportSnapshot } from "./transport-session-recovery.js";
 import fs from "node:fs";
@@ -464,12 +464,29 @@ export function createRuntimeHost(options: {
   const recoveryNow = options.transportRecoveryPolicy?.now ?? Date.now;
   const journalFor = (agent: ManagedAgent): TransportRecoveryJournal | null => agent.stateStore?.inspectTransportRecovery
     ? readTransportRecovery(agent.stateStore.readJson("transportRecovery", null)) : null;
+  const journalWithHeldInbox = (agent: ManagedAgent, lockedRows?: Record<string, unknown>[]): TransportRecoveryJournal | null => {
+    const journal = journalFor(agent);
+    if (!journal || ["complete", "cancelled"].includes(journal.phase) || !agent.stateStore?.readNdjson) return journal;
+    const initialIds = new Set(journal.initialInboxMessageIds);
+    const failedIds = new Set(journal.failures.map((failure) => failure.messageId));
+    const health = agent.stateStore.readJson<{ inboundDeliveryHealth?: { state?: string; messageIds?: string[] } }>("status", {}).inboundDeliveryHealth;
+    for (const id of health?.state === "error" && Array.isArray(health.messageIds) ? health.messageIds : []) failedIds.add(id);
+    const rows = lockedRows || agent.stateStore.withInboxTransaction(() => agent.stateStore!.readNdjson!<Record<string, unknown>>("inbox"));
+    const missed = rows.filter((row) => typeof row.message_id === "string" && !initialIds.has(row.message_id)
+      && !failedIds.has(row.message_id) && !agent.byMessage.has(row.message_id)
+      && isRecoveryWake(row))
+      .map((row) => String(row.message_id));
+    return { ...journal, heldMessageIds: [...new Set([...(journal.heldMessageIds || []).filter((id) => !failedIds.has(id)), ...missed])] };
+  };
   const recoveryHeld = (agent: ManagedAgent): boolean => {
     try { return transportRecoveryHeld(journalFor(agent)); } catch { return true; }
   };
   const recoveryConfigFingerprint = (config: AgentRuntimeConfig): string => digestRecovery({ runtime: config.runtime, model: config.model,
     effort: config.effort || null, workspaceDir: config.workspaceDir, stateDir: config.stateDir || null, larkConfigDir: config.larkConfigDir || null });
-  const saveJournal = (agent: ManagedAgent, journal: TransportRecoveryJournal): void => agent.stateStore!.writeJson("transportRecovery", journal);
+  const saveJournal = (agent: ManagedAgent, journal: TransportRecoveryJournal, replaceHeld = false): void => {
+    const held = replaceHeld ? journal.heldMessageIds : [...new Set([...(journalFor(agent)?.heldMessageIds || []), ...(journal.heldMessageIds || [])])];
+    agent.stateStore!.writeJson("transportRecovery", { ...journal, heldMessageIds: held || [] });
+  };
   const recoveryResult = (agent: ManagedAgent, journal: TransportRecoveryJournal): TransportRecoveryResult => ({
     ok: !["failed", "switching"].includes(journal.phase), agentId: agent.config.agentId, phase: journal.phase,
     recoveryId: journal.id, sessionId: journal.sessionId, previousSessionId: journal.previousSession.sessionId,
@@ -491,7 +508,6 @@ export function createRuntimeHost(options: {
       if (transportRecoveryHeld(journal)) {
         if (journal!.phase !== "reconciling" || journal!.sessionId !== proof.session.sessionId
           || journal!.launchId !== agent.launchId || !store.areRuntimeDeliveriesConsumed(journal!.failures.map((f) => f.messageId))) return;
-        saveJournal(agent, { ...journal!, phase: "complete", code: undefined });
       }
       // Host failures may precede ledger creation. Keep successful-turn proof
       // until those exact failed messages are also canonically consumed.
@@ -499,9 +515,14 @@ export function createRuntimeHost(options: {
       const recovered = [...agent.records.values()].every((record) => record.status === "consumed")
         && store.areRuntimeDeliveriesConsumed(health?.state === "error" ? health.messageIds || [] : []);
       if (!recovered) return;
+      if (transportRecoveryHeld(journal)) store.withInboxTransaction(() => {
+        const held = journalWithHeldInbox(agent, store.readNdjson?.<Record<string, unknown>>("inbox") || [])!;
+        saveJournal(agent, { ...held, phase: "complete", code: undefined }, true);
+      });
       successfulDeliveryTurns.delete(agent);
       emit({ type: "delivery-recovered", agentId: agent.config.agentId, runtime: agent.adapter.id,
         launchId: agent.launchId, sessionId: proof.session.sessionId });
+      void releaseHeldInbox(agent).catch((error) => log("held Inbox release failed", String(error)));
     } catch { /* Missing or malformed canonical state cannot prove recovery. */ }
   };
   const runtimeEnv = (config: AgentRuntimeConfig, generation?: string): NodeJS.ProcessEnv => {
@@ -1381,13 +1402,16 @@ export function createRuntimeHost(options: {
       emit({ type: "activity", agentId: agent.config.agentId, activity: event.activity, activityKind: event.activity });
     } else if (event.type === "input-error") {
       successfulDeliveryTurns.delete(agent);
-      agent.turnHadFailure = true;
+      // Native retries may complete inside this same turn with no second start.
+      // Only a terminal error/auth failure can invalidate its eventual success.
+      const nativeRetryPending = event.willRetry === true && event.retryable === true && event.errorCategory !== "auth";
+      if (!nativeRetryPending) agent.turnHadFailure = true;
       const record = event.inputId
         ? agent.records.get(event.inputId) ?? [...agent.records.values()].find((candidate) => candidate.input.inputId === event.inputId)
         : undefined;
       if (!record || record.status === "consumed" || record.status === "error") {
         const recovery = journalFor(agent);
-        if (recovery && event.inputId === recovery.inputId && event.willRetry !== true && ["submitting", "reconciling"].includes(recovery.phase)) {
+        if (recovery && event.inputId === recovery.inputId && !nativeRetryPending && ["submitting", "reconciling"].includes(recovery.phase)) {
           saveJournal(agent, { ...recovery, phase: "failed", code: "reconciliation_failed" });
           if (event.errorCategory === "auth") projectAuthFailure(agent,
             providerAuthenticationFailureReadiness(agent.adapter.id as "codex", event.upstream?.provider),
@@ -1533,11 +1557,14 @@ export function createRuntimeHost(options: {
     if (!agent || agent.stopped) throw new TransportRecoveryError("unknown_agent");
     const store = agent.stateStore;
     if (!store?.inspectTransportRecovery || !store.commitTransportRecovery || !store.restoreTransportRecoverySession) throw new TransportRecoveryError("recovery_unavailable");
-    let journal = journalFor(agent);
+    let journal = journalWithHeldInbox(agent);
     if (request.abort) {
       if (!journal || !transportRecoveryHeld(journal) || request.planToken !== journal.lastPlan) throw new TransportRecoveryError("recovery_plan_stale");
       if (agent.busy || agent.turnInProgress || agent.submitting) throw new TransportRecoveryError("agent_busy");
-      saveJournal(agent, { ...journal, phase: "cancelled", code: "recovery_cancelled" });
+      store.withInboxTransaction(() => {
+        const held = journalWithHeldInbox(agent, store.readNdjson?.<Record<string, unknown>>("inbox") || [])!;
+        saveJournal(agent, { ...held, phase: "cancelled", code: "recovery_cancelled" }, true);
+      });
       return recoveryResult(agent, { ...journal, phase: "cancelled", code: "recovery_cancelled" });
     }
     const assertReady = (): void => {
@@ -1604,6 +1631,8 @@ export function createRuntimeHost(options: {
       inputId: `recovery-${crypto.randomUUID()}`, attempts: (inWindow ? journal!.attempts : 0) + 1,
       windowStartedAt: inWindow ? journal!.windowStartedAt : recoveryNow(),
       retryAt: new Date(recoveryNow() + TRANSPORT_RECOVERY_COOLDOWN_MS).toISOString(),
+      heldMessageIds: [...new Set([...(journal?.heldMessageIds || []), ...snapshot.undispatchedWakeIds])],
+      initialInboxMessageIds: transportRecoveryHeld(journal) ? journal!.initialInboxMessageIds : snapshot.inboxMessageIds,
       history: [...(journal?.history || []), ...(journal?.sessionId ? [{ sessionId: journal.sessionId, previousSession: journal.previousSession }] : [])] };
     saveJournal(agent, next);
     // Inspection/reconciliation authority is explicit and durable before any
@@ -1773,6 +1802,113 @@ export function createRuntimeHost(options: {
       runtimeReady: true, pendingCount: remainingPendingCount, rearmedCount,
       replayStatus: remainingPendingCount > 0 ? "pending" : "consumed", sessionId: fresh.sessionId };
   };
+
+  async function deliver(agentId: string, envelope: Record<string, unknown>): Promise<DeliveryReceipt> {
+    const messageId = String(envelope.message_id || envelope.seq || crypto.randomUUID());
+    const agent = managed.get(agentId);
+    if (!agent) { telemetry?.delivery(agentId, messageId, "error"); throw new Error(`unknown runtime Agent: ${agentId}`); }
+    if (recoveryHeld(agent)) {
+      const journal = journalFor(agent)!;
+      if (!agent.byMessage.has(messageId) && !journal.failures.some((failure) => failure.messageId === messageId)) {
+        saveJournal(agent, { ...journal, heldMessageIds: [...(journal.heldMessageIds || []), messageId] });
+      }
+      return { status: "deferred", deliveryId: `recovery-held-${crypto.createHash("sha256").update(messageId).digest("hex").slice(0, 24)}`,
+        reason: "operator reconciliation is required before dispatch" };
+    }
+    let target: string;
+    try {
+      target = targetKeyOfInboxEnvelope(envelope);
+    } catch (error) {
+      const reason = `Inbox target derivation failed: ${error instanceof Error ? error.message : String(error)}`;
+      const deliveryId = `invalid-target-${crypto.createHash("sha256").update(`${agentId}\0${messageId}`).digest("hex").slice(0, 24)}`;
+      telemetry?.delivery(agentId, messageId, "error");
+      emit({ type: "delivery", agentId, deliveryId, messageId, status: "error", reason });
+      return { status: "error", deliveryId, reason, retryable: false };
+    }
+    reconcileExternalConsumption(agent);
+    const existingId = agent.byMessage.get(messageId);
+    if (existingId) {
+      const existing = agent.records.get(existingId);
+      if (existing?.status === "error") {
+        if (existing.target && existing.target !== target) return quarantineRecord(agent, existing, "delivery_target_conflict");
+        existing.target = target;
+        if (typeof envelope.wake_reason === "string" && envelope.wake_reason) existing.wakeReason = envelope.wake_reason;
+        else delete existing.wakeReason;
+        const priorAttempt = existing.input && Number.isSafeInteger(existing.input.attempt) ? existing.input.attempt : 0;
+        existing.input = existing.input && typeof existing.input === "object"
+          ? { ...existing.input, attempt: priorAttempt + 1 }
+          : { inputId: existing.deliveryId, deliveryId: existing.deliveryId, kind: "wake", text: "", attempt: priorAttempt + 1 };
+        delete existing.reason;
+        delete existing.retryable;
+        agent.promotedInboxUpdateIds.delete(existing.deliveryId);
+        setRecord(agent, existing, "pending");
+        const receipt = await (telemetry?.phase(messageId, "runtime.deliver", SpanKind.PRODUCER,
+          () => submit(agent, existing, agent.busy || agent.submitting)) ?? submit(agent, existing, agent.busy || agent.submitting));
+        telemetry?.delivery(agentId, messageId, receipt.status);
+        reconcileAbsentCanonical(agent, agent.records.get(existingId) ?? existing);
+        return receipt;
+      }
+      if (existing) reconcileAbsentCanonical(agent, existing);
+      telemetry?.delivery(agentId, messageId, "duplicate");
+      return { status: "duplicate", deliveryId: existingId };
+    }
+    if ([...agent.records.values()].filter((record) => isActiveDelivery(record.status)).length >= MAX_DELIVERIES) {
+      const deliveryId = `overflow-${crypto.createHash("sha256").update(messageId).digest("hex").slice(0, 24)}`;
+      telemetry?.delivery(agentId, messageId, "deferred");
+      return { status: "deferred", deliveryId, reason: `runtime delivery backlog limit ${MAX_DELIVERIES} reached` };
+    }
+    const deliveryId = crypto.randomUUID();
+    const busy = agent.busy || agent.submitting;
+    const wakeReason = typeof envelope.wake_reason === "string" ? envelope.wake_reason : undefined;
+    const input: RuntimeInput = { inputId: deliveryId, deliveryId, kind: busy ? "inbox_update" : "wake",
+      text: options.promptBuilder.buildInboxNotice({ busy, count: 1, deliveryId, target,
+        ...(wakeReason ? { wakeReason } : {}) }), attempt: 0 };
+    const record: DeliveryRecord = { deliveryId, messageId, status: "pending", input, target,
+      ...(wakeReason ? { wakeReason } : {}), updatedAt: now() };
+    agent.records.set(deliveryId, record); agent.byMessage.set(messageId, deliveryId); persist(agent);
+    if (agent.disabledReason) {
+      reconcileAbsentCanonical(agent, record);
+      telemetry?.delivery(agentId, messageId, "deferred");
+      return { status: "deferred", deliveryId, reason: agent.disabledReason };
+    }
+    const receipt = await (telemetry?.phase(messageId, "runtime.deliver", SpanKind.PRODUCER,
+      () => submit(agent, record, busy)) ?? submit(agent, record, busy));
+    telemetry?.delivery(agentId, messageId, receipt.status);
+    reconcileAbsentCanonical(agent, agent.records.get(deliveryId) ?? record);
+    return receipt;
+  }
+
+  const releasingHeldInbox = new WeakSet<ManagedAgent>();
+  async function releaseHeldInbox(agent: ManagedAgent): Promise<void> {
+    if (releasingHeldInbox.has(agent)) return;
+    releasingHeldInbox.add(agent);
+    try {
+      while (!agent.stopped) {
+        const journal = journalWithHeldInbox(agent);
+        if (journal?.phase !== "complete" || !journal.heldMessageIds?.length) return;
+        saveJournal(agent, journal);
+        const messageId = journal.heldMessageIds[0]!;
+        // A ledger record is the durable handoff to ordinary dispatch. Never
+        // rearm a failed or uncertain delivery while resuming a held wake.
+        if (!agent.byMessage.has(messageId)) {
+          const source = agent.stateStore?.resolveInboxDeliverySource?.(messageId);
+          if (!source || source.status === "invalid" || source.status === "missing") return;
+          if (source.status === "pending") {
+            const submission = deliver(agent.config.agentId, source.envelope);
+            void submission.catch((error) => log("held Inbox handoff failed", String(error)));
+            // deliver persists ordinary ownership before waiting for the child.
+            // Do not let a lost acceptance promise hold the remaining queue.
+            if (!agent.byMessage.has(messageId)) {
+              await submission;
+              if (!agent.byMessage.has(messageId)) return; // backlog-deferred: retain the wake for the next scan
+            }
+          }
+        }
+        const latest = journalFor(agent)!;
+        saveJournal(agent, { ...latest, heldMessageIds: (latest.heldMessageIds || []).filter((id) => id !== messageId) }, true);
+      }
+    } finally { releasingHeldInbox.delete(agent); }
+  }
 
   return {
     async probe(config): Promise<RuntimeReadiness> {
@@ -2223,6 +2359,7 @@ export function createRuntimeHost(options: {
           if (agent.stopped) return;
           activeCount += 1;
           await retryPending(agent);
+          await releaseHeldInbox(agent);
         } catch (error) {
           if (agent.stopped) return;
           const reason = error instanceof Error ? error.message : String(error);
@@ -2239,81 +2376,17 @@ export function createRuntimeHost(options: {
           deliveryId: record.deliveryId, messageId: record.messageId, status: "error", reason: replayFailureReason(code) });
         if (visibleQuarantines.length) emit({ type: "agent-status", agentId: config.agentId, status: "error",
           error: `${visibleQuarantines.length} Runtime delivery record(s) quarantined; canonical Inbox recovery is required` });
-        agent.poller = setInterval(() => reconcileExternalConsumption(agent), 250); agent.poller.unref?.();
+        agent.poller = setInterval(() => {
+          reconcileExternalConsumption(agent);
+          void releaseHeldInbox(agent).catch((error) => log("held Inbox release failed", String(error)));
+        }, 250); agent.poller.unref?.();
       });
       await Promise.all(startups);
       if (configs.length > 0 && activeCount === 0 && recoveringCount === 0) {
         throw new Error(`No runtime Agent started: ${startupFailures.join("; ")}`);
       }
     },
-    async deliver(agentId, envelope): Promise<DeliveryReceipt> {
-      const messageId = String(envelope.message_id || envelope.seq || crypto.randomUUID());
-      const agent = managed.get(agentId);
-      if (!agent) { telemetry?.delivery(agentId, messageId, "error"); throw new Error(`unknown runtime Agent: ${agentId}`); }
-      if (recoveryHeld(agent)) return { status: "deferred", deliveryId: `recovery-held-${crypto.createHash("sha256").update(messageId).digest("hex").slice(0, 24)}`,
-        reason: "operator reconciliation is required before dispatch" };
-      let target: string;
-      try {
-        target = targetKeyOfInboxEnvelope(envelope);
-      } catch (error) {
-        const reason = `Inbox target derivation failed: ${error instanceof Error ? error.message : String(error)}`;
-        const deliveryId = `invalid-target-${crypto.createHash("sha256").update(`${agentId}\0${messageId}`).digest("hex").slice(0, 24)}`;
-        telemetry?.delivery(agentId, messageId, "error");
-        emit({ type: "delivery", agentId, deliveryId, messageId, status: "error", reason });
-        return { status: "error", deliveryId, reason, retryable: false };
-      }
-      reconcileExternalConsumption(agent);
-      const existingId = agent.byMessage.get(messageId);
-      if (existingId) {
-        const existing = agent.records.get(existingId);
-        if (existing?.status === "error") {
-          if (existing.target && existing.target !== target) return quarantineRecord(agent, existing, "delivery_target_conflict");
-          existing.target = target;
-          if (typeof envelope.wake_reason === "string" && envelope.wake_reason) existing.wakeReason = envelope.wake_reason;
-          else delete existing.wakeReason;
-          const priorAttempt = existing.input && Number.isSafeInteger(existing.input.attempt) ? existing.input.attempt : 0;
-          existing.input = existing.input && typeof existing.input === "object"
-            ? { ...existing.input, attempt: priorAttempt + 1 }
-            : { inputId: existing.deliveryId, deliveryId: existing.deliveryId, kind: "wake", text: "", attempt: priorAttempt + 1 };
-          delete existing.reason;
-          delete existing.retryable;
-          agent.promotedInboxUpdateIds.delete(existing.deliveryId);
-          setRecord(agent, existing, "pending");
-          const receipt = await (telemetry?.phase(messageId, "runtime.deliver", SpanKind.PRODUCER,
-            () => submit(agent, existing, agent.busy || agent.submitting)) ?? submit(agent, existing, agent.busy || agent.submitting));
-          telemetry?.delivery(agentId, messageId, receipt.status);
-          reconcileAbsentCanonical(agent, agent.records.get(existingId) ?? existing);
-          return receipt;
-        }
-        if (existing) reconcileAbsentCanonical(agent, existing);
-        telemetry?.delivery(agentId, messageId, "duplicate");
-        return { status: "duplicate", deliveryId: existingId };
-      }
-      if ([...agent.records.values()].filter((record) => isActiveDelivery(record.status)).length >= MAX_DELIVERIES) {
-        const deliveryId = `overflow-${crypto.createHash("sha256").update(messageId).digest("hex").slice(0, 24)}`;
-        telemetry?.delivery(agentId, messageId, "deferred");
-        return { status: "deferred", deliveryId, reason: `runtime delivery backlog limit ${MAX_DELIVERIES} reached` };
-      }
-      const deliveryId = crypto.randomUUID();
-      const busy = agent.busy || agent.submitting;
-      const wakeReason = typeof envelope.wake_reason === "string" ? envelope.wake_reason : undefined;
-      const input: RuntimeInput = { inputId: deliveryId, deliveryId, kind: busy ? "inbox_update" : "wake",
-        text: options.promptBuilder.buildInboxNotice({ busy, count: 1, deliveryId, target,
-          ...(wakeReason ? { wakeReason } : {}) }), attempt: 0 };
-      const record: DeliveryRecord = { deliveryId, messageId, status: "pending", input, target,
-        ...(wakeReason ? { wakeReason } : {}), updatedAt: now() };
-      agent.records.set(deliveryId, record); agent.byMessage.set(messageId, deliveryId); persist(agent);
-      if (agent.disabledReason) {
-        reconcileAbsentCanonical(agent, record);
-        telemetry?.delivery(agentId, messageId, "deferred");
-        return { status: "deferred", deliveryId, reason: agent.disabledReason };
-      }
-      const receipt = await (telemetry?.phase(messageId, "runtime.deliver", SpanKind.PRODUCER,
-        () => submit(agent, record, busy)) ?? submit(agent, record, busy));
-      telemetry?.delivery(agentId, messageId, receipt.status);
-      reconcileAbsentCanonical(agent, agent.records.get(deliveryId) ?? record);
-      return receipt;
-    },
+    deliver,
     async stop(agentId, reason): Promise<void> {
       const agent = managed.get(agentId); if (!agent) return; agent.stopped = true;
       const starting = agent.starting;
