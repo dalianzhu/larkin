@@ -1,4 +1,7 @@
 import crypto from "node:crypto";
+import { digestRecovery, planTransportRecovery, readTransportRecovery, reconciliationInput, transportRecoveryHeld, validateRecoveryReview,
+  TRANSPORT_RECOVERY_COOLDOWN_MS, TRANSPORT_RECOVERY_MAX_ATTEMPTS, TRANSPORT_RECOVERY_WINDOW_MS, TransportRecoveryError,
+  type TransportRecoveryJournal, type TransportRecoveryRequest, type TransportRecoveryResult, type TransportSnapshot } from "./transport-session-recovery.js";
 import fs from "node:fs";
 import path from "node:path";
 import { agentCliPromptCapabilities } from "../agent/agent-cli-capabilities.js";
@@ -61,12 +64,15 @@ export interface DeliveryRecord {
 }
 interface DeliveryFile { version: 1; records: DeliveryRecord[] }
 interface DeliveryStateStore {
-  readJson<T>(key: "runtimeDeliveries" | "agentState" | "status", fallback: T): T;
+  readJson<T>(key: "runtimeDeliveries" | "agentState" | "status" | "transportRecovery", fallback: T): T;
   readNdjson?<T>(key: "inbox"): T[];
-  writeJson(key: "runtimeDeliveries" | "agentState", value: unknown): void;
+  writeJson(key: "runtimeDeliveries" | "agentState" | "transportRecovery", value: unknown): void;
   withInboxTransaction<T>(operation: () => T): T;
   resolveInboxDeliverySource?(messageId: string): InboxDeliverySourceResolution;
   areRuntimeDeliveriesConsumed?(requiredMessageIds?: readonly string[]): boolean;
+  inspectTransportRecovery?(): TransportSnapshot;
+  commitTransportRecovery?(fingerprint: string, journal: TransportRecoveryJournal & { sessionId: string }): void;
+  restoreTransportRecoverySession?(): void;
   paths?: { reminders: string };
   resolveCurrentReminder?(): { reminderId: string; deliveryTarget: string; deliveryAnchor: string; deliveryCommitted?: boolean; deliveryMessageId?: string } | null;
   resolveCurrentReminders?(): Array<{ reminderId: string; deliveryTarget: string; deliveryAnchor: string; deliveryCommitted?: boolean; deliveryMessageId?: string }>;
@@ -133,6 +139,7 @@ export interface RuntimeHost {
   /** Promote accepted inbox_update deliveries once after idle / drought reconnect. */
   scanPendingInboxUpdates?(agentId?: string): Promise<void>;
   resetSession?(agentId: string): Promise<RuntimeSessionResetResult>;
+  recoverTransportSession?(agentId: string, request: TransportRecoveryRequest): Promise<TransportRecoveryResult>;
   recoverSession?(agentId: string, reason: "context-overflow"): Promise<RuntimeSessionRecoveryResult>;
   /** Internal recovery boundary for Pi compaction failures; never exposed as session reset. */
   recoverContextOverflow?(agentId: string, deliveryKey: string, reason: string): Promise<RuntimeSessionRecoveryResult>;
@@ -420,6 +427,7 @@ export function createRuntimeHost(options: {
   adapterFor(runtime: string): RuntimeAdapter; promptBuilder: ContextPromptBuilder; log?: (...parts: unknown[]) => void;
   stateStoreFor?(agentId: string): DeliveryStateStore;
   assertOfficialCliReady?(config: AgentRuntimeConfig, env: NodeJS.ProcessEnv): void | Promise<void>;
+  transportRecoveryPolicy?: { now?(): number; stageTimeoutMs?: number };
   retryPolicy?: { baseDelayMs?: number; maxDelayMs?: number; maxAttempts?: number; stableWindowMs?: number };
   turnEndRetryPolicy?: { baseDelayMs?: number; maxDelayMs?: number; maxAttempts?: number };
   /** Isolated scheduler so persisted turn-end retry deadlines can be tested deterministically. */
@@ -453,6 +461,21 @@ export function createRuntimeHost(options: {
     if (event.type === "delivery") telemetry?.delivery(event.agentId, event.messageId, event.status);
     for (const listener of listeners) listener(event);
   };
+  const recoveryNow = options.transportRecoveryPolicy?.now ?? Date.now;
+  const journalFor = (agent: ManagedAgent): TransportRecoveryJournal | null => agent.stateStore?.inspectTransportRecovery
+    ? readTransportRecovery(agent.stateStore.readJson("transportRecovery", null)) : null;
+  const recoveryHeld = (agent: ManagedAgent): boolean => {
+    try { return transportRecoveryHeld(journalFor(agent)); } catch { return true; }
+  };
+  const recoveryConfigFingerprint = (config: AgentRuntimeConfig): string => digestRecovery({ runtime: config.runtime, model: config.model,
+    effort: config.effort || null, workspaceDir: config.workspaceDir, stateDir: config.stateDir || null, larkConfigDir: config.larkConfigDir || null });
+  const saveJournal = (agent: ManagedAgent, journal: TransportRecoveryJournal): void => agent.stateStore!.writeJson("transportRecovery", journal);
+  const recoveryResult = (agent: ManagedAgent, journal: TransportRecoveryJournal): TransportRecoveryResult => ({
+    ok: !["failed", "switching"].includes(journal.phase), agentId: agent.config.agentId, phase: journal.phase,
+    recoveryId: journal.id, sessionId: journal.sessionId, previousSessionId: journal.previousSession.sessionId,
+    dispatchHeld: transportRecoveryHeld(journal), attemptsRemaining: Math.max(0, TRANSPORT_RECOVERY_MAX_ATTEMPTS - journal.attempts),
+    retryAt: journal.retryAt, ...(journal.code ? { code: journal.code } : {}),
+  });
   // Evidence is local to this daemon and exact child generation, never restored
   // from activity/status timestamps or a historical consumed ledger entry.
   const successfulDeliveryTurns = new WeakMap<ManagedAgent, { session: RuntimeSession; generation: number }>();
@@ -464,6 +487,12 @@ export function createRuntimeHost(options: {
     const store = agent.stateStore;
     if (!store?.areRuntimeDeliveriesConsumed) return;
     try {
+      const journal = journalFor(agent);
+      if (transportRecoveryHeld(journal)) {
+        if (journal!.phase !== "reconciling" || journal!.sessionId !== proof.session.sessionId
+          || journal!.launchId !== agent.launchId || !store.areRuntimeDeliveriesConsumed(journal!.failures.map((f) => f.messageId))) return;
+        saveJournal(agent, { ...journal!, phase: "complete", code: undefined });
+      }
       // Host failures may precede ledger creation. Keep successful-turn proof
       // until those exact failed messages are also canonically consumed.
       const health = store.readJson<{ inboundDeliveryHealth?: { state?: string; messageIds?: string[] } }>("status", {}).inboundDeliveryHealth;
@@ -659,7 +688,7 @@ export function createRuntimeHost(options: {
   const INBOX_UPDATE_PROMOTE_REASON = "accepted inbox_update promoted after Agent became idle";
   const isInboxUpdateKind = (kind: unknown): boolean => kind === "inbox_update" || kind === "inbox-update";
   const agentIsIdleForInboxScan = (agent: ManagedAgent): boolean =>
-    !agent.stopped && !agent.busy && !agent.submitting && !agent.turnInProgress && !agent.starting && Boolean(agent.session);
+    !agent.stopped && !recoveryHeld(agent) && !agent.busy && !agent.submitting && !agent.turnInProgress && !agent.starting && Boolean(agent.session);
   const acceptedInboxStillPending = (agent: ManagedAgent, record: DeliveryRecord): boolean => {
     if (!agent.stateStore?.readNdjson) return true;
     try {
@@ -949,6 +978,7 @@ export function createRuntimeHost(options: {
       && agent.piProactiveCompactionSession === agent.session
       ? agent.piProactiveCompaction : null;
     if (proactive) await proactive;
+    if (recoveryHeld(agent)) return;
     if (agent.submitting || agent.starting) { agent.retryAfterSubmit = true; return; }
     if (agent.busy || agent.turnInProgress || !agent.session) return;
     if (agent.adapter.id === "pi") {
@@ -1035,6 +1065,9 @@ export function createRuntimeHost(options: {
 
   const replaceSession = (agent: ManagedAgent, session: RuntimeSession, reason: string): void => {
     if (agent.session !== session || agent.stopped) return;
+    const recovery = journalFor(agent);
+    if (recovery && transportRecoveryHeld(recovery)) saveJournal(agent, { ...recovery, phase: "failed", code: "recovery_runtime_replaced" });
+    successfulDeliveryTurns.delete(agent);
     agent.session = null; agent.busy = false; agent.submitting = false; agent.generation += 1;
     agent.recreateReason = reason;
     if (agent.stabilityTimer) clearTimeout(agent.stabilityTimer);
@@ -1302,6 +1335,8 @@ export function createRuntimeHost(options: {
       // Terminal outcome is independent of input ownership: native follow-ups
       // and late turn/start responses may leave no input-error to correlate.
       if (event.outcome !== "success") {
+        const recovery = journalFor(agent);
+        if (recovery && ["submitting", "reconciling"].includes(recovery.phase)) saveJournal(agent, { ...recovery, phase: "failed", code: "reconciliation_failed" });
         agent.turnHadFailure = true;
         successfulDeliveryTurns.delete(agent);
       }
@@ -1350,7 +1385,16 @@ export function createRuntimeHost(options: {
       const record = event.inputId
         ? agent.records.get(event.inputId) ?? [...agent.records.values()].find((candidate) => candidate.input.inputId === event.inputId)
         : undefined;
-      if (!record || record.status === "consumed" || record.status === "error") return;
+      if (!record || record.status === "consumed" || record.status === "error") {
+        const recovery = journalFor(agent);
+        if (recovery && event.inputId === recovery.inputId && ["submitting", "reconciling"].includes(recovery.phase)) {
+          saveJournal(agent, { ...recovery, phase: "failed", code: "reconciliation_failed" });
+          if (event.errorCategory === "auth") projectAuthFailure(agent,
+            providerAuthenticationFailureReadiness(agent.adapter.id as "codex", event.upstream?.provider),
+            { kind: "generic", provider: genericAuthProvider(agent, event.upstream) });
+        }
+        return;
+      }
       if (agent.adapter.id === "pi" && event.errorCategory === "context_window" && event.willRetry === true && session.compact) {
         beginPiManualCompaction(agent, session, record, true);
         return;
@@ -1484,6 +1528,141 @@ export function createRuntimeHost(options: {
     return agent.starting;
   };
 
+  const recoverTransportSession = async (agentId: string, request: TransportRecoveryRequest): Promise<TransportRecoveryResult> => {
+    const agent = managed.get(agentId);
+    if (!agent || agent.stopped) throw new TransportRecoveryError("unknown_agent");
+    const store = agent.stateStore;
+    if (!store?.inspectTransportRecovery || !store.commitTransportRecovery || !store.restoreTransportRecoverySession) throw new TransportRecoveryError("recovery_unavailable");
+    let journal = journalFor(agent);
+    if (request.abort) {
+      if (!journal || !transportRecoveryHeld(journal) || request.planToken !== journal.lastPlan) throw new TransportRecoveryError("recovery_plan_stale");
+      if (agent.busy || agent.turnInProgress || agent.submitting) throw new TransportRecoveryError("agent_busy");
+      saveJournal(agent, { ...journal, phase: "cancelled", code: "recovery_cancelled" });
+      return recoveryResult(agent, { ...journal, phase: "cancelled", code: "recovery_cancelled" });
+    }
+    const assertReady = (): void => {
+      if (agent.config.runtime !== "codex") throw new TransportRecoveryError("recovery_runtime_unsupported");
+      if (agent.authFailureActive || agent.readiness?.state !== "ready" || agent.disabledReason || agent.configurationRecovery) throw new TransportRecoveryError("recovery_prerequisite_failed");
+    };
+    assertReady();
+    const sendReconciliation = async (current: TransportRecoveryJournal, plan: ReturnType<typeof planTransportRecovery>): Promise<TransportRecoveryResult> => {
+      if (agent.busy || agent.turnInProgress || agent.submitting || !agent.session || agent.session.sessionId !== current.sessionId) throw new TransportRecoveryError("agent_busy");
+      if (store.inspectTransportRecovery!().fingerprint !== current.snapshot) throw new TransportRecoveryError("recovery_plan_stale");
+      saveJournal(agent, { ...current, phase: "submitting" });
+      agent.submitting = true; agent.busy = true;
+      try {
+        const receipt = await agent.session.prompt({ inputId: current.inputId, kind: "user", attempt: current.attempts,
+          text: reconciliationInput(plan, request.review!) });
+        const latest = journalFor(agent)!;
+        if (receipt.status !== "accepted" && !agent.turnInProgress) agent.busy = false;
+        if (!["complete", "failed"].includes(latest.phase)) saveJournal(agent, { ...latest,
+          phase: receipt.status === "accepted" ? "reconciling" : "failed",
+          ...(receipt.status === "accepted" ? {} : { code: "reconciliation_rejected" }) });
+        projectDeliveryRecovery(agent);
+      } catch {
+        const latest = journalFor(agent)!;
+        saveJournal(agent, { ...latest, phase: "failed", code: "reconciliation_submission_unknown" });
+        if (!agent.turnInProgress) agent.busy = false;
+      } finally { agent.submitting = false; }
+      return recoveryResult(agent, journalFor(agent)!);
+    };
+    if (journal && request.planToken === journal.lastPlan && request.review && digestRecovery(request.review) === journal.reviewHash) {
+      // Repeated operator calls are idempotent. Only an intent definitely not
+      // submitted before a crash may continue; uncertain submissions never replay.
+      if (journal.phase === "switching") {
+        store.restoreTransportRecoverySession();
+        journal = { ...journal, phase: "awaiting" }; saveJournal(agent, journal);
+        emit({ type: "session", agentId, runtime: "codex", sessionId: journal.sessionId, launchId: agent.launchId, previousSession: journal.previousSession });
+      }
+      if (journal.phase === "awaiting") {
+        const plan = { ...agent.config, agentId, runtime: "codex", model: agent.config.model, sessionId: journal.sessionId!,
+          launchId: agent.launchId, generation: agent.generation, configFingerprint: journal.configFingerprint, token: journal.lastPlan, snapshot: journal.snapshot,
+          failures: journal.failures, retryAt: journal.retryAt, attemptsRemaining: TRANSPORT_RECOVERY_MAX_ATTEMPTS - journal.attempts };
+        return sendReconciliation(journal, plan);
+      }
+      return recoveryResult(agent, journal);
+    }
+    if (agent.busy || agent.turnInProgress || agent.submitting || agent.starting || !agent.session) throw new TransportRecoveryError("agent_busy");
+    const snapshot = store.inspectTransportRecovery();
+    const scope = { agentId, runtime: agent.config.runtime, model: agent.config.model,
+      sessionId: agent.session.sessionId || "", launchId: agent.launchId, generation: agent.generation, configFingerprint: recoveryConfigFingerprint(agent.config) };
+    const plan = planTransportRecovery(scope, snapshot, journal, recoveryNow());
+    if (!request.planToken && !request.review) return { ok: true, agentId, plan, dispatchHeld: transportRecoveryHeld(journal), ...(journal ? { phase: journal.phase, recoveryId: journal.id } : {}) };
+    if (request.planToken !== plan.token || !request.review) throw new TransportRecoveryError("recovery_plan_stale");
+    validateRecoveryReview(plan, request.review);
+    if (!plan.attemptsRemaining) throw new TransportRecoveryError("recovery_retry_budget_exhausted");
+    if (plan.retryAt) throw new TransportRecoveryError("recovery_cooldown");
+    const inWindow = journal && recoveryNow() - journal.windowStartedAt < TRANSPORT_RECOVERY_WINDOW_MS;
+    const alreadySwitched = transportRecoveryHeld(journal) && journal!.sessionId === agent.session.sessionId;
+    const previousSession = alreadySwitched ? journal!.previousSession : previousSessionRefFor(agent.session, "operator transport-failure reconciliation");
+    if (!previousSession) throw new TransportRecoveryError("recovery_session_unavailable");
+    const next: TransportRecoveryJournal = { version: 1, id: crypto.randomUUID(), agentId, runtime: "codex", model: agent.config.model, configFingerprint: scope.configFingerprint,
+      phase: "staging", sessionId: alreadySwitched ? agent.session.sessionId : null, previousSession,
+      launchId: alreadySwitched ? agent.launchId : crypto.randomUUID(), failures: plan.failures,
+      lastPlan: plan.token, reviewHash: digestRecovery(request.review), snapshot: snapshot.fingerprint,
+      inputId: `recovery-${crypto.randomUUID()}`, attempts: (inWindow ? journal!.attempts : 0) + 1,
+      windowStartedAt: inWindow ? journal!.windowStartedAt : recoveryNow(),
+      retryAt: new Date(recoveryNow() + TRANSPORT_RECOVERY_COOLDOWN_MS).toISOString(),
+      history: [...(journal?.history || []), ...(journal?.sessionId ? [{ sessionId: journal.sessionId, previousSession: journal.previousSession }] : [])] };
+    saveJournal(agent, next);
+    // Inspection/reconciliation authority is explicit and durable before any
+    // async probe/session creation. Ordinary ingress remains durable but held.
+    if (alreadySwitched) {
+      saveJournal(agent, { ...next, phase: "awaiting" });
+      return sendReconciliation({ ...next, phase: "awaiting" }, plan);
+    }
+    const oldSession = agent.session;
+    let fresh: RuntimeSession | null = null;
+    let unsubscribe: (() => void) | undefined;
+    let committed = false;
+    try {
+      const env = runtimeEnv(agent.config, `${next.launchId}:transport-recovery`);
+      await assertOfficialCliReady(agent.config, env);
+      const readiness = agent.adapter.probe ? await agent.adapter.probe({ agentId, workspaceDir: agent.config.workspaceDir, stateDir: agent.config.stateDir, env }) : { runtime: "codex" as const, state: "ready" as const };
+      if (readiness.state !== "ready") throw new TransportRecoveryError("recovery_prerequisite_failed");
+      fresh = await agent.adapter.createSession({ agentId, model: agent.config.model, reasoningEffort: agent.config.effort || null,
+        workspaceDir: agent.config.workspaceDir, stateDir: agent.config.stateDir, resumeSessionId: null,
+        standingPrompt: options.promptBuilder.build({ agentId, name: agent.config.displayName || agent.config.name,
+          description: agent.config.description || "", runtime: "codex", cli: agentCliPromptCapabilities("larkin"), previousSession }), env });
+      let prematureTurn = false;
+      unsubscribe = fresh.subscribe((event) => {
+        if (agent.session === fresh) observe(agent, fresh!, event);
+        else if (event.type === "turn-start" || event.type === "activity") prematureTurn = true;
+      });
+      const deadline = Date.now() + (options.transportRecoveryPolicy?.stageTimeoutMs ?? 15_000);
+      while (!fresh.sessionId && Date.now() < deadline && !prematureTurn) await new Promise((resolve) => setTimeout(resolve, 10));
+      if (!fresh.sessionId || fresh.sessionId === oldSession.sessionId || prematureTurn) throw new TransportRecoveryError("recovery_staging_failed");
+      if (agent.session !== oldSession || agent.generation !== scope.generation || recoveryConfigFingerprint(agent.config) !== scope.configFingerprint || agent.busy || agent.turnInProgress || agent.stopped) throw new TransportRecoveryError("agent_busy");
+      next.sessionId = fresh.sessionId;
+      try { store.commitTransportRecovery(snapshot.fingerprint, { ...next, sessionId: fresh.sessionId }); }
+      catch (error) {
+        const intent = journalFor(agent);
+        if (intent?.id !== next.id || !intent.sessionId) throw error;
+        // The durable intent is the restart authority even when the session
+        // projection write failed. Keep the new actor held; never revive both.
+        committed = true;
+        agent.session = fresh; agent.config.sessionId = fresh.sessionId;
+        agent.generation += 1; agent.launchId = next.launchId; agent.previousSession = previousSession;
+        await oldSession.close("transport recovery durable intent").catch(() => {});
+        throw new TransportRecoveryError("recovery_commit_pending");
+      }
+      committed = true;
+      agent.session = fresh; agent.config.sessionId = fresh.sessionId;
+      agent.generation += 1; agent.launchId = next.launchId; agent.previousSession = previousSession; agent.readiness = readiness;
+      await oldSession.close("operator transport recovery committed").catch(() => {});
+      emit({ type: "session", agentId, runtime: "codex", sessionId: fresh.sessionId, launchId: agent.launchId, previousSession });
+      emit({ type: "agent-status", agentId, status: "active", readiness });
+      return sendReconciliation({ ...next, phase: "awaiting" }, plan);
+    } catch (error) {
+      if (!committed) {
+        try { unsubscribe?.(); } catch { /* close staged child anyway */ }
+        await fresh?.close("transport recovery not committed").catch(() => {});
+        saveJournal(agent, { ...next, phase: "failed", code: error instanceof TransportRecoveryError ? error.code : "recovery_staging_failed" });
+      }
+      throw error instanceof TransportRecoveryError ? error : new TransportRecoveryError("recovery_staging_failed");
+    }
+  };
+
   recoverContextOverflowInternal = async (agentId: string, deliveryKey: string, reason: string, breakerKey?: string): Promise<RuntimeSessionRecoveryResult> => {
     const agent = managed.get(agentId);
     if (!agent || agent.stopped) throw new RuntimeSessionRecoveryError("unknown_agent", `unknown runtime Agent: ${agentId}`);
@@ -1606,6 +1785,7 @@ export function createRuntimeHost(options: {
     },
     async stage(config): Promise<StagedRuntimeCandidate> {
       const previous = managed.get(config.agentId);
+      if (previous && recoveryHeld(previous)) throw new TransportRecoveryError("recovery_in_progress");
       if (!previous) throw new Error(`cannot stage unknown runtime Agent: ${config.agentId}`);
       if (previous.busy || previous.submitting || previous.starting) {
         throw new Error(`Agent ${config.agentId} is not idle for runtime staging`);
@@ -1699,7 +1879,7 @@ export function createRuntimeHost(options: {
     async resetSession(agentId): Promise<RuntimeSessionResetResult> {
       const agent = managed.get(agentId);
       if (!agent || agent.stopped) throw new RuntimeSessionResetError("unknown_agent", `unknown runtime Agent: ${agentId}`);
-      if (agent.busy || agent.turnInProgress || agent.submitting || agent.starting) {
+      if (recoveryHeld(agent) || agent.busy || agent.turnInProgress || agent.submitting || agent.starting) {
         throw new RuntimeSessionResetError("agent_busy", `Agent ${agentId} is not idle`);
       }
       const countPending = (): number => agent.stateStore
@@ -1777,6 +1957,9 @@ export function createRuntimeHost(options: {
         .catch((error) => log("previous runtime close after fresh reset failed", String(error)));
       return { generationChanged: true, sessionChanged: oldSessionId !== fresh.sessionId, turns: 0,
         runtimeReady: true, pendingCount: 0, sessionId: fresh.sessionId };
+    },
+    async recoverTransportSession(agentId, request): Promise<TransportRecoveryResult> {
+      return recoverTransportSession(agentId, request);
     },
     async recoverSession(agentId, reason): Promise<RuntimeSessionRecoveryResult> {
       if (reason !== "context-overflow") throw new RuntimeSessionRecoveryError("recovery_refused", "unsupported recovery reason");
@@ -1987,6 +2170,21 @@ export function createRuntimeHost(options: {
           turnInProgress: false, turnHadFailure: false, turnHadAuthenticatedOutput: false, authFailureActive: false,
           authFailureKind: null, authFailureProvider: null,
           promotedInboxUpdateIds: new Set() };
+        try {
+          const recovery = journalFor(agent);
+          if (transportRecoveryHeld(recovery)) {
+            if (recovery!.agentId !== config.agentId || recovery!.model !== config.model || config.runtime !== "codex" || recovery!.configFingerprint !== recoveryConfigFingerprint(config)) {
+              agent.disabledReason = "operator recovery configuration changed";
+            } else if (recovery!.sessionId) {
+              agent.stateStore!.restoreTransportRecoverySession!();
+              config.sessionId = recovery!.sessionId;
+              agent.previousSession = recovery!.previousSession;
+              saveJournal(agent, { ...recovery!, launchId: agent.launchId,
+                phase: recovery!.phase === "switching" ? "awaiting" : recovery!.phase === "staging" ? "failed" : recovery!.phase,
+                ...(["submitting", "reconciling"].includes(recovery!.phase) ? { phase: "failed" as const, code: "reconciliation_interrupted" } : {}) });
+            } else saveJournal(agent, { ...recovery!, phase: "failed", code: "recovery_staging_interrupted" });
+          }
+        } catch { agent.disabledReason = "operator recovery state requires repair"; }
         restoreAuthFailure(agent);
         const startupConsumed: DeliveryRecord[] = [];
         const startupQuarantined: Array<{ record: DeliveryRecord; code: ReplayFailureCode }> = [];
@@ -2051,6 +2249,8 @@ export function createRuntimeHost(options: {
       const messageId = String(envelope.message_id || envelope.seq || crypto.randomUUID());
       const agent = managed.get(agentId);
       if (!agent) { telemetry?.delivery(agentId, messageId, "error"); throw new Error(`unknown runtime Agent: ${agentId}`); }
+      if (recoveryHeld(agent)) return { status: "deferred", deliveryId: `recovery-held-${crypto.createHash("sha256").update(messageId).digest("hex").slice(0, 24)}`,
+        reason: "operator reconciliation is required before dispatch" };
       let target: string;
       try {
         target = targetKeyOfInboxEnvelope(envelope);
