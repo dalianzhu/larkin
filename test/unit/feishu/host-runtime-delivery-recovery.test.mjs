@@ -199,3 +199,57 @@ test("Host/Runtime recover when canonical consumption becomes visible after succ
     assert.equal(store.readJson("status", {}).inboundDeliveryHealth.state, "healthy");
   });
 });
+
+test("fresh Runtime readiness after restart does not inherit a fully consumed historical delivery fault", async () => {
+  await fixture(async ({ store, fail, restart, ingest, succeed }) => {
+    await fail();
+    store.pollInbox({ target: "chat:oc_recovery" });
+    await restart();
+    assert.equal(store.readJson("status", {}).runtimeReadiness.state, "ready", "a drained historical fault must not block fresh dispatch after a successful prerequisite probe");
+    assert.equal(store.readJson("status", {}).inboundDeliveryHealth.state, "error", "startup alone does not claim successful delivery recovery");
+    await ingest();
+    succeed();
+    assert.equal(store.readJson("status", {}).inboundDeliveryHealth.state, "healthy");
+  });
+});
+
+test("startup does not submit a paid unread replay while a terminal delivery is unresolved", { timeout: 10_000 }, async () => {
+  await fixture(async ({ store, fail, restart, session }) => {
+    await fail();
+    await restart();
+    await new Promise((resolve) => setTimeout(resolve, 5_200));
+    assert.equal(store.readJson("status", {}).runtimeReadiness.state, "unavailable");
+    assert.equal(session().inputs.length, 0, "the startup redelivery timer must respect the unresolved delivery gate");
+    assert.equal(store.readJson("runtimeDeliveries", {}).records.filter((record) => record.status === "error").length, 1);
+  });
+});
+
+test("passive unread messages do not block proven delivery recovery or startup readiness", async () => {
+  await fixture(async ({ store, fail, ingest, succeed, restart }) => {
+    await fail();
+    await ingest();
+    store.appendCanonicalInboxOnce({ message_id: "om_passive", target: "chat:oc_passive", content: "passive fixture", wake: false });
+    succeed();
+    assert.equal(store.areRuntimeDeliveriesConsumed(), true);
+    assert.equal(store.readJson("status", {}).runtimeReadiness.state, "ready");
+    assert.equal(store.readJson("status", {}).inboundDeliveryHealth.state, "healthy");
+    assert.deepEqual(store.readNdjson("inbox").map((row) => row.message_id), ["om_passive"]);
+    await restart();
+    assert.equal(store.readJson("status", {}).runtimeReadiness.state, "ready");
+    assert.deepEqual(store.readNdjson("inbox").map((row) => row.message_id), ["om_passive"]);
+  });
+});
+
+test("Host failures before ledger creation require consumption of the exact failed message", async () => {
+  await fixture(async ({ agentId, store, ingest, succeed, inject }) => {
+    store.appendCanonicalInboxOnce({ message_id: "om_before_ledger", target: "chat:oc_failed", content: "failed fixture", wake: true });
+    inject({ type: "delivery", agentId, messageId: "om_before_ledger", deliveryId: "missing-ledger", status: "error" });
+    await ingest();
+    succeed();
+    assert.equal(store.readJson("status", {}).inboundDeliveryHealth.state, "error");
+    assert.equal(store.readJson("status", {}).runtimeReadiness.state, "unavailable");
+    store.pollInbox({ target: "chat:oc_failed" });
+    succeed();
+    assert.equal(store.readJson("status", {}).inboundDeliveryHealth.state, "healthy");
+  });
+});
