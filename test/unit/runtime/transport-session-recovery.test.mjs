@@ -238,3 +238,20 @@ test("canonical poll atomically refuses later or unrelated rows during reconcili
     assert.deepEqual(f.store.readNdjson("inbox").map((row) => row.message_id), ["om_unreviewed_later", "om_unreviewed_other"]);
   });
 });
+
+test("a new explicit attempt requires its own success even if a prior turn left delayed-consumption proof", async () => {
+  let now = Date.now(); let duringRetry;
+  await withFixture(async (f) => {
+    await f.fail(); let { plan } = await f.inspect(); await f.commit(plan, f.review(plan));
+    await f.finish({ poll: false });
+    assert.equal(f.store.readJson("transportRecovery", {}).phase, "reconciling");
+    now += 60_001; ({ plan } = await f.inspect());
+    duringRetry = () => f.store.pollInbox({ target: "chat:oc_transport", limit: 1 });
+    await f.commit(plan, f.review(plan));
+    assert.equal(f.store.readJson("runtimeDeliveries", {}).records[0].status, "consumed");
+    assert.equal(f.store.readJson("transportRecovery", {}).phase, "reconciling", "previous attempt success cannot authenticate a new attempt");
+    duringRetry = null;
+    await f.finish({ poll: false });
+    assert.equal(f.store.readJson("transportRecovery", {}).phase, "complete");
+  }, { now: () => now, onPrompt() { duringRetry?.(); } });
+});
