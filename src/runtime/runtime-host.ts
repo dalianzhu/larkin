@@ -61,12 +61,12 @@ export interface DeliveryRecord {
 }
 interface DeliveryFile { version: 1; records: DeliveryRecord[] }
 interface DeliveryStateStore {
-  readJson<T>(key: "runtimeDeliveries" | "agentState", fallback: T): T;
+  readJson<T>(key: "runtimeDeliveries" | "agentState" | "status", fallback: T): T;
   readNdjson?<T>(key: "inbox"): T[];
   writeJson(key: "runtimeDeliveries" | "agentState", value: unknown): void;
   withInboxTransaction<T>(operation: () => T): T;
   resolveInboxDeliverySource?(messageId: string): InboxDeliverySourceResolution;
-  areRuntimeDeliveriesConsumed?(): boolean;
+  areRuntimeDeliveriesConsumed?(requiredMessageIds?: readonly string[]): boolean;
   paths?: { reminders: string };
   resolveCurrentReminder?(): { reminderId: string; deliveryTarget: string; deliveryAnchor: string; deliveryCommitted?: boolean; deliveryMessageId?: string } | null;
   resolveCurrentReminders?(): Array<{ reminderId: string; deliveryTarget: string; deliveryAnchor: string; deliveryCommitted?: boolean; deliveryMessageId?: string }>;
@@ -464,8 +464,11 @@ export function createRuntimeHost(options: {
     const store = agent.stateStore;
     if (!store?.areRuntimeDeliveriesConsumed) return;
     try {
+      // Host failures may precede ledger creation. Keep successful-turn proof
+      // until those exact failed messages are also canonically consumed.
+      const health = store.readJson<{ inboundDeliveryHealth?: { state?: string; messageIds?: string[] } }>("status", {}).inboundDeliveryHealth;
       const recovered = [...agent.records.values()].every((record) => record.status === "consumed")
-        && store.areRuntimeDeliveriesConsumed();
+        && store.areRuntimeDeliveriesConsumed(health?.state === "error" ? health.messageIds || [] : []);
       if (!recovered) return;
       successfulDeliveryTurns.delete(agent);
       emit({ type: "delivery-recovered", agentId: agent.config.agentId, runtime: agent.adapter.id,
@@ -1296,14 +1299,19 @@ export function createRuntimeHost(options: {
       markSessionStable(agent, session);
       emit({ type: "activity", agentId: agent.config.agentId, activity: "working", activityKind: "working", detailKind: "turn_started" });
     } else if (event.type === "turn-end") {
+      // Terminal outcome is independent of input ownership: native follow-ups
+      // and late turn/start responses may leave no input-error to correlate.
+      if (event.outcome !== "success") {
+        agent.turnHadFailure = true;
+        successfulDeliveryTurns.delete(agent);
+      }
       for (const [inputId, machine] of agent.compactionMachines) {
         if (machine.recordSnapshot.sessionGeneration !== agent.generation) continue;
         machine.close();
         if (["closed", "fallback_committed"].includes(machine.state)) agent.compactionMachines.delete(inputId);
       }
       const successfulTurn = agent.turnInProgress && agent.turnHadAuthenticatedOutput && !agent.turnHadFailure;
-      const recoveredAuthentication = agent.authFailureActive && agent.turnInProgress
-        && agent.turnHadAuthenticatedOutput && !agent.turnHadFailure && namedAuthProviderPresent(agent);
+      const recoveredAuthentication = agent.authFailureActive && successfulTurn && namedAuthProviderPresent(agent);
       agent.turnInProgress = false;
       agent.busy = false;
       emit({ type: "activity", agentId: agent.config.agentId, activity: "idle", activityKind: "idle", detailKind: "turn_ended" });

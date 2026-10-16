@@ -44,7 +44,7 @@ export type NormalizedRuntimeEvent =
       reason?: "manual" | "threshold" | "overflow"; willRetry?: boolean; success?: boolean; inputId?: string; sessionId?: string }
   | { type: "turn-start"; turnId?: string }
   | { type: "activity"; activity: "thinking" | "text" | "tool" | "internal"; text?: string; name?: string }
-  | { type: "turn-end"; sessionId?: string; turnId?: string }
+  | { type: "turn-end"; outcome: "success" | "error" | "aborted" | "unknown"; sessionId?: string; turnId?: string }
   | { type: "input-error"; inputId?: string; retryable: boolean; willRetry?: boolean; message: string;
       errorCategory?: "billing" | "quota" | "rate_limit" | "auth" | "context_window" | "provider"; nextAction?: string;
       upstream?: UpstreamProviderError }

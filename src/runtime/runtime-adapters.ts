@@ -257,7 +257,7 @@ class CodexSession extends EventSession {
       this.stopped = false;
       this.completeTurn(turnId);
       this.finishTurnInputs(turnId, "Codex capacity retry cancelled", false);
-      this.emit({ type: "turn-end", ...(this.threadId ? { sessionId: this.threadId } : {}) });
+      this.emit({ type: "turn-end", outcome: "aborted", ...(this.threadId ? { sessionId: this.threadId } : {}) });
     }
     if (this.threadId && this.activeTurnId) this.request("turn/interrupt", { threadId: this.threadId, turnId: this.activeTurnId });
   }
@@ -310,7 +310,7 @@ class CodexSession extends EventSession {
     if (!recovery) return;
     this.finishTurnInputs(recovery.turnId, message, false);
     this.completeTurn(recovery.turnId);
-    this.emit({ type: "turn-end", ...(this.threadId ? { sessionId: this.threadId } : {}) });
+    this.emit({ type: "turn-end", outcome: "error", ...(this.threadId ? { sessionId: this.threadId } : {}) });
   }
 
   private request(method: string, params: unknown, inputId?: string): number {
@@ -474,7 +474,7 @@ class CodexSession extends EventSession {
       this.emit({ type: "turn-start", ...(this.activeTurnId ? { turnId: this.activeTurnId } : {}) });
     } else if (message.method === "turn/completed") {
       const turnId = String(message.params?.turn?.id || this.activeTurnId || "") || undefined;
-      const status = String(message.params?.turn?.status || "completed").toLowerCase();
+      const status = String(message.params?.turn?.status || "").toLowerCase();
       const turnError = message.params?.turn?.error;
       const errorMessage = String(turnError?.message || turnError || `Codex turn ${status}`);
       if (turnId && this.recentTurnIds.includes(turnId)) return;
@@ -490,7 +490,7 @@ class CodexSession extends EventSession {
       if (turnId) this.completeTurn(turnId);
       if (!endsActiveTurn) return;
       this.activeTurnId = null;
-      this.emit({ type: "turn-end", ...(this.threadId ? { sessionId: this.threadId } : {}), ...(turnId ? { turnId } : {}) });
+      this.emit({ type: "turn-end", outcome: status === "interrupted" ? "aborted" : status === "failed" || turnError ? "error" : status === "completed" ? "success" : "unknown", ...(this.threadId ? { sessionId: this.threadId } : {}), ...(turnId ? { turnId } : {}) });
     } else if (message.method === "item/agentMessage/delta" && message.params?.delta) {
       this.emit({ type: "activity", activity: "text", text: String(message.params.delta) });
     } else if (message.method === "item/reasoning/summaryTextDelta" && message.params?.delta) {
@@ -675,7 +675,7 @@ class ClaudeSession extends EventSession {
       this.busy = false;
       this.safeBoundary = true;
       if (message.is_error) this.emit({ type: "error", message: String(message.result || message.subtype || "Claude runtime error") });
-      this.emit({ type: "turn-end", ...(this.currentSessionId ? { sessionId: this.currentSessionId } : {}) });
+      this.emit({ type: "turn-end", outcome: message.is_error ? "error" : message.subtype === "success" ? "success" : "unknown", ...(this.currentSessionId ? { sessionId: this.currentSessionId } : {}) });
       for (const next of this.gated.splice(0)) void this.writeUser(next.input).then(next.resolve);
     } else if (message.type === "system" && message.subtype === "init") {
       this.emit({ type: "turn-start" });
@@ -876,14 +876,14 @@ class PiSession extends EventSession {
           type: "input-error", inputId, retryable, willRetry: false, message: classified.reason,
           errorCategory: classified.category, nextAction: classified.nextAction, upstream: error.upstream,
         });
-        this.emit({ type: "turn-end", ...(this.sessionId ? { sessionId: this.sessionId } : {}) });
+        this.emit({ type: "turn-end", outcome: "error", ...(this.sessionId ? { sessionId: this.sessionId } : {}) });
       } else if (stopReason === "aborted") {
         for (const inputId of owned) this.emit({
           type: "input-error", inputId, retryable: true, willRetry: false, message: "Pi assistant turn aborted",
         });
-        this.emit({ type: "turn-end", ...(this.sessionId ? { sessionId: this.sessionId } : {}) });
+        this.emit({ type: "turn-end", outcome: "aborted", ...(this.sessionId ? { sessionId: this.sessionId } : {}) });
       } else {
-        this.emit({ type: "turn-end", ...(this.sessionId ? { sessionId: this.sessionId } : {}) });
+        this.emit({ type: "turn-end", outcome: stopReason === "error" ? "error" : ["stop", "length", "toolUse"].includes(stopReason || "") ? "success" : "unknown", ...(this.sessionId ? { sessionId: this.sessionId } : {}) });
       }
       for (const inputId of owned) { this.ownedInputIds.delete(inputId); this.inputEpochs.delete(inputId); }
       this.observedSubmitEpochs.delete(epoch);

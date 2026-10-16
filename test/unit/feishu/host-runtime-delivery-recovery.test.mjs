@@ -6,6 +6,7 @@ import { test } from "bun:test";
 import { createAgentStateStore } from "../../../dist/agent/agent-state-store.mjs";
 import { ContextPromptBuilder } from "../../../dist/agent/context-prompt.mjs";
 import { createRuntimeHost } from "../../../dist/runtime/runtime-host.mjs";
+import { createNativeRuntimeAdapter } from "../../../dist/runtime/runtime-adapters.mjs";
 import { createHostShell } from "../../../dist/feishu/host-shell.mjs";
 
 class Session {
@@ -13,17 +14,19 @@ class Session {
   listeners = new Set();
   inputs = [];
   subscribe(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); }
-  emit(event) { for (const fn of this.listeners) fn(event); }
+  emit(event) { if (event.type === "turn-end") event = { outcome: "success", ...event }; for (const fn of this.listeners) fn(event); }
   async prompt(input) { this.inputs.push(input); return { status: "accepted", inputId: input.inputId }; }
   async busyInput(input) { return this.prompt(input); }
+  async steer(text) { this.inputs.push(text); }
+  async abort() {}
   async close() {}
 }
 
-async function fixture(run) {
+async function fixture(run, { nativePi = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-delivery-recovery-"));
   const agentId = "cli_deliveryRecoveryA1";
   const store = createAgentStateStore(root, agentId);
-  const agent = { agentId, name: agentId, runtime: "codex", model: "fixture", feishuAppId: agentId,
+  const agent = { agentId, name: agentId, runtime: nativePi ? "pi" : "codex", model: "fixture", feishuAppId: agentId,
     feishuProfile: agentId, larkConfigDir: path.join(store.paths.root, "lark-cli-config"),
     workspaceDir: path.join(root, "agents", agentId), stateDir: store.paths.root };
   let host, runtime, session, inject;
@@ -32,7 +35,10 @@ async function fixture(run) {
   const start = async () => {
     session = new Session();
     runtime = createRuntimeHost({
-      adapterFor: () => ({ id: "codex", capabilities: {}, async createSession() { return session; } }),
+      adapterFor: () => nativePi
+        ? { ...createNativeRuntimeAdapter("pi", { createPiSession: async () => session }),
+          async probe() { return { runtime: "pi", state: "ready" }; } }
+        : { id: "codex", capabilities: {}, async createSession() { return session; } },
       promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store, assertOfficialCliReady: async () => {},
     });
     const subscribe = runtime.subscribe.bind(runtime);
@@ -249,7 +255,55 @@ test("Host failures before ledger creation require consumption of the exact fail
     assert.equal(store.readJson("status", {}).inboundDeliveryHealth.state, "error");
     assert.equal(store.readJson("status", {}).runtimeReadiness.state, "unavailable");
     store.pollInbox({ target: "chat:oc_failed" });
-    succeed();
+    const deadline = Date.now() + 2_000;
+    while (store.readJson("status", {}).inboundDeliveryHealth.state === "error" && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
     assert.equal(store.readJson("status", {}).inboundDeliveryHealth.state, "healthy");
+    assert.equal(store.readJson("status", {}).runtimeReadiness.state, "ready");
   });
 });
+
+for (const outcome of ["error", "aborted", "pending", "deferred", "stop", "length", "toolUse"]) {
+  test(`native Pi unowned ${outcome} follow-up requires successful completion to recover Host delivery health`, async () => {
+    await fixture(async ({ store, ingest, session, events }) => {
+      await ingest();
+      const end = (stopReason) => {
+        session().emit({ type: "agent_end", messages: [{ role: "assistant", stopReason,
+          ...(stopReason === "error" ? { errorMessage: "insufficient quota" } : {}) }] });
+        session().emit({ type: "agent_settled" });
+      };
+      session().emit({ type: "turn_start" });
+      end("error");
+      assert.equal(store.readJson("status", {}).inboundDeliveryHealth.state, "error");
+      assert.equal(store.readJson("runtimeDeliveries", {}).records[0].status, "error");
+      // A native follow-up has no new Host-owned input. Partial text/tool output
+      // and a canonical poll cannot prove that this follow-up completed well.
+      session().emit({ type: "turn_start" });
+      store.pollInbox({ target: "chat:oc_recovery" });
+      if (outcome === "aborted") session().emit({ type: "tool_execution_start", toolName: "synthetic_tool" });
+      else session().emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "partial synthetic output" } });
+      end(outcome);
+      const successful = ["stop", "length", "toolUse"].includes(outcome);
+      assert.equal(events.filter((event) => event.type === "delivery-recovered").length, successful ? 1 : 0);
+      assert.equal(store.readJson("status", {}).inboundDeliveryHealth.state, successful ? "healthy" : "error");
+      assert.equal(store.readJson("status", {}).runtimeReadiness.state, successful ? "ready" : "unavailable");
+      assert.equal(session().inputs.length, 1, "native failure evidence must not submit an extra Host prompt");
+    }, { nativePi: true });
+  });
+}
+
+for (const outcome of ["error", "aborted", "unknown"]) {
+  test(`Host refuses recovery on unowned ${outcome} terminal evidence without input-error`, async () => {
+    await fixture(async ({ store, fail, session, events }) => {
+      await fail();
+      session().emit({ type: "turn-start" });
+      store.pollInbox({ target: "chat:oc_recovery" });
+      session().emit({ type: "activity", activity: "text" });
+      session().emit({ type: "turn-end", outcome });
+      assert.equal(events.filter((event) => event.type === "delivery-recovered").length, 0);
+      assert.equal(store.readJson("status", {}).inboundDeliveryHealth.state, "error");
+      assert.equal(store.readJson("status", {}).runtimeReadiness.state, "unavailable");
+    });
+  });
+}
