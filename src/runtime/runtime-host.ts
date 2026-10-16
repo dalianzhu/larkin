@@ -1548,6 +1548,7 @@ export function createRuntimeHost(options: {
     const sendReconciliation = async (current: TransportRecoveryJournal, plan: ReturnType<typeof planTransportRecovery>): Promise<TransportRecoveryResult> => {
       if (agent.busy || agent.turnInProgress || agent.submitting || !agent.session || agent.session.sessionId !== current.sessionId) throw new TransportRecoveryError("agent_busy");
       if (store.inspectTransportRecovery!().fingerprint !== current.snapshot) throw new TransportRecoveryError("recovery_plan_stale");
+      successfulDeliveryTurns.delete(agent);
       saveJournal(agent, { ...current, phase: "submitting" });
       agent.submitting = true; agent.busy = true;
       try {
