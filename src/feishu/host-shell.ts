@@ -381,6 +381,12 @@ export function createHostShell({
         reason: "Operator session recovery requires reconciliation.", nextAction: "Inspect session recover --reason transport-failure from a user terminal." } });
       return;
     }
+    const health = hostState.readStatus(agent).inboundDeliveryHealth as Record<string, unknown> | undefined;
+    if (health?.state === "healthy" && ["reason", "nextAction", "code", "messageIds"].some((key) => key in health)) {
+      const { state: _state, at, recoveredAt, lastFailure, ...diagnostics } = health;
+      hostState.updateStatus(agent, { inboundDeliveryHealth: { state: "healthy", at: recoveredAt || at,
+        ...(recoveredAt ? { recoveredAt } : {}), lastFailure: lastFailure || { ...diagnostics, state: "error", at } } });
+    }
     let unresolvedDeliveries = false;
     if (!deliveryRecovered && (hostState.readStatus(agent).inboundDeliveryHealth as { state?: string } | undefined)?.state === "error") {
       try { unresolvedDeliveries = !stateStore(agent).areRuntimeDeliveriesConsumed(
