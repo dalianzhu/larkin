@@ -462,6 +462,38 @@ test("Codex resume failure falls back to a fresh thread with the same standing p
   assert.equal(fallback.params.developerInstructions, "standing");
 });
 
+test("Codex sandbox defaults to danger-full-access and workspace-write keeps network plus Larkin state writable", async () => {
+  const startParams = async (overrides) => {
+    const child = new FakeProcess();
+    await createNativeRuntimeAdapter("codex", { spawn: () => child }).createSession(create(overrides));
+    child.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} })}\n`);
+    await new Promise((resolve) => setImmediate(resolve));
+    return child.writes.find((request) => request.method === "thread/start").params;
+  };
+  const legacy = await startParams({ reasoningEffort: "high" });
+  assert.equal(legacy.approvalPolicy, "never");
+  assert.equal(legacy.sandbox, "danger-full-access");
+  assert.deepEqual(legacy.config, { model_reasoning_effort: "high" });
+
+  const restricted = await startParams({
+    sandbox: "workspace-write", reasoningEffort: "medium", stateDir: "/tmp/larkin-root/state/agents/cli_test",
+    env: { LARKIN_TELEMETRY_SPOOL_DIR: "/tmp/larkin-root/telemetry/spool" },
+  });
+  assert.equal(restricted.approvalPolicy, "never");
+  assert.equal(restricted.sandbox, "workspace-write");
+  assert.deepEqual(restricted.config, {
+    model_reasoning_effort: "medium",
+    sandbox_workspace_write: {
+      network_access: true,
+      // Roots are resolved, so Windows turns these into drive-qualified paths.
+      writable_roots: ["/tmp/larkin-root/state/agents/cli_test", "/tmp/larkin-root/telemetry/spool"].map((root) => path.resolve(root)),
+    },
+  });
+  assert.ok(!restricted.config.sandbox_workspace_write.writable_roots.includes("/tmp/larkin-root"));
+  assert.equal(Object.hasOwn(legacy, "serviceTier"), false, "fast mode off leaves the tier to the user's Codex config");
+  assert.equal((await startParams({ fastMode: true })).serviceTier, "fast");
+});
+
 test("Codex rejects unsupported app-server requests without treating them as notifications", async () => {
   const child = new FakeProcess();
   await createNativeRuntimeAdapter("codex", { spawn: () => child }).createSession(create());
@@ -1733,3 +1765,65 @@ for (const [is_error, subtype, outcome] of [[true, "error_during_execution", "er
     await session.close("terminal outcome test");
   });
 }
+
+test("Codex, Claude and Pi emit ordered text-delta events with block boundaries for card replies", async () => {
+  const textDeltas = (events) => events.filter((event) => event.type === "text-delta")
+    .map((event) => `${event.newBlock ? "|" : ""}${event.text}`);
+
+  const codex = await startedCodexTurn("delta-codex", "turn-delta-codex");
+  for (const message of [
+    { method: "item/started", params: { item: { type: "agentMessage", id: "m1" } } },
+    { method: "item/agentMessage/delta", params: { delta: "Hel" } },
+    { method: "item/agentMessage/delta", params: { delta: "lo" } },
+    { method: "item/reasoning/summaryTextDelta", params: { delta: "hidden" } },
+    { method: "item/started", params: { item: { type: "agentMessage", id: "m2" } } },
+    { method: "item/agentMessage/delta", params: { delta: "Done" } },
+  ]) codex.child.stdout.write(`${JSON.stringify(message)}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(textDeltas(codex.events), ["|Hel", "lo", "|Done"]);
+
+  codex.child.stdout.write(`${JSON.stringify({ method: "item/started", params: { item: { type: "commandExecution", id: "c1", command: "curl -H 'Authorization: Bearer s3cr3t' x" } } })}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  const toolEvent = codex.events.findLast((event) => event.type === "activity" && event.activity === "tool");
+  assert.deepEqual(toolEvent, { type: "activity", activity: "tool", name: "执行命令", toolId: "c1" }, "tool activity carries no arguments");
+
+  const child = new FakeProcess();
+  const claude = await createNativeRuntimeAdapter("claude", {
+    spawn: () => child, mkdir: () => {}, writeFile: () => {},
+  }).createSession(create());
+  const claudeEvents = [];
+  claude.subscribe((event) => claudeEvents.push(event));
+  for (const message of [
+    { type: "system", subtype: "init", session_id: "claude-delta" },
+    { type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "thinking" } } },
+    { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "hidden" } } },
+    { type: "stream_event", event: { type: "content_block_start", index: 1, content_block: { type: "text", text: "" } } },
+    { type: "stream_event", event: { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "An" } } },
+    { type: "stream_event", event: { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "swer" } } },
+    { type: "assistant", session_id: "claude-delta", message: { content: [{ type: "text", text: "Answer" }] } },
+    { type: "result", session_id: "claude-delta", is_error: false },
+  ]) child.stdout.write(`${JSON.stringify(message)}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  // The complete assistant message keeps feeding activity, but never duplicates the streamed text.
+  assert.deepEqual(textDeltas(claudeEvents), ["|An", "swer"]);
+
+  let listener;
+  const sdk = {
+    sessionId: "pi-delta", prompt() {}, steer() {}, abort() {},
+    subscribe(next) { listener = next; return () => {}; },
+  };
+  const pi = await createNativeRuntimeAdapter("pi", {
+    createPiSession: async () => sdk,
+    env: { LARKIN_PI_DISTRIBUTION: "builtin" },
+  }).createSession(create());
+  const piEvents = [];
+  pi.subscribe((event) => piEvents.push(event));
+  await pi.prompt({ inputId: "pi-delta-input", kind: "user", text: "work", attempt: 0 });
+  listener({ type: "turn_start" });
+  listener({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "hidden" } });
+  listener({ type: "message_update", assistantMessageEvent: { type: "text_start" } });
+  listener({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Hi" } });
+  listener({ type: "message_update", assistantMessageEvent: { type: "toolcall_delta", delta: "{\"cmd\"" } });
+  listener({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: " there" } });
+  assert.deepEqual(textDeltas(piEvents), ["|Hi", " there"]);
+});

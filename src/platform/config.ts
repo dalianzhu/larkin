@@ -7,6 +7,7 @@ import { exactMode, fsyncDirectoryOf } from "./secure-metadata.js";
 import { CURRENT_RUNTIME_MODELS, type RuntimeModels } from "../runtime/runtime-model-catalog.js";
 import { fromUserRuntime, isAdapterRuntime, isUserRuntime, toUserRuntime } from "../runtime/user-runtime.js";
 import processInspect from "./process-inspect.cjs";
+import type { ReplyMode } from "./reply-mode.js";
 
 type Env = Record<string, string | undefined>;
 type Obj = Record<string, unknown>;
@@ -27,6 +28,13 @@ export interface InboxAuditResolved {
   intervalMs: number;
 }
 
+export const AGENT_SANDBOXES = ["workspace-write", "danger-full-access"] as const;
+export type AgentSandbox = typeof AGENT_SANDBOXES[number];
+export const DEFAULT_AGENT_SANDBOX: AgentSandbox = "danger-full-access";
+function isAgentSandbox(value: unknown): value is AgentSandbox {
+  return typeof value === "string" && (AGENT_SANDBOXES as readonly string[]).includes(value);
+}
+
 export const DEFAULT_INBOX_AUDIT_INTERVAL_MS = 15 * 60_000;
 export const MIN_INBOX_AUDIT_INTERVAL_MS = 60_000;
 export const MAX_INBOX_AUDIT_INTERVAL_MS = 24 * 60 * 60_000;
@@ -35,6 +43,10 @@ export interface StoredAgent {
   runtime: string;
   model: string;
   effort?: string;
+  /** Codex sandbox. Absent means danger-full-access (the historical default). */
+  sandbox?: AgentSandbox;
+  /** Codex Fast service tier. Stored only when on; absent follows the user's own Codex config. */
+  fastMode?: true;
   mentionPolicy?: MentionPolicy;
   chatMentionPolicies?: Record<string, MentionPolicy>;
   inboxAudit?: InboxAuditSettings;
@@ -51,6 +63,8 @@ export interface HydratedAgent extends StoredAgent {
   larkConfigDir: string;
   /** Compatibility projection for older status consumers. Never stored in v4. */
   noMentionChats?: string[];
+  /** Projection of the global reply mode so Runtime agent snapshots carry it. Never stored per Agent. */
+  replyMode?: ReplyMode;
   [key: string]: unknown;
 }
 
@@ -59,6 +73,8 @@ export interface HydratedConfig {
   serverId: string | null;
   mentionPolicy: MentionPolicy;
   inboxAudit?: InboxAuditResolved;
+  /** Who delivers IM replies; absent means the Runtime process default (LARKIN_REPLY_MODE, else cli). */
+  replyMode?: ReplyMode;
   configDir: string;
   larkinHome: string;
   larkConfigDir: string;
@@ -73,9 +89,12 @@ export type ConfigMutation =
   | { kind: "set-chat-mention"; agentId: string; chatId: string; value: MentionPolicyOverride }
   | { kind: "set-global-inbox-audit"; enabled?: boolean; intervalMs?: number }
   | { kind: "set-agent-inbox-audit"; agentId: string; enabled?: InboxAuditEnabledOverride; intervalMs?: InboxAuditIntervalOverride }
+  | { kind: "set-global-reply-mode"; value: ReplyMode }
   | { kind: "set-agent-runtime"; agentId: string; runtime: string; model?: string }
   | { kind: "set-agent-model"; agentId: string; model: string }
-  | { kind: "set-agent-effort"; agentId: string; effort: string | null };
+  | { kind: "set-agent-effort"; agentId: string; effort: string | null }
+  | { kind: "set-agent-sandbox"; agentId: string; value: AgentSandbox }
+  | { kind: "set-agent-fast-mode"; agentId: string; value: boolean };
 
 export type ConfigAuthority = { kind: "user" } | { kind: "agent"; agentId: string };
 export interface ConfigMutationResult {
@@ -93,9 +112,9 @@ interface ConfigApplyFile { version: 1; persistedRevision: string; agents: Recor
 
 const TOP_FIELDS_V3 = new Set(["version", "serverId", "activeAgent", "agents"]);
 const TOP_FIELDS_V4 = new Set(["version", "serverId", "mentionPolicy", "activeAgent", "agents"]);
-const OPTIONAL_TOP_FIELDS_V4 = new Set(["inboxAudit"]);
+const OPTIONAL_TOP_FIELDS_V4 = new Set(["inboxAudit", "replyMode"]);
 const AGENT_FIELDS_V3 = new Set(["runtime", "model", "effort", "noMentionChats", "createdAt"]);
-const AGENT_FIELDS_V4 = new Set(["runtime", "model", "effort", "mentionPolicy", "chatMentionPolicies", "inboxAudit", "createdAt"]);
+const AGENT_FIELDS_V4 = new Set(["runtime", "model", "effort", "sandbox", "fastMode", "mentionPolicy", "chatMentionPolicies", "inboxAudit", "createdAt"]);
 const LEGACY_AGENT_FIELDS = new Set(["piDistribution", "runtimeOption", "processingEye"]);
 const INBOX_AUDIT_FIELDS = new Set(["enabled", "intervalMs"]);
 const APP_ID = /^cli_[A-Za-z0-9]+$/;
@@ -162,6 +181,10 @@ function assertAllowedFields(object: Obj, allowed: Set<string>, label: string): 
 
 function assertPolicy(value: unknown, label: string): asserts value is MentionPolicy {
   if (value !== "require" && value !== "free") throw new Error(`${label} 只允许 require/free`);
+}
+
+function assertReplyMode(value: unknown, label: string): asserts value is ReplyMode {
+  if (value !== "card" && value !== "cli") throw new Error(`${label} 只允许 card/cli`);
 }
 
 export function assertInboxAuditInterval(value: unknown, label = "inbox-audit interval"): asserts value is number {
@@ -305,6 +328,11 @@ function validateStoredAgent(key: string, agent: unknown, version: 3 | 4): asser
   if (typeof agent.effort === "string") {
     if (!runtimeSupportsEffort(canonical.runtime, agent.effort)) throw new Error(`Agent ${key}.effort=${agent.effort} 不在 ${canonical.runtime} 安全档位中`);
   }
+  if (version === 4 && Object.hasOwn(agent, "sandbox") && !isAgentSandbox(agent.sandbox)) throw new Error(`Agent ${key}.sandbox 必须是 ${AGENT_SANDBOXES.join(" / ")}`);
+  if (version === 4 && Object.hasOwn(agent, "fastMode")) {
+    if (agent.fastMode !== true) throw new Error(`Agent ${key}.fastMode 只能是 true（关闭时不保存）`);
+    if (canonical.runtime !== "codex") throw new Error(`Agent ${key}.fastMode 只适用于 codex`);
+  }
   if (version === 3 && Object.hasOwn(agent, "noMentionChats")) {
     if (!Array.isArray(agent.noMentionChats) || agent.noMentionChats.some((chat) => typeof chat !== "string" || !CHAT_ID.test(chat))) {
       throw new Error(`Agent ${key}.noMentionChats 必须是安全的群 ID 字符串数组`);
@@ -335,6 +363,8 @@ function hydratedStoredAgent(key: string, agent: Obj, version: 3 | 4): StoredAge
     runtime: agent.runtime as string,
     model: agent.model as string,
     ...(typeof agent.effort === "string" ? { effort: agent.effort } : {}),
+    ...(version === 4 && isAgentSandbox(agent.sandbox) ? { sandbox: agent.sandbox } : {}),
+    ...(version === 4 && agent.fastMode === true ? { fastMode: true as const } : {}),
     ...(version === 4 && (agent.mentionPolicy === "require" || agent.mentionPolicy === "free") ? { mentionPolicy: agent.mentionPolicy } : {}),
     ...(version === 4 && Object.hasOwn(agent, "inboxAudit") ? { inboxAudit: parseStoredInboxAudit(agent.inboxAudit, `Agent ${key}.inboxAudit`) } : {}),
     ...(Object.keys(chatMentionPolicies).length ? { chatMentionPolicies, noMentionChats: Object.entries(chatMentionPolicies).filter(([, policy]) => policy === "free").map(([chatId]) => chatId) } : {}),
@@ -350,6 +380,8 @@ export function hydrateAgent(key: string, agent: StoredAgent & { noMentionChats?
     workspaceDir: layout.workspaceDir(key), stateDir: layout.agentStateDir(key),
     larkConfigDir: path.join(layout.agentStateDir(key), "lark-cli-config"),
     ...(agent.effort ? { effort: agent.effort } : {}),
+    ...(agent.sandbox ? { sandbox: agent.sandbox } : {}),
+    ...(agent.fastMode ? { fastMode: true as const } : {}),
     ...(agent.mentionPolicy ? { mentionPolicy: agent.mentionPolicy } : {}),
     ...(agent.inboxAudit ? { inboxAudit: { ...agent.inboxAudit } } : {}),
     ...(agent.chatMentionPolicies ? { chatMentionPolicies: { ...agent.chatMentionPolicies } } : {}),
@@ -373,18 +405,24 @@ export function normalizeConfig(raw: unknown, configDir: string, { mint }: { min
   for (const field of topFields) if (!Object.hasOwn(raw, field)) throw new Error(`config 缺少必需字段 ${field}`);
   if (typeof raw.serverId !== "string" || !raw.serverId) throw new Error("config.serverId 必须是非空字符串");
   if (version === 4) assertPolicy(raw.mentionPolicy, "config.mentionPolicy");
+  if (version === 4 && Object.hasOwn(raw, "replyMode")) assertReplyMode(raw.replyMode, "config.replyMode");
   if (raw.activeAgent !== null && typeof raw.activeAgent !== "string") throw new Error("config.activeAgent 必须是字符串或 null");
   if (!isPlainObject(raw.agents)) throw new Error("config.agents 必须是普通 object");
   for (const [key, agent] of Object.entries(raw.agents)) validateStoredAgent(key, agent, version);
   if (raw.activeAgent !== null && !Object.hasOwn(raw.agents, raw.activeAgent)) throw new Error(`config.activeAgent 指向不存在的 Agent：${raw.activeAgent}`);
+  const replyMode = version === 4 && Object.hasOwn(raw, "replyMode") ? raw.replyMode as ReplyMode : undefined;
   const agents: Record<string, HydratedAgent> = {};
-  for (const [key, agent] of Object.entries(raw.agents)) agents[key] = hydrateAgent(key, hydratedStoredAgent(key, agent as Obj, version), layout.root);
+  for (const [key, agent] of Object.entries(raw.agents)) {
+    agents[key] = hydrateAgent(key, hydratedStoredAgent(key, agent as Obj, version), layout.root);
+    if (replyMode) agents[key].replyMode = replyMode;
+  }
   const inboxAudit = version === 4 && Object.hasOwn(raw, "inboxAudit")
     ? resolvedInboxAudit(parseStoredInboxAudit(raw.inboxAudit, "config.inboxAudit"))
     : undefined;
   return {
     version: 4, serverId: raw.serverId, mentionPolicy: version === 4 ? raw.mentionPolicy as MentionPolicy : "require",
     ...(inboxAudit ? { inboxAudit } : {}),
+    ...(replyMode ? { replyMode } : {}),
     configDir: layout.configDir, larkinHome: layout.larkinHome, larkConfigDir: resolveLarkConfigDir({}, layout.root), activeAgent: raw.activeAgent as string | null, agents,
   };
 }
@@ -574,16 +612,19 @@ export function selectAgent(config: HydratedConfig, env: Env = process.env): Hyd
 }
 
 export function toStored(config: HydratedConfig): {
-  version: 4; serverId: string | null; mentionPolicy: MentionPolicy; inboxAudit?: InboxAuditResolved;
+  version: 4; serverId: string | null; mentionPolicy: MentionPolicy; inboxAudit?: InboxAuditResolved; replyMode?: ReplyMode;
   activeAgent: string | null; agents: Record<string, StoredAgent>;
 } {
   const out: ReturnType<typeof toStored> = {
     version: 4, serverId: config.serverId, mentionPolicy: config.mentionPolicy, activeAgent: config.activeAgent, agents: {},
   };
   if (config.inboxAudit) out.inboxAudit = { enabled: config.inboxAudit.enabled, intervalMs: config.inboxAudit.intervalMs };
+  if (config.replyMode) out.replyMode = config.replyMode;
   for (const [key, agent] of Object.entries(config.agents || {})) {
     const stored: StoredAgent = { runtime: agent.runtime, model: agent.model };
     if (typeof agent.effort === "string" && agent.effort) stored.effort = agent.effort;
+    if (agent.sandbox && agent.sandbox !== DEFAULT_AGENT_SANDBOX) stored.sandbox = agent.sandbox;
+    if (agent.fastMode === true) stored.fastMode = true;
     if (agent.mentionPolicy) stored.mentionPolicy = agent.mentionPolicy;
     if (agent.chatMentionPolicies && Object.keys(agent.chatMentionPolicies).length) stored.chatMentionPolicies = { ...agent.chatMentionPolicies };
     if (agent.inboxAudit && (agent.inboxAudit.enabled !== undefined || agent.inboxAudit.intervalMs !== undefined)) {
@@ -647,6 +688,10 @@ function agentSignature(config: HydratedConfig, agentId: string): string {
     globalInboxAudit: config.inboxAudit ?? null, agentInboxAudit: agent.inboxAudit ?? null,
     // 0.5.19 起不再有 processingEye 开关；固定 null 以免未配过该 key 的 Agent 升级后无意义 pending apply。
     globalProcessingEye: null, agentProcessingEye: null,
+    // Only present once configured, so upgrading does not mark every Agent pending apply.
+    ...(config.replyMode ? { globalReplyMode: config.replyMode } : {}),
+    ...(agent.sandbox && agent.sandbox !== DEFAULT_AGENT_SANDBOX ? { sandbox: agent.sandbox } : {}),
+    ...(agent.fastMode ? { fastMode: true } : {}),
   }));
 }
 
@@ -768,7 +813,8 @@ export function markConfigApplied(env: Env, agentId: string, expectedSignature: 
 function assertAuthority(authority: ConfigAuthority, mutation: ConfigMutation): void {
   if (authority.kind !== "user" && authority.kind !== "agent") throw new Error("配置 authority 无效");
   if (authority.kind === "agent" && !APP_ID.test(authority.agentId)) throw new Error("Runtime Agent authority 格式无效");
-  void mutation;
+  // An Agent must not be able to loosen its own sandbox; only the user may change it.
+  if (authority.kind === "agent" && mutation.kind === "set-agent-sandbox") throw new Error("沙箱只能由用户在 dashboard 或终端修改，Agent 不能自己改");
 }
 
 function applyMutation(config: HydratedConfig, mutation: ConfigMutation): { scope: "global" | "agent" | "chat"; agentId?: string; runtimeChange: boolean; affectedAgentIds: string[] } {
@@ -787,6 +833,13 @@ function applyMutation(config: HydratedConfig, mutation: ConfigMutation): { scop
     }
     config.inboxAudit = current;
     return { scope: "global", runtimeChange: false, affectedAgentIds: Object.keys(config.agents) };
+  }
+  if (mutation.kind === "set-global-reply-mode") {
+    assertReplyMode(mutation.value, "全局 reply mode");
+    config.replyMode = mutation.value;
+    for (const agent of Object.values(config.agents)) agent.replyMode = mutation.value;
+    // The standing prompt and the lark-cli gate are fixed per Runtime session, so each Agent must re-apply.
+    return { scope: "global", runtimeChange: true, affectedAgentIds: Object.keys(config.agents) };
   }
   if (!APP_ID.test(mutation.agentId) || !config.agents[mutation.agentId]) throw new Error(`Agent 不存在：${mutation.agentId}`);
   const agent = config.agents[mutation.agentId];
@@ -818,6 +871,17 @@ function applyMutation(config: HydratedConfig, mutation: ConfigMutation): { scop
     agent.noMentionChats = Object.entries(policies).filter(([, value]) => value === "free").map(([chatId]) => chatId);
     return { scope: "chat", agentId: mutation.agentId, runtimeChange: false, affectedAgentIds: [mutation.agentId] };
   }
+  if (mutation.kind === "set-agent-sandbox") {
+    if (!isAgentSandbox(mutation.value)) throw new Error(`sandbox 只能是 ${AGENT_SANDBOXES.join(" / ")}`);
+    if (mutation.value === DEFAULT_AGENT_SANDBOX) delete agent.sandbox; else agent.sandbox = mutation.value;
+    return { scope: "agent", agentId: mutation.agentId, runtimeChange: true, affectedAgentIds: [mutation.agentId] };
+  }
+  if (mutation.kind === "set-agent-fast-mode") {
+    if (typeof mutation.value !== "boolean") throw new Error("fast mode 只能是 true 或 false");
+    if (mutation.value && agent.runtime !== "codex") throw new Error("Fast 模式只适用于 codex");
+    if (mutation.value) agent.fastMode = true; else delete agent.fastMode;
+    return { scope: "agent", agentId: mutation.agentId, runtimeChange: true, affectedAgentIds: [mutation.agentId] };
+  }
   if (mutation.kind === "set-agent-runtime") {
     if (!isUserRuntime(mutation.runtime)) throw new Error(`未知 runtime：${mutation.runtime}`);
     const stored = fromUserRuntime(mutation.runtime);
@@ -825,6 +889,7 @@ function applyMutation(config: HydratedConfig, mutation: ConfigMutation): { scop
     agent.runtime = stored.runtime;
     agent.model = mutation.model || "default";
     delete agent.effort;
+    if (agent.runtime !== "codex") delete agent.fastMode;
   } else if (mutation.kind === "set-agent-model") {
     if (!mutation.model.trim()) throw new Error("model 不能为空");
     assertModel(agent.runtime, mutation.model);
@@ -1196,6 +1261,8 @@ export function safeConfigView(config: HydratedConfig, onlyAgentId?: string, cha
   const entries = onlyAgentId ? [[onlyAgentId, config.agents[onlyAgentId]]] as const : Object.entries(config.agents);
   const agents = entries.filter((entry): entry is readonly [string, HydratedAgent] => Boolean(entry[1])).map(([agentId, agent]) => ({
     agentId, runtime: agent.runtime, runtimeOption: toUserRuntime(agent.runtime), model: agent.model, effort: agent.effort ?? null,
+    sandbox: agent.sandbox ?? DEFAULT_AGENT_SANDBOX,
+    fastMode: agent.fastMode === true,
     mention: {
       override: agent.mentionPolicy ?? "inherit",
       effective: agent.mentionPolicy ?? config.mentionPolicy,
@@ -1220,6 +1287,7 @@ export function safeConfigView(config: HydratedConfig, onlyAgentId?: string, cha
   return {
     version: 4, mentionPolicy: config.mentionPolicy,
     inboxAudit: { enabled: inboxAudit.enabled, intervalMs: inboxAudit.intervalMs },
+    replyMode: config.replyMode ?? null,
     persistedRevision: applyState?.persistedRevision ?? "unknown", agents,
   };
 }

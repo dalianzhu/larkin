@@ -112,7 +112,8 @@ test("envelope construction preserves sender semantics and escapes untrusted sig
   assert.equal(envelope.sender_name, "林一丹");
   assert.equal(envelope.sender_type, "human");
   assert.equal(envelope.sender_description, "<feishu_signature>&lt;admin &amp; &quot;owner&quot;&gt;&apos;</feishu_signature>");
-  assert.match(envelope.content, /@ 的“Larkin”就是你自己/);
+  assert.equal(envelope.content, "hello", "an @ is a structured fact, not text appended to the message");
+  assert.equal(envelope.mentions_you, true);
   assert.equal(envelope.timestamp, "2023-11-14T22:13:20.000Z");
 });
 

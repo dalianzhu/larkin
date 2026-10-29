@@ -15,6 +15,24 @@ async function withFixture(run, options) {
 }
 const bytes = (store) => ["inbox", "inboxState", "runtimeDeliveries"].map((key) => fs.readFileSync(store.paths[key], "utf8"));
 
+test("transport recovery preserves the Agent sandbox, Fast mode, and card standing prompt", async () => {
+  await withFixture(async (f) => {
+    const before = f.current().config;
+    assert.equal(before.sandbox, "workspace-write");
+    assert.equal(before.fastMode, true);
+    assert.match(before.standingPrompt.version, /-card$/);
+    await f.fail();
+    const { plan } = await f.inspect();
+    await f.commit(plan, f.review(plan));
+    const after = f.current().config;
+    assert.equal(after.sandbox, before.sandbox);
+    assert.equal(after.fastMode, before.fastMode);
+    assert.equal(after.standingPrompt.version, before.standingPrompt.version);
+    await f.finish();
+    assert.equal(f.store.readJson("transportRecovery", {}).phase, "complete");
+  }, { agentSettings: { sandbox: "workspace-write", fastMode: true, replyMode: "card" } });
+});
+
 test("operator transport recovery switches only one session, preserves canonical bytes, and reconciles without task replay", async () => {
   await withFixture(async (f) => {
     await f.fail();

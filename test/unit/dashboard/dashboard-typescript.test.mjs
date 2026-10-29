@@ -53,7 +53,7 @@ test("dashboard is layered: React workbench, shell template, filesystem-only vie
   assert.match(workbench, /\/api\/config\/apply/);
   assert.match(workbench, /GlobalSettingsSheet/);
   assert.match(workbench, /role="tablist"/);
-  assert.match(state, /overview.*conversation.*configuration.*reminders.*workspace.*logs/);
+  assert.match(state, /activity.*persona.*reply.*advanced/);
   assert.match(styles, /body \{[^}]*overflow-x: (?:hidden|clip)/, "dashboard must not expose page-level horizontal scrolling");
   assert.match(styles, /@media \(max-width: 760px\)/);
   assert.doesNotMatch(template, /function renderAgents|class="grid"/);

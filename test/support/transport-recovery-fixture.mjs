@@ -12,14 +12,14 @@ import { runAgentCli } from "../../dist/app/agent-cli.mjs";
 export const fixtureAgentId = "cli_transportA1";
 export const fixtureOtherId = "cli_transportB2";
 export const fixtureStreamError = "stream disconnected before completion: stream closed before response.completed";
-export async function createTransportFixture(root, { now = () => Date.now(), onPrompt, onCreate, native = false, storeDecorator = (store) => store } = {}) {
+export async function createTransportFixture(root, { now = () => Date.now(), onPrompt, onCreate, native = false, agentSettings = {}, storeDecorator = (store) => store } = {}) {
   fs.mkdirSync(root, { recursive: true, mode: 0o700 }); fs.chmodSync(root, 0o700);
   const stores = new Map([fixtureAgentId, fixtureOtherId].map((id) => [id, createAgentStateStore(root, id)]));
   const store = stores.get(fixtureAgentId);
   const sessions = [];
   let host, runtime;
   let serial = 0;
-  const agents = [...stores.keys()].map((agentId) => ({ agentId, name: agentId, runtime: "codex", model: "fixture-model",
+  const agents = [...stores.keys()].map((agentId) => ({ agentId, name: agentId, runtime: "codex", model: "fixture-model", ...agentSettings,
     feishuAppId: agentId, feishuProfile: agentId, larkConfigDir: path.join(stores.get(agentId).paths.root, "lark-cli-config"),
     workspaceDir: path.join(root, "agents", agentId), stateDir: stores.get(agentId).paths.root }));
   const current = () => sessions.filter((session) => session.agentId === fixtureAgentId).at(-1);
