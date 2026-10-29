@@ -486,7 +486,7 @@ export class HostEnvelopeProjector {
       sender_type: "system" as const,
       channel_type: "dm" as const,
       channel_name: "system" as const,
-      content: `[启动补投] 服务重启期间有 ${wakeCount} 条本应唤醒你的消息未被读取（可能包含用户消息、@提及或定时提醒）。请先用 ${this.agentCommand("inbox check")} 看目标摘要，再用 ${this.agentCommand("inbox poll")} 领取完整消息；仅当 message_id 以 om_ 开头时才用 ${this.larkCommand("im +messages-reply")}，系统 rem_/redeliver_ ID 不可回复；有 chat_id 时可用 ${this.larkCommand("im +messages-send")}，否则先查询确认目标，禁止猜测。`,
+      content: `[启动补投] 服务重启期间有 ${wakeCount} 条本应唤醒你的消息还没读（用户消息、@ 或提醒）。先用 ${this.agentCommand("inbox check")} 看有哪些目标，再用 ${this.agentCommand("inbox poll --target <target>")} 逐个领取并处理。`,
       timestamp: this.now().toISOString(),
       thread_id: null,
     };

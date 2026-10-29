@@ -18,6 +18,7 @@ import type {
 import { isPiThinkingLevel } from "./pi-model-catalog.js";
 import { PiRpcClient, type PiRpcClientOptions } from "./pi-rpc-client.js";
 import { traceProcessBoundary } from "../platform/process-boundary-trace.js";
+import { loadTelemetryConfig } from "../platform/telemetry-config.js";
 import { effectivePiStateDir, writePrivateAtomic } from "./pi-state-dir.js";
 import { resolvePiTmuxExtensionArg } from "./pi-tmux-injection.js";
 import {
@@ -186,6 +187,19 @@ function parseJson(line: string): Record<string, any> | null {
   } catch { return null; }
 }
 
+/** Display name of a Codex app-server tool item; null for messages and reasoning. Arguments are never shown. */
+function codexToolName(item: Record<string, any> | undefined): string | null {
+  if (!item || typeof item.type !== "string") return null;
+  switch (item.type) {
+    case "commandExecution": return "执行命令";
+    case "mcpToolCall": return [item.server, item.tool].filter(Boolean).join("/") || "MCP 工具";
+    case "fileChange": return "修改文件";
+    case "webSearch": return "网页搜索";
+    case "dynamicToolCall": return String(item.tool || "工具");
+    default: return null;
+  }
+}
+
 function attachLines(stream: ReadableLike | null, listener: (message: Record<string, any>) => void): void {
   if (!stream) return;
   const lines = createInterface({ input: stream });
@@ -195,10 +209,31 @@ function attachLines(stream: ReadableLike | null, listener: (message: Record<str
   });
 }
 
+/**
+ * Codex sandbox + config overrides for thread/start and thread/resume. Approval stays "never":
+ * nobody is there to click approve, so an escalation request would only stall the turn.
+ * workspace-write still has to let the Agent run larkin and lark-cli, so it keeps network
+ * access and adds the Agent state dir (Inbox state, lark-cli profile) and the telemetry spool.
+ * The config root itself stays read-only so an Agent cannot loosen its own sandbox.
+ */
+export function codexSandboxParams(config: Pick<RuntimeSessionCreate, "sandbox" | "reasoningEffort" | "stateDir" | "env">): Record<string, unknown> {
+  const overrides: Record<string, unknown> = config.reasoningEffort ? { model_reasoning_effort: config.reasoningEffort } : {};
+  if (config.sandbox !== "workspace-write") {
+    return { sandbox: "danger-full-access", ...(Object.keys(overrides).length ? { config: overrides } : {}) };
+  }
+  const env = { ...process.env, ...(config.env || {}) };
+  const writableRoots = [...new Set([config.stateDir, loadTelemetryConfig(env).spoolDir]
+    .filter((root): root is string => Boolean(root)).map((root) => path.resolve(root)))];
+  overrides.sandbox_workspace_write = { network_access: true, writable_roots: writableRoots };
+  return { sandbox: "workspace-write", config: overrides };
+}
+
 class CodexSession extends EventSession {
   private requestId = 0;
   private threadId: string | null = null;
   private activeTurnId: string | null = null;
+  /** Set when Codex starts a new agentMessage item; marks its first text delta as a new block. */
+  private textBlockPending = false;
   private readonly turnOwnership = new Map<string, CodexTurnOwnership>();
   private readonly unassignedTurnInputs: string[] = [];
   private readonly recentTurnIds: string[] = [];
@@ -318,11 +353,11 @@ class CodexSession extends EventSession {
         const threadParams: Record<string, unknown> = {
           cwd: this.config.workspaceDir,
           approvalPolicy: "never",
-          sandbox: "danger-full-access",
           developerInstructions: this.config.standingPrompt.content,
           experimentalRawEvents: true,
           ...(configuredModel(this.config.model) ? { model: configuredModel(this.config.model) } : {}),
-          ...(this.config.reasoningEffort ? { config: { model_reasoning_effort: this.config.reasoningEffort } } : {}),
+          ...codexSandboxParams(this.config),
+          ...(this.config.fastMode ? { serviceTier: "fast" } : {}),
         };
         this.freshThreadParams = threadParams;
         this.request(this.config.resumeSessionId ? "thread/resume" : "thread/start", this.config.resumeSessionId
@@ -360,8 +395,20 @@ class CodexSession extends EventSession {
       if (!endsActiveTurn) return;
       this.activeTurnId = null;
       this.emit({ type: "turn-end", ...(this.threadId ? { sessionId: this.threadId } : {}), ...(turnId ? { turnId } : {}) });
+    } else if (message.method === "item/started" && message.params?.item?.type === "agentMessage") {
+      this.textBlockPending = true;
+    } else if (message.method === "item/started" && codexToolName(message.params?.item)) {
+      this.emit({ type: "activity", activity: "tool", name: codexToolName(message.params.item)!,
+        ...(message.params.item.id ? { toolId: String(message.params.item.id) } : {}) });
+    } else if (message.method === "item/completed" && codexToolName(message.params?.item)) {
+      const item = message.params.item;
+      const status = String(item.status || "completed").toLowerCase();
+      const ok = status !== "failed" && status !== "declined" && (item.exitCode === undefined || item.exitCode === null || item.exitCode === 0);
+      this.emit({ type: "tool-result", ok, ...(item.id ? { toolId: String(item.id) } : {}) });
     } else if (message.method === "item/agentMessage/delta" && message.params?.delta) {
       this.emit({ type: "activity", activity: "text", text: String(message.params.delta) });
+      this.emit({ type: "text-delta", text: String(message.params.delta), ...(this.textBlockPending ? { newBlock: true } : {}) });
+      this.textBlockPending = false;
     } else if (message.method === "item/reasoning/summaryTextDelta" && message.params?.delta) {
       this.emit({ type: "activity", activity: "thinking", text: String(message.params.delta) });
     } else if (message.method === "error" || message.method === "codex/event/error") {
@@ -479,6 +526,7 @@ class ClaudeSession extends EventSession {
   private currentSessionId: string | null;
   private busy = false;
   private safeBoundary = true;
+  private textBlockPending = false;
   private readonly gated: Array<{ input: RuntimeInput; resolve: (result: RuntimeInputResult) => void }> = [];
 
   constructor(private readonly process: ProcessLike, resumeSessionId?: string) {
@@ -527,7 +575,9 @@ class ClaudeSession extends EventSession {
       for (const block of message.message?.content ?? []) {
         if (block.type === "text" && block.text) this.emit({ type: "activity", activity: "text", text: String(block.text) });
         if (block.type === "thinking" && block.thinking) this.emit({ type: "activity", activity: "thinking", text: String(block.thinking) });
-        if (block.type === "tool_use") this.emit({ type: "activity", activity: "tool", name: String(block.name || "tool") });
+        if (block.type === "tool_use") {
+          this.emit({ type: "activity", activity: "tool", name: String(block.name || "tool"), ...(block.id ? { toolId: String(block.id) } : {}) });
+        }
       }
       const next = this.gated.shift();
       if (next) {
@@ -536,6 +586,21 @@ class ClaudeSession extends EventSession {
       }
     } else if (message.type === "stream_event") {
       this.safeBoundary = false;
+      // Partial text deltas (--include-partial-messages) drive the streaming card;
+      // the complete assistant message above still feeds activity/history.
+      const streamEvent = message.event;
+      if (streamEvent?.type === "content_block_start" && streamEvent.content_block?.type === "text") {
+        this.textBlockPending = true;
+      } else if (streamEvent?.type === "content_block_delta" && streamEvent.delta?.type === "text_delta" && streamEvent.delta.text) {
+        this.emit({ type: "text-delta", text: String(streamEvent.delta.text), ...(this.textBlockPending ? { newBlock: true } : {}) });
+        this.textBlockPending = false;
+      }
+    } else if (message.type === "user" && Array.isArray(message.message?.content)) {
+      for (const block of message.message.content) {
+        if (block?.type === "tool_result") {
+          this.emit({ type: "tool-result", ok: block.is_error !== true, ...(block.tool_use_id ? { toolId: String(block.tool_use_id) } : {}) });
+        }
+      }
     } else if (message.type === "result") {
       this.busy = false;
       this.safeBoundary = true;
@@ -563,6 +628,7 @@ class PiSession extends EventSession {
   private readonly observedCompletedEpochs = new Set<number>();
   private readonly observedAgentEndEpochs = new Set<number>();
   private firstOutputObserved = false;
+  private textBlockPending = false;
   private toolCallOpen = false;
   readonly piPolicyManaged: boolean;
   constructor(private readonly sdk: PiSessionProcessLike, private readonly distribution: "external" = "external") {
@@ -765,13 +831,16 @@ class PiSession extends EventSession {
         this.toolCallOpen = true;
         this.emit({ type: "runtime-observation", runtime: "pi", distribution: this.distribution, phase: "tool_call" });
       }
-      this.emit({ type: "activity", activity: "tool", name: String(event.toolName || "tool") });
+      this.emit({ type: "activity", activity: "tool", name: String(event.toolName || "tool"),
+        ...(event.toolCallId ? { toolId: String(event.toolCallId) } : {}) });
     }
     else if (event?.type === "tool_execution_end") {
       if (this.toolCallOpen) {
         this.toolCallOpen = false;
         this.emit({ type: "runtime-observation", runtime: "pi", distribution: this.distribution, phase: "tool_result" });
       }
+      this.emit({ type: "tool-result", ok: event.isError !== true, ...(event.toolCallId ? { toolId: String(event.toolCallId) } : {}),
+        ...(event.toolName ? { name: String(event.toolName) } : {}) });
     }
     else if (event?.type === "message_update" && event.assistantMessageEvent?.delta) {
       if (!this.firstOutputObserved) {
@@ -780,6 +849,14 @@ class PiSession extends EventSession {
       }
       const kind = event.assistantMessageEvent.type?.startsWith("thinking") ? "thinking" : "text";
       this.emit({ type: "activity", activity: kind, text: String(event.assistantMessageEvent.delta) });
+      if (event.assistantMessageEvent.type === "text_delta") {
+        this.emit({ type: "text-delta", text: String(event.assistantMessageEvent.delta),
+          ...(this.textBlockPending ? { newBlock: true } : {}) });
+        this.textBlockPending = false;
+      }
+    }
+    else if (event?.type === "message_update" && event.assistantMessageEvent?.type === "text_start") {
+      this.textBlockPending = true;
     }
   }
 

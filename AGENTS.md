@@ -14,7 +14,7 @@ Larkin is a local Runtime Host that connects externally installed `pi`, `codex`,
 
 ## Development and validation
 
-Use Bun 1.3.14 and the locked dependency graph:
+Use Bun 1.4.4 and the locked dependency graph:
 
 ```bash
 bun install --frozen-lockfile

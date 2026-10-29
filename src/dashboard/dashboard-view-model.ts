@@ -10,10 +10,20 @@ import { fileURLToPath } from "node:url";
 import { readJson, readProcessState } from "../platform/process-state.js";
 import { isRuntimeReadinessCurrent, isSessionCurrent } from "../app/agent-readiness.js";
 import { isAllowedDashboardAvatarUrl } from "./dashboard-avatar.js";
-import { collectWorkspaceEntry as collectTypedWorkspaceEntry } from "./dashboard-workspace.js";
+import {
+  collectInstructionFiles as collectTypedInstructionFiles,
+  collectWorkspaceEntry as collectTypedWorkspaceEntry,
+  createInstructionFile as createTypedInstructionFile,
+  writeWorkspaceFile as writeTypedWorkspaceFile,
+} from "./dashboard-workspace.js";
+import { collectCapabilities as collectTypedCapabilities, defaultCapabilityHomes } from "./dashboard-capabilities.js";
 import { buildFingerprint, packageVersion } from "../platform/build-info.js";
 import * as larkinConfig from "../platform/config.js";
 import { toUserRuntime } from "../runtime/user-runtime.js";
+import { ContextPromptBuilder } from "../agent/context-prompt.js";
+import { agentCliPromptCapabilities } from "../agent/agent-cli-capabilities.js";
+import { replyModeFromEnv } from "../platform/reply-mode.js";
+import type { RuntimeId } from "../runtime/runtime-contracts.js";
 
 export interface JsonRecord {
   [key: string]: unknown;
@@ -449,6 +459,49 @@ function readConversation(file: string, limit = 60): JsonRecord[] {
 export function collectWorkspaceEntry(agentId: string | null, requestedPath: string): unknown {
   const { config } = larkinConfig.loadConfig(process.env);
   return collectTypedWorkspaceEntry(config, agentId || "", requestedPath);
+}
+
+export function writeWorkspaceFile(body: Record<string, unknown>): unknown {
+  const allowed = new Set(["agentId", "path", "content", "expectedSha256"]);
+  if (Object.keys(body).some((key) => !allowed.has(key))) throw Object.assign(new Error("unsupported field"), { statusCode: 400 });
+  const { config } = larkinConfig.loadConfig(process.env);
+  return writeTypedWorkspaceFile(config, String(body.agentId || ""), body.path, body.content, body.expectedSha256);
+}
+
+export function collectInstructionFiles(agentId: string | null): unknown {
+  const { config } = larkinConfig.loadConfig(process.env);
+  return collectTypedInstructionFiles(config, agentId || "");
+}
+
+export function createInstructionFile(body: Record<string, unknown>): unknown {
+  const allowed = new Set(["agentId", "name", "content"]);
+  if (Object.keys(body).some((key) => !allowed.has(key))) throw Object.assign(new Error("unsupported field"), { statusCode: 400 });
+  const { config } = larkinConfig.loadConfig(process.env);
+  return createTypedInstructionFile(config, String(body.agentId || ""), body.name, body.content);
+}
+
+export function collectCapabilities(agentId: string | null): unknown {
+  const { config } = larkinConfig.loadConfig(process.env);
+  const agent = Object.values(config.agents || {}).find((candidate) => candidate.agentId === agentId);
+  if (!agent) throw Object.assign(new Error("agent 不存在"), { statusCode: 404 });
+  return collectTypedCapabilities(config, agent.agentId, toUserRuntime(agent.runtime), defaultCapabilityHomes(process.env, os.homedir()));
+}
+
+/** The standing prompt a new session of this Agent receives, built the same way the Runtime host builds it (minus the per-session previous-archive note). */
+export function standingPromptView(config: { agents?: Record<string, larkinConfig.HydratedAgent> }, agentId: string | null, env: NodeJS.ProcessEnv = process.env) {
+  const agent = Object.values(config.agents || {}).find((candidate) => candidate.agentId === agentId);
+  if (!agent) throw Object.assign(new Error("agent 不存在"), { statusCode: 404 });
+  const identity = readJson(path.join(agent.stateDir, "bot-identity.json"), null) as JsonRecord | null;
+  const replyMode = agent.replyMode ?? replyModeFromEnv(env);
+  const prompt = new ContextPromptBuilder({ replyMode }).build({
+    agentId: agent.agentId, name: (typeof identity?.name === "string" && identity.name) || agent.name,
+    runtime: agent.runtime as RuntimeId, cli: agentCliPromptCapabilities("larkin"),
+  });
+  return { runtime: toUserRuntime(agent.runtime), replyMode, version: prompt.version, content: prompt.content };
+}
+
+export function collectStandingPrompt(agentId: string | null): unknown {
+  return standingPromptView(larkinConfig.loadConfig(process.env).config, agentId);
 }
 
 export function resolveDashboardAvatarSource(agentId: string): string | null {

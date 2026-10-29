@@ -106,13 +106,17 @@ export interface ConfigAgent {
   runtimeOption: "codex" | "claude" | "pi";
   model: string;
   effort: string | null;
+  /** Codex sandbox; other Runtimes ignore it. */
+  sandbox?: "workspace-write" | "danger-full-access";
+  fastMode?: boolean;
   mention: { override: "inherit" | "require" | "free"; effective: "require" | "free"; source: "global" | "agent" };
   inboxAudit: {
     override: { enabled: "inherit" | "on" | "off"; intervalMs: "inherit" | number };
     effective: { enabled: boolean; intervalMs: number };
     source: { enabled: "default" | "global" | "agent"; intervalMs: "default" | "global" | "agent" };
   };
-  knownChats: KnownChat[];
+  /** Absent when requested with chats=0. */
+  knownChats?: KnownChat[];
   apply: { applyState?: "unknown" | "pending" | "applied" };
 }
 
@@ -121,12 +125,16 @@ export interface RuntimeModel {
   label?: string;
   supportedReasoningEfforts?: string[];
   defaultReasoningEffort?: string;
+  /** Codex only: the model offers the Fast speed tier. */
+  supportsFast?: boolean;
 }
 
 export interface ConfigResponse {
   version: 4;
   mentionPolicy: "require" | "free";
   inboxAudit: { enabled: boolean; intervalMs: number };
+  /** null: not configured; the Runtime falls back to LARKIN_REPLY_MODE, else card. */
+  replyMode: "card" | "cli" | null;
   persistedRevision: string;
   agents: ConfigAgent[];
   runtimeModels: Record<string, RuntimeModel[]>;
@@ -147,6 +155,8 @@ export type WorkspaceProjection = {
   binary: boolean;
   truncated: boolean;
   content: string | null;
+  /** Present only for fully previewed text files; required to save an edit. */
+  sha256?: string | null;
 };
 
 declare global {
@@ -158,4 +168,36 @@ declare global {
       csrfCapability: string;
     };
   }
+}
+
+export interface InstructionFilesResponse {
+  files: Array<{
+    name: "AGENTS.md" | "CLAUDE.md";
+    linkedTo: string | null;
+    file: Extract<WorkspaceProjection, { kind: "file" }> | null;
+    error: string | null;
+  }>;
+}
+
+export interface StandingPromptResponse {
+  runtime: string;
+  replyMode: "card" | "cli";
+  version: string;
+  content: string;
+}
+
+export type CapabilityKind = "skill" | "subagent" | "plugin" | "mcp";
+
+export interface CapabilitiesResponse {
+  runtime: string;
+  items: Array<{
+    kind: CapabilityKind;
+    source: "workspace" | "global" | "plugin" | "builtin";
+    name: string;
+    description: string | null;
+    location: string;
+    status: "ok" | "disabled" | "invalid" | "shadowed";
+    detail: string | null;
+  }>;
+  unsupported: CapabilityKind[];
 }

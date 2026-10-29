@@ -39,8 +39,18 @@ for (const resume of [false, true]) {
       assert.equal((await deliver("om_root")).status, "accepted");
       notify("thread/started", { thread: { id: "child-thread" } });
       notify("turn/started", { threadId: "child-thread", turn: { id: "child-turn" } });
+      notify("item/started", { threadId: "child-thread", item: { type: "agentMessage", id: "child-message" } });
+      notify("item/agentMessage/delta", { threadId: "child-thread", delta: "child output" });
+      notify("item/started", { threadId: "child-thread", item: { type: "commandExecution", id: "child-tool" } });
+      notify("item/completed", { threadId: "child-thread", item: { type: "commandExecution", id: "child-tool", exitCode: 1 } });
       await new Promise(resolve => setImmediate(resolve));
       assert.equal((await deliver("om_during_child")).status, "accepted");
+      assert.equal(events.filter(event => event.type === "runtime" &&
+        ["text-delta", "tool-result", "activity"].includes(event.event.type)).length, 0);
+      notify("item/agentMessage/delta", { threadId: "root-thread", delta: "root output" });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(events.filter(event => event.type === "runtime" && event.event.type === "text-delta")
+        .map(event => event.event), [{ type: "text-delta", text: "root output" }]);
       notify("error", { threadId: "child-thread", turnId: "child-turn", error: { message: "child failed" }, willRetry: false });
       notify("turn/completed", { threadId: "child-thread", turn: { id: "child-turn", status: "failed" } });
       await new Promise(resolve => setImmediate(resolve));

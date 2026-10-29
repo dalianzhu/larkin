@@ -13,7 +13,7 @@ Larkin is a local Runtime Host that connects Codex, Claude Code, and Pi agent ru
 - A supported macOS, Linux, or Windows (x64) system
 - Official `@larksuite/cli >= 1.0.80` (`lark-cli`) (Larkin product policy)
 - At least one externally installed agent runtime on `PATH`, already logged in: `pi`, `codex`, or `claude`
-- Bun 1.3.14 when running the npm package or building from source (standalone binaries bundle their own runtime)
+- Bun 1.4.4 when running the npm package or building from source (standalone binaries bundle their own runtime)
 
 ## Quick start
 

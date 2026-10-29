@@ -235,6 +235,41 @@ test("RuntimeHost does not proactively compact at the strict threshold", async (
   }
 });
 
+test("RuntimeHost resubmits a delivery deferred before the session was ready once the session reports in", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-session-init-retry-"));
+  const agentId = "cli_sessionInitRetryA1";
+  const store = createAgentStateStore(root, agentId);
+  // Codex answers prompt() with "deferred" until thread/start or thread/resume returns, then emits session-init.
+  class StartingThreadSession extends FakeSession {
+    ready = false;
+    async prompt(input) {
+      this.prompts.push(input);
+      return this.ready ? { status: "accepted", inputId: input.inputId }
+        : { status: "deferred", inputId: input.inputId, reason: "Codex thread is not initialized" };
+    }
+  }
+  const session = new StartingThreadSession();
+  const adapter = { id: "codex", capabilities: {}, async createSession() { return session; } };
+  const host = createRuntimeHost({ adapterFor: () => adapter, promptBuilder: new ContextPromptBuilder(), stateStoreFor: () => store });
+  try {
+    await host.start([{ agentId, name: "codex", runtime: "codex", model: "model", workspaceDir: "/tmp", stateDir: root }]);
+    store.appendNdjson("inbox", { message_id: "om_before_thread", chat_id: "oc_before_thread", content: "hello" });
+    const receipt = await host.deliver(agentId, { message_id: "om_before_thread", chat_id: "oc_before_thread", content: "hello" });
+    assert.equal(receipt.status, "deferred");
+    assert.equal(session.prompts.length, 1);
+
+    session.ready = true;
+    session.emit({ type: "session-init", sessionId: "thread-1" });
+    const deadline = Date.now() + 1_000;
+    while (session.prompts.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(session.prompts.length, 2, "the deferred delivery is resubmitted when the thread becomes ready");
+    assert.equal(session.prompts[1].deliveryId, session.prompts[0].deliveryId);
+  } finally {
+    await host.shutdown("done");
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("RuntimeHost bounds proactive compact failure without retry or session reset", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "larkin-pi-proactive-failure-"));
   const policy = calculatePiCompactionSettings(272_000);

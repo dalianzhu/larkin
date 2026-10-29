@@ -43,7 +43,16 @@ export type NormalizedRuntimeEvent =
         | "rpc_timeout" | "rpc_error" | "turn_start" | "first_output" | "tool_call" | "tool_result" | "agent_end" | "completed" | "settled";
       reason?: "manual" | "threshold" | "overflow"; willRetry?: boolean; success?: boolean; inputId?: string; sessionId?: string }
   | { type: "turn-start"; turnId?: string }
-  | { type: "activity"; activity: "thinking" | "text" | "tool" | "internal"; text?: string; name?: string }
+  /** For `tool`: `name` is the display name, `text` its argument summary, `toolId` pairs it with its `tool-result`. */
+  | { type: "activity"; activity: "thinking" | "text" | "tool" | "internal"; text?: string; name?: string; toolId?: string }
+  /** A tool call finished; `toolId` (or the latest running call named `name`) identifies which. */
+  | { type: "tool-result"; toolId?: string; name?: string; ok: boolean }
+  /**
+   * Incremental user-facing assistant text, in output order. `newBlock` marks the
+   * first delta of a new assistant text block so a renderer can separate paragraphs.
+   * Feeds the streaming card reply; never contains thinking or tool payloads.
+   */
+  | { type: "text-delta"; text: string; newBlock?: boolean }
   | { type: "turn-end"; sessionId?: string; turnId?: string }
   | { type: "input-error"; inputId?: string; retryable: boolean; willRetry?: boolean; message: string;
       errorCategory?: "billing" | "quota" | "rate_limit" | "auth" | "context_window" | "provider"; nextAction?: string;
@@ -65,6 +74,10 @@ export interface RuntimeSessionCreate {
   standingPrompt: StandingPrompt;
   model?: string;
   reasoningEffort?: string | null;
+  /** Codex sandbox mode; null/absent keeps danger-full-access. */
+  sandbox?: string | null;
+  /** Codex Fast service tier; false/absent leaves the tier to the user's Codex config. */
+  fastMode?: boolean;
   resumeSessionId?: string | null;
   env?: NodeJS.ProcessEnv;
 }
