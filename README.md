@@ -83,7 +83,7 @@ git push origin main
 - release commit 必须保持工作树干净、已推送，并通过 typecheck、build、测试、license 和 publication checks；安装工件必须显示 `sourceDirty: false`。
 - 发现上下游使用了相同版本号时，不覆盖、不移动已有 tag；下游直接递增到新的未使用版本，并从明确的上游 commit 重新构建。
 
-当前发行关系：下游已同步上游 `eddiearc/larkin@5a78e2d`（`0.5.5`），该版本上游已移除内置（builtin）Pi、全面转向外部安装的 `pi` 运行时；下游在此基础上保留 external enqueue，发行版本为 `0.5.6`。后续同步时以实际的 `upstream/main` 和下游最新 release 为准，不把本段中的 commit 当作永久固定基线。
+当前发行关系：下游已同步上游 `eddiearc/larkin@325ce03`（`v0.5.23`）。下游在此基础上保留 external enqueue、external Pi 探测与 `kiro/*` provider 探针的回归覆盖，并在 0.5.24 中修正 inbound delivery health 只能写入、无法从 canonical 证据恢复的问题。后续同步时以实际的 `upstream/main` 和下游最新 release 为准，不把本段中的 commit 当作永久固定基线。
 
 ## Requirements
 
