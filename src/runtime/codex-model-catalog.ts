@@ -8,6 +8,8 @@ export interface CodexCatalogModel {
   label: string;
   supportedReasoningEfforts: string[];
   defaultReasoningEffort?: string;
+  /** The model offers Codex's Fast speed tier (`serviceTier: "fast"`). */
+  supportsFast: boolean;
   verified: "codex-cli-visible";
 }
 
@@ -58,7 +60,7 @@ async function runCodexAppServer(call: CodexCall): Promise<unknown> {
     };
     const timer = setTimeout(() => finish(new Error("Codex model catalog timed out")), call.timeout);
     timer.unref?.();
-    child.on("error", () => finish(new Error("Codex model catalog command failed")));
+    child.on("error", (error) => finish(new Error(`Codex model catalog command failed: ${error.message}`)));
     child.on("exit", () => finish(new Error("Codex model catalog app-server exited before response")));
     child.stderr.resume();
     child.stdout.on("data", (chunk: Buffer) => {
@@ -106,8 +108,10 @@ function parseCatalog(value: unknown): CodexModelCatalog {
       : [];
     const defaultReasoningEffort = typeof item.defaultReasoningEffort === "string" && levels.includes(item.defaultReasoningEffort)
       ? item.defaultReasoningEffort : undefined;
+    const supportsFast = (Array.isArray(item.additionalSpeedTiers) && item.additionalSpeedTiers.includes("fast"))
+      || (Array.isArray(item.serviceTiers) && item.serviceTiers.some((tier) => /^fast$/i.test(String((tier as { name?: unknown } | null)?.name ?? ""))));
     return [{ id, label: cleanLabel(item.displayName, id), supportedReasoningEfforts: levels,
-      ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}), verified: "codex-cli-visible" }];
+      ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}), supportsFast, verified: "codex-cli-visible" }];
   });
   if (!models.length || !effectiveModel) throw new Error("Codex model catalog has no visible local default");
   return { models, effectiveModel };

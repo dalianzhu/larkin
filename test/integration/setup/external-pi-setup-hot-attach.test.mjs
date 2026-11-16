@@ -217,8 +217,8 @@ test("rerunning external-pi setup repairs model=default and hot-attach uses the 
       const isolated = launches.find((row) => row.args.includes("--no-session") && row.args.includes("--model") && !row.args.includes("--session-dir"));
       assert.ok(isolated, JSON.stringify(launches));
       // Regression: the isolated context-window probe must not disable extensions,
-      // otherwise provider-registered models (kiro/*) fail to resolve and the
-      // runtime is misclassified as "not installed".
+      // otherwise models from a Pi package provider fail to resolve and the runtime
+      // is misclassified as not installed.
       assert.equal(isolated.args.includes("--no-extensions"), false, JSON.stringify(launches));
       assert.equal(isolated.args.includes("--model"), true);
       assert.equal(isolated.args[isolated.args.indexOf("--model") + 1], "fixture/pi-fixture");
